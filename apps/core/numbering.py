@@ -54,6 +54,9 @@ SERIES_DEFAULTS = {
     "VEND": ("VEND", "never", 4, "-"),
     "EMP": ("EMP", "never", 4, ""),
     "ASSET": ("AST", "never", 4, "-"),
+    # Grey-fabric production wiring (HRMS_ERP_CHANGES.md)
+    "PROD": ("PROD", "fy", 4, "-"),
+    "INC": ("INC", "fy", 4, "-"),
 }
 
 

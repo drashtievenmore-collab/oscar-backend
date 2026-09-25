@@ -200,6 +200,15 @@ CATALOGUE = [
             ("complete_project", "Complete project"),
         ],
     ),
+    (
+        "Production",
+        "Production Monitoring",
+        [
+            ("view_production", "View production"),
+            ("enter_production", "Enter production"),
+            ("verify_production", "Verify production"),
+        ],
+    ),
 ]
 
 
@@ -347,6 +356,17 @@ DEFAULT_ROLES = [
             "regularize_attendance", "generate_payroll", "approve_payroll",
             "edit_salary_structure", "view_staff", "create_staff", "edit_staff",
             "show_hrm_dashboard", "export_excel",
+        ],
+    ),
+    (
+        "PC",
+        "Production Coordinator",
+        "Grey-fabric monitoring and verification. No payroll write.",
+        [
+            "menu_hrms",
+            "view_staff",
+            "view_production", "enter_production", "verify_production",
+            "export_excel",
         ],
     ),
     (

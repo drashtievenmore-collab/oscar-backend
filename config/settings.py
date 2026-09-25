@@ -51,6 +51,12 @@ INSTALLED_APPS = [
     "corsheaders",
     "drf_spectacular",
     # project
+    # NOTE: All apps stay installed here even in HRMS-only mode, because
+    # masters/accounting/inventory/sales have hard FKs between them (e.g.
+    # hrms.Payslip -> accounting, accounting -> masters.Party,
+    # masters.ItemSerial -> inventory/sales). Removing them from
+    # INSTALLED_APPS breaks `manage.py check`. HRMS-only mode only disables
+    # their API routes (see ENABLED_MODULES / config/urls.py).
     "apps.core",
     "apps.accounts",
     "apps.masters",
@@ -63,6 +69,46 @@ INSTALLED_APPS = [
     "apps.hrms",
     "apps.reports",
 ]
+
+# --------------------------------------------------------------------------
+# Module toggle (HRMS-only dev mode)
+# --------------------------------------------------------------------------
+#: HRMS_ONLY=True exposes only auth/admin/hrms (+ core platform) routes.
+#: HRMS_ONLY=False exposes the full ERP. Flip in `.env`, no code edits.
+#: Optionally override the exact route set with ENABLED_MODULES (comma-separated).
+HRMS_ONLY = env_bool("HRMS_ONLY", True)
+
+#: Route keys used by config/urls.py. "auth"/"admin" (accounts) and "core"
+#: platform routes are always on -- HRMS needs login, users and files.
+#: "production" is a route key backed by apps.pms, not a separate app.
+HRMS_ONLY_MODULES = ["hrms", "production"]
+FULL_MODULES = [
+    "masters",
+    "inventory",
+    "sales",
+    "purchase",
+    "accounting",
+    "crm",
+    "pms",
+    "hrms",
+    "production",
+    "reports",
+    "dashboard",
+    "public",
+]
+
+_custom_modules = env_list("ENABLED_MODULES", "")
+if _custom_modules:
+    ENABLED_MODULES = [m.strip().lower() for m in _custom_modules if m.strip()]
+elif HRMS_ONLY:
+    ENABLED_MODULES = list(HRMS_ONLY_MODULES)
+else:
+    ENABLED_MODULES = list(FULL_MODULES)
+
+
+def module_enabled(name):
+    """Route-level toggle. Apps stay in INSTALLED_APPS for FK integrity."""
+    return name.lower() in ENABLED_MODULES
 
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
