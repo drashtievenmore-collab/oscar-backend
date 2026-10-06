@@ -17,6 +17,7 @@ from apps.inventory import services as stock
 
 from .models import (
     CategoryPart,
+    Fabric,
     Item,
     ItemCategory,
     ItemPart,
@@ -28,6 +29,7 @@ from .models import (
 )
 from .serializers import (
     CategoryPartSerializer,
+    FabricSerializer,
     ImportRowsSerializer,
     ItemCategorySerializer,
     ItemPartSerializer,
@@ -794,3 +796,59 @@ class LocationViewSet(TenantModelViewSet):
     ordering = ["name"]
     status_field = None
     filter_map = {"type": "type", "isActive": "is_active"}
+
+
+class FabricViewSet(TenantModelViewSet):
+    """Permanent fabric catalogue -- ``GET /inventory/fabrics/``.
+
+    The "Select fabric..." dropdown reads this list. Rows are seeded per
+    tenant (migration 0007 + ``seed_fabrics``), never hardcoded in the client.
+    """
+
+    queryset = Fabric.objects.all()
+    serializer_class = FabricSerializer
+    audit_entity_type = "Fabric"
+    audit_label_field = "name"
+    search_fields = ["name", "code", "description"]
+    ordering = ["name"]
+    status_field = None
+    filter_map = {"isActive": "is_active", "is_active": "is_active"}
+
+    def check_delete_allowed(self, fabric):
+        """Block archiving while an active Fabric-kind item references it."""
+        count = Item.objects.filter(
+            client_id=self.get_client_id(),
+            item_kind="Fabric",
+            fabric_quality__iexact=fabric.name,
+            deleted_at__isnull=True,
+        ).count()
+        if count:
+            raise Conflict(
+                f"{fabric.name} is used by {count} fabric item(s).",
+                code="FABRIC_IN_USE",
+                payload={"itemCount": count},
+            )
+
+    @action(detail=False, methods=["post"], url_path="import")
+    def bulk_import(self, request):
+        serializer = ImportRowsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return Response(
+            _import_rows(
+                request,
+                serializer.validated_data["rows"],
+                serializer.validated_data["dryRun"],
+                FabricSerializer,
+                Fabric,
+                required=["name"],
+            )
+        )
+
+    @action(detail=False, methods=["get"], url_path="import-template")
+    def import_template(self, request):
+        return Response(
+            {
+                "headers": ["name", "code", "description"],
+                "sampleRow": ["Cotton", "COTTON", "Natural fibre"],
+            }
+        )

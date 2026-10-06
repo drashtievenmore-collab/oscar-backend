@@ -35,6 +35,8 @@ from .models import (
     PurchaseOrderLine,
     PurchaseReturn,
     PurchaseReturnLine,
+    VendorBill,
+    VendorBillLine,
 )
 from .serializers import (
     ExpenseSerializer,
@@ -45,6 +47,7 @@ from .serializers import (
     PurchaseReturnSerializer,
     QcSerializer,
     ReceiveGoodsSerializer,
+    VendorBillSerializer,
 )
 
 MONEY = DecimalField(max_digits=18, decimal_places=2)
@@ -610,6 +613,250 @@ class ExpenseViewSet(TenantModelViewSet):
         expense.journal_entry = entry
         expense.save(update_fields=["journal_entry", "updated_at"])
         return expense
+
+
+class VendorBillViewSet(TenantModelViewSet):
+    """Manual vendor-bill entry, matched later to a real ``PurchaseBill``.
+
+    Creating or editing a vendor bill only captures the vendor's invoice --
+    it never posts stock or ledger entries. ``send-for-matching`` creates the
+    ``PurchaseBill`` Draft; the bill's own receive/cancel flow posts from
+    there.
+    """
+
+    queryset = VendorBill.objects.all()
+    serializer_class = VendorBillSerializer
+    audit_entity_type = "VendorBill"
+    audit_label_field = "vendor_bill_number"
+    status_field = "status"
+    default_date_field = "bill_date"
+    allowed_date_fields = ("bill_date", "created_at")
+    search_fields = ["vendor_bill_number", "party_name", "remarks"]
+    ordering = ["-bill_date", "-created_at"]
+    filter_map = {
+        "vendorId": "party_id",
+        "status": "status",
+        "matchStatus": "match_status",
+    }
+    permission_map = {"read": ["view_purchase"], "write": ["create_bill"]}
+
+    def get_queryset(self):
+        return (
+            super()
+            .get_queryset()
+            .select_related(
+                "party", "purchase_order", "goods_receipt", "purchase_bill",
+                "approved_by",
+            )
+            .prefetch_related("line_items__item")
+        )
+
+    def get_aggregates(self, queryset):
+        return queryset.aggregate(
+            count=Count("id"), totalValue=money_sum("total")
+        )
+
+    @action(detail=True, methods=["post"], url_path="send-for-matching")
+    @transaction.atomic
+    def send_for_matching(self, request, pk=None):
+        """Create the ``PurchaseBill`` Draft from this vendor bill.
+
+        Carries party, lines (qty/rate), the vendor bill number and the PO
+        link (plus the PO's location); the Draft itself posts nothing.
+        """
+        bill = self.get_object()
+        if bill.status == "Rejected":
+            raise Conflict(
+                "A rejected vendor bill cannot be sent for matching.",
+                code=Codes.DRAFT_ONLY,
+            )
+        if bill.match_status == "Matched" or bill.purchase_bill_id:
+            raise Conflict(
+                "This vendor bill is already matched.",
+                code=Codes.ALREADY_DONE,
+            )
+
+        lines = list(
+            bill.line_items.filter(deleted_at__isnull=True).order_by("line_no")
+        )
+        if not lines:
+            raise ValidationFailed(
+                "Add at least one line before matching.",
+                field_errors={"lineItems": ["Add at least one line."]},
+            )
+
+        if bill.purchase_order_id is not None and bill.status != "Approved":
+            matching = services.compute_vendor_bill_matching(
+                request.client_id, bill
+            )
+            if matching.get("overallStatus") == "Mismatch":
+                raise Conflict(
+                    "Quantities or rates do not match the purchase order. "
+                    "Approve the vendor bill before sending it for matching.",
+                    code="BILL_MISMATCH",
+                    payload={"matching": matching},
+                )
+
+        client = request.user.client
+        purchase_order = bill.purchase_order
+        purchase_bill = PurchaseBill(
+            client_id=request.client_id,
+            party=bill.party,
+            doc_date=bill.bill_date,
+            vendor_bill_number=bill.vendor_bill_number,
+            purchase_order=purchase_order,
+            location=purchase_order.location if purchase_order else None,
+            status="Draft",
+            bill_number=allocate_number(client, "BILL", bill.bill_date),
+        )
+        purchase_bill.freeze_party_snapshot()
+        purchase_bill.save()
+
+        PurchaseBillLine.objects.bulk_create(
+            [
+                PurchaseBillLine(
+                    client_id=request.client_id,
+                    purchase_bill=purchase_bill,
+                    line_no=line.line_no,
+                    item=line.item,
+                    sku=line.sku or (line.item.sku if line.item else None),
+                    item_name=line.item_name or (line.item.name if line.item else None),
+                    uom=line.uom or (line.item.uom if line.item else None),
+                    qty=line.qty,
+                    rate=line.rate,
+                    tax_pct=bill.gst_pct,
+                )
+                for line in lines
+            ]
+        )
+
+        from apps.sales.services import recalculate_document
+
+        recalculate_document(purchase_bill)
+
+        bill.purchase_bill = purchase_bill
+        bill.match_status = "Matched"
+        history = list(bill.approval_history or [])
+        history.append(
+            {
+                "at": timezone.now().isoformat(),
+                "by": getattr(request.user, "name", None)
+                or getattr(request.user, "email", ""),
+                "action": "Sent for Approval",
+                "remarks": "",
+            }
+        )
+        bill.approval_history = history
+        bill.save(
+            update_fields=[
+                "purchase_bill", "match_status", "approval_history", "updated_at",
+            ]
+        )
+        self.write_audit(
+            "match", bill,
+            description=f"PurchaseBill {purchase_bill.bill_number} created",
+        )
+        return Response(
+            {
+                "vendorBill": self.get_serializer(bill).data,
+                "purchaseBillId": str(purchase_bill.id),
+                "billNumber": purchase_bill.bill_number,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def approve(self, request, pk=None):
+        bill = self.get_object()
+        if bill.status != "Pending":
+            raise Conflict(
+                f"Only a pending bill can be approved. This bill is {bill.status}.",
+                code=Codes.DRAFT_ONLY,
+            )
+        remarks = request.data.get("remarks")
+        now = timezone.now()
+        bill.status = "Approved"
+        if remarks is not None:
+            bill.approval_remarks = remarks
+        bill.approved_by = request.user
+        bill.approved_at = now
+        history = list(bill.approval_history or [])
+        history.append(
+            {
+                "at": now.isoformat(),
+                "by": getattr(request.user, "name", None) or str(request.user),
+                "action": "Approved",
+                "remarks": remarks,
+            }
+        )
+        bill.approval_history = history
+        bill.save(
+            update_fields=[
+                "status", "approval_remarks", "approved_by", "approved_at",
+                "approval_history", "updated_at",
+            ]
+        )
+        self.write_audit("approve", bill, description=remarks)
+        return Response(self.get_serializer(bill).data)
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def reject(self, request, pk=None):
+        bill = self.get_object()
+        if bill.status != "Pending":
+            raise Conflict(
+                f"Only a pending bill can be rejected. This bill is {bill.status}.",
+                code=Codes.DRAFT_ONLY,
+            )
+        remarks = request.data.get("remarks", request.data.get("reason"))
+        now = timezone.now()
+        bill.status = "Rejected"
+        if remarks is not None:
+            bill.approval_remarks = remarks
+        bill.approved_by = request.user
+        bill.approved_at = now
+        history = list(bill.approval_history or [])
+        history.append(
+            {
+                "at": now.isoformat(),
+                "by": getattr(request.user, "name", None) or str(request.user),
+                "action": "Rejected",
+                "remarks": remarks,
+            }
+        )
+        bill.approval_history = history
+        bill.save(
+            update_fields=[
+                "status", "approval_remarks", "approved_by", "approved_at",
+                "approval_history", "updated_at",
+            ]
+        )
+        self.write_audit("reject", bill, description=remarks)
+        return Response(self.get_serializer(bill).data)
+
+    @action(detail=True, methods=["get"], url_path="matching")
+    def matching(self, request, pk=None):
+        """Live PO/GRN comparison for this vendor bill (no DB writes)."""
+        bill = self.get_object()
+        return Response(
+            services.compute_vendor_bill_matching(request.client_id, bill)
+        )
+
+    @action(detail=True, methods=["post"], url_path="recheck-matching")
+    @transaction.atomic
+    def recheck_matching(self, request, pk=None):
+        """Recompute the comparison and persist it on ``match_result``."""
+        bill = self.get_object()
+        result = services.compute_vendor_bill_matching(request.client_id, bill)
+        bill.match_result = result
+        bill.save(update_fields=["match_result", "updated_at"])
+        return Response(result)
+
+    @action(detail=True, methods=["get"], url_path="approval-history")
+    def approval_history(self, request, pk=None):
+        bill = self.get_object()
+        return Response({"history": bill.approval_history or []})
 
 
 class VendorLookupViewSet(ReadOnlyTenantViewSet):

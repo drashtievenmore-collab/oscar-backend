@@ -25,6 +25,24 @@ ITEM_KINDS = [
 #: Kinds that never hold stock (api.md §4.2).
 STOCKLESS_ITEM_KINDS = {"Service"}
 
+#: Permanent fabric catalogue. These are master rows stored in the database
+#: (``masters.Fabric``), never frontend mock data. Seeded by migration 0007
+#: and ``seed_fabrics`` for every tenant.
+DEFAULT_FABRICS = [
+    "Cotton",
+    "Linen",
+    "Silk",
+    "Wool",
+    "Polyester",
+    "Nylon",
+    "Spandex (Elastane)",
+    "Rayon (Viscose)",
+    "Denim",
+    "Velvet",
+    "Chiffon",
+    "Georgette",
+]
+
 DIMENSION_UNITS = [("mm", "mm"), ("cm", "cm"), ("m", "m"), ("in", "in")]
 
 
@@ -282,6 +300,43 @@ class Location(TenantModel, LegacyIdMixin):
                 condition=models.Q(deleted_at__isnull=True),
                 name="uq_locations_code",
             )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class Fabric(TenantModel):
+    """Permanent fabric catalogue (Cotton, Silk, Denim, ...).
+
+    Backs the "Select fabric..." dropdown. Rows live in the database per
+    tenant -- the frontend must fetch ``GET /inventory/fabrics/``, never a
+    hardcoded mock list. ``Item.fabric_quality`` stores the selected fabric
+    name as free text for history; this table is the selectable master.
+    """
+
+    name = models.TextField()
+    code = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "fabrics"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "name"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_fabrics_name",
+            ),
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_fabrics_code",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["client", "name"], name="ix_fabrics_name"),
         ]
 
     def __str__(self):

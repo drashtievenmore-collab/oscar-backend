@@ -15,6 +15,9 @@ router.register("returns", views.PurchaseReturnViewSet, basename="purchase-retur
 router.register("expenses", views.ExpenseViewSet, basename="purchase-expenses")
 router.register("vendors", views.VendorLookupViewSet, basename="purchase-vendors")
 router.register(
+    "vendor-bills", views.VendorBillViewSet, basename="purchase-vendor-bills"
+)
+router.register(
     "quality-standards", QualityStandardViewSet, basename="purchase-quality-standards"
 )
 

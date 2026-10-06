@@ -1,4 +1,7 @@
 """Purchase serializers (api.md §6)."""
+from decimal import Decimal
+
+from django.utils import timezone
 from rest_framework import serializers
 
 from apps.core.document_serializers import (
@@ -7,10 +10,12 @@ from apps.core.document_serializers import (
     DocumentLineSerializer,
     DocumentSerializer,
 )
+from apps.core.money import ZERO, D, round2
 from apps.core.serializers import (
     BaseModelSerializer,
     BaseSerializer,
     MoneyField,
+    PercentField,
     QuantityField,
     TenantPrimaryKeyRelatedField,
 )
@@ -27,6 +32,8 @@ from .models import (
     PurchaseOrderLine,
     PurchaseReturn,
     PurchaseReturnLine,
+    VendorBill,
+    VendorBillLine,
 )
 
 PurchaseOrderLineSerializer = line_serializer_for(
@@ -305,3 +312,209 @@ class BillOutstandingSerializer(BaseSerializer):
     dueDate = serializers.DateField(allow_null=True)
     daysOverdue = serializers.IntegerField()
     ageingBucket = serializers.CharField()
+
+
+# ---------------------------------------------------------------------------
+# Vendor bills -- manual entry, matched later to a real PurchaseBill
+# ---------------------------------------------------------------------------
+class VendorBillLineSerializer(BaseModelSerializer):
+    lineNo = serializers.IntegerField(source="line_no", required=False)
+    itemId = TenantPrimaryKeyRelatedField(
+        source="item", model="masters.Item", required=False, allow_null=True
+    )
+    itemName = serializers.CharField(
+        source="item_name", required=False, allow_null=True, allow_blank=True
+    )
+    qty = QuantityField()
+    rate = QuantityField(required=False)
+    lineTotal = MoneyField(source="line_total", read_only=True)
+
+    class Meta:
+        model = VendorBillLine
+        fields = [
+            "id", "lineNo", "itemId", "sku", "itemName", "uom",
+            "qty", "rate", "amount", "lineTotal",
+        ]
+        read_only_fields = ["amount"]
+
+    def validate(self, attrs):
+        qty = attrs.get("qty")
+        if qty is not None and D(qty) <= ZERO:
+            raise serializers.ValidationError(
+                {"qty": "Quantity must be greater than zero."}
+            )
+        rate = attrs.get("rate")
+        if rate is not None and D(rate) < ZERO:
+            raise serializers.ValidationError(
+                {"rate": "Rate cannot be negative."}
+            )
+        return attrs
+
+
+class VendorBillSerializer(BaseModelSerializer):
+    vendorId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
+    vendorName = serializers.CharField(source="party_name", read_only=True)
+    vendorBillNumber = serializers.CharField(source="vendor_bill_number")
+    billDate = serializers.DateField(source="bill_date")
+    purchaseOrderId = TenantPrimaryKeyRelatedField(
+        source="purchase_order", model="purchase.PurchaseOrder",
+        required=False, allow_null=True,
+    )
+    grnId = TenantPrimaryKeyRelatedField(
+        source="goods_receipt", model="purchase.GoodsReceipt",
+        required=False, allow_null=True,
+    )
+    attachmentFileId = TenantPrimaryKeyRelatedField(
+        source="attachment", model="core.File", required=False, allow_null=True
+    )
+    billFileName = serializers.CharField(source="attachment.file_name", read_only=True)
+    purchaseBillId = serializers.CharField(source="purchase_bill_id", read_only=True)
+    purchaseBillNumber = serializers.CharField(
+        source="purchase_bill.bill_number", read_only=True
+    )
+    gstPct = PercentField(source="gst_pct", required=False)
+    subtotal = MoneyField(read_only=True)
+    gstAmount = MoneyField(source="gst_amount", read_only=True)
+    total = MoneyField(read_only=True)
+    matchStatus = serializers.CharField(source="match_status", read_only=True)
+    remarks = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    approvalRemarks = serializers.CharField(
+        source="approval_remarks", read_only=True
+    )
+    approvedAt = serializers.DateTimeField(source="approved_at", read_only=True)
+    approvedByName = serializers.SerializerMethodField()
+    approvalHistory = serializers.JSONField(
+        source="approval_history", read_only=True
+    )
+    matchResult = serializers.JSONField(source="match_result", read_only=True)
+    lineItems = serializers.ListField(
+        child=serializers.DictField(), required=False, write_only=True
+    )
+
+    class Meta:
+        model = VendorBill
+        fields = [
+            "id", "vendorBillNumber", "billDate", "vendorId", "vendorName",
+            "purchaseOrderId", "grnId", "attachmentFileId", "billFileName",
+            "purchaseBillId", "purchaseBillNumber", "gstPct", "subtotal",
+            "gstAmount", "total", "remarks", "status", "matchStatus",
+            "approvalRemarks", "approvedAt", "approvedByName",
+            "approvalHistory", "matchResult",
+            "lineItems", "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "subtotal", "gstAmount", "total", "matchStatus",
+            "approvalRemarks", "approvedAt", "approvedByName",
+            "approvalHistory", "matchResult",
+            "created_at", "updated_at",
+        ]
+
+    def get_approvedByName(self, bill):
+        user = getattr(bill, "approved_by", None)
+        return getattr(user, "name", None) if user is not None else None
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None) or self.context.get("client_id")
+        number = attrs.get(
+            "vendor_bill_number",
+            getattr(self.instance, "vendor_bill_number", None),
+        )
+        if number is not None and client_id is not None:
+            duplicates = VendorBill.objects.filter(
+                client_id=client_id,
+                vendor_bill_number=number,
+                deleted_at__isnull=True,
+            )
+            if self.instance is not None:
+                duplicates = duplicates.exclude(pk=self.instance.pk)
+            if duplicates.exists():
+                raise serializers.ValidationError(
+                    {"vendorBillNumber": "A vendor bill with this number already exists."}
+                )
+        gst_pct = attrs.get("gst_pct", getattr(self.instance, "gst_pct", None))
+        if gst_pct is not None and D(gst_pct) < ZERO:
+            raise serializers.ValidationError(
+                {"gstPct": "GST % cannot be negative."}
+            )
+        lines = attrs.get("lineItems", None)
+        if (self.instance is None and not lines) or lines == []:
+            raise serializers.ValidationError(
+                {"lineItems": "Add at least one line."}
+            )
+        return attrs
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        lines = instance.line_items.filter(deleted_at__isnull=True).order_by("line_no")
+        data["lineItems"] = VendorBillLineSerializer(
+            lines, many=True, context=self.context
+        ).data
+        return data
+
+    def create(self, validated_data):
+        line_payloads = validated_data.pop("lineItems", [])
+        bill = super().create(validated_data)
+        bill.freeze_party_snapshot()
+        bill.save(update_fields=["party_name", "updated_at"])
+        self._write_lines(bill, line_payloads)
+        self._recalculate(bill)
+        return bill
+
+    def update(self, instance, validated_data):
+        line_payloads = validated_data.pop("lineItems", None)
+        bill = super().update(instance, validated_data)
+        if "party" in validated_data:
+            bill.freeze_party_snapshot()
+            bill.save(update_fields=["party_name", "updated_at"])
+        if line_payloads is not None:
+            self._replace_lines(bill, line_payloads)
+        self._recalculate(bill)
+        return bill
+
+    def _write_lines(self, bill, payloads):
+        for index, payload in enumerate(payloads or [], start=1):
+            line_serializer = VendorBillLineSerializer(
+                data=payload, context=self.context
+            )
+            line_serializer.is_valid(raise_exception=True)
+            data = dict(line_serializer.validated_data)
+            data.setdefault("line_no", index)
+            line = VendorBillLine(
+                client_id=bill.client_id, vendor_bill=bill, **data
+            )
+            line.freeze_item_snapshot()
+            line.save()
+
+    def _replace_lines(self, bill, payloads):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not getattr(user, "is_authenticated", False):
+            user = None
+        for old in bill.line_items.filter(deleted_at__isnull=True):
+            old.deleted_at = timezone.now()
+            old.deleted_by = user
+            old.save(update_fields=["deleted_at", "deleted_by", "updated_at"])
+        self._write_lines(bill, payloads)
+
+    def _recalculate(self, bill):
+        lines = list(
+            bill.line_items.filter(deleted_at__isnull=True).order_by("line_no")
+        )
+        subtotal = ZERO
+        for line in lines:
+            line.amount = round2(D(line.qty) * D(line.rate))
+            line.line_total = line.amount
+            subtotal += line.amount
+        if lines:
+            VendorBillLine.objects.bulk_update(
+                lines, ["amount", "line_total", "updated_at"]
+            )
+        bill.subtotal = round2(subtotal)
+        bill.gst_amount = round2(
+            bill.subtotal * D(bill.gst_pct) / Decimal("100")
+        )
+        bill.total = round2(bill.subtotal + bill.gst_amount)
+        bill.save(
+            update_fields=["subtotal", "gst_amount", "total", "updated_at"]
+        )

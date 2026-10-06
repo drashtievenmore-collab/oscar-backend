@@ -9,6 +9,7 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from apps.masters.views import (
+    FabricViewSet,
     ItemCategoryViewSet,
     ItemViewSet,
     LocationViewSet,
@@ -22,6 +23,7 @@ router.register("items", ItemViewSet, basename="inventory-items")
 router.register("categories", ItemCategoryViewSet, basename="inventory-categories")
 router.register("units", UnitViewSet, basename="inventory-units")
 router.register("locations", LocationViewSet, basename="inventory-locations")
+router.register("fabrics", FabricViewSet, basename="inventory-fabrics")
 router.register("movements", views.StockMovementViewSet, basename="inventory-movements")
 router.register("transfers", views.StockTransferViewSet, basename="inventory-transfers")
 router.register("faulty-parts", views.FaultyPartViewSet, basename="inventory-faulty-parts")

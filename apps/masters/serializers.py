@@ -14,6 +14,7 @@ from apps.core.serializers import (
 from .models import (
     CategoryCustomField,
     CategoryPart,
+    Fabric,
     Item,
     ItemCategory,
     ItemPart,
@@ -193,6 +194,38 @@ class LocationSerializer(BaseModelSerializer):
         if not attrs.get("code") and not self.instance:
             attrs["code"] = slug_code(attrs.get("name"), "LOC")
         return attrs
+
+
+class FabricSerializer(BaseModelSerializer):
+    """Permanent fabric master -- the "Select fabric..." dropdown source."""
+
+    class Meta:
+        model = Fabric
+        fields = [
+            "id", "name", "code", "description", "is_active",
+            "created_at", "updated_at",
+        ]
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if not attrs.get("code") and not self.instance:
+            attrs["code"] = slug_code(attrs.get("name"), "FABRIC")
+        return attrs
+
+    def validate_name(self, value):
+        cleaned = (value or "").strip()
+        if not cleaned:
+            raise serializers.ValidationError("Fabric name is required.")
+        client_id = self.context.get("client_id")
+        existing = Fabric.objects.filter(
+            client_id=client_id, name__iexact=cleaned, deleted_at__isnull=True
+        )
+        if self.instance is not None:
+            existing = existing.exclude(pk=self.instance.pk)
+        if existing.exists():
+            raise serializers.ValidationError("This fabric already exists.")
+        return cleaned
 
 
 # ---------------------------------------------------------------------------
