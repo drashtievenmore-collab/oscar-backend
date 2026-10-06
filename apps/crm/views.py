@@ -285,16 +285,32 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
 
         party = lead.party
         if party is None and request.data.get("createCustomer", True):
-            party = Party.objects.create(
-                client_id=request.client_id,
-                code=allocate_number(request.user.client, "CUST"),
-                type="Customer",
-                name=lead.company or lead.name,
-                phone=lead.phone,
-                email=lead.email,
-                place_of_supply=lead.state,
-                created_by=request.user,
+            # Link, don't duplicate: an identical live party (same tenant, same
+            # name) wins over a new row. Leads converted before this endpoint
+            # existed already have a customer on file, and re-running the UI's
+            # convert must never mint a second CUST- code for the same name.
+            party_name = lead.company or lead.name
+            party = (
+                Party.objects.filter(
+                    client_id=request.client_id,
+                    type__in=["Customer", "Both"],
+                    name__iexact=party_name,
+                    deleted_at__isnull=True,
+                )
+                .order_by("created_at")
+                .first()
             )
+            if party is None:
+                party = Party.objects.create(
+                    client_id=request.client_id,
+                    code=allocate_number(request.user.client, "CUST"),
+                    type="Customer",
+                    name=party_name,
+                    phone=lead.phone,
+                    email=lead.email,
+                    place_of_supply=lead.state,
+                    created_by=request.user,
+                )
             lead.party = party
 
         deal = Deal.objects.create(
@@ -352,7 +368,7 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
                          "actor": task.assignee.name if task.assignee_id else None})
         for entry in AuditLog.objects.filter(
             client_id=request.client_id, entity_type="CrmLead", entity_id=lead.id
-        )[:100]:
+        ).exclude(action="update", description="").exclude(action="update", description__isnull=True)[:100]:
             rows.append({"type": "activity", "id": str(entry.id), "at": entry.created_at,
                          "title": entry.description or entry.action,
                          "body": None, "actor": entry.actor_name,

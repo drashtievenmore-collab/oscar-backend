@@ -21,7 +21,14 @@ from apps.core.documents import (
 )
 from apps.core.models import LegacyIdMixin, TenantModel
 
-PO_STATUSES = ["Draft", "Issued", "Pending", "Received", "Cancelled"]
+# Existing legacy values are retained; Oscar grey-fabric workflow adds the
+# following so the UI can track the real lifecycle (Draft -> Pending Approval
+# -> Approved -> In Production -> Partially/Fully Received -> Cancelled).
+PO_STATUSES = [
+    "Draft", "Issued", "Pending", "Received", "Cancelled",
+    "Pending Approval", "Approved", "In Production",
+    "Partially Received", "Fully Received",
+]
 BILL_STATUSES = ["Draft", "Unpaid", "Partially Paid", "Paid", "Cancelled"]
 #: api.md §6.4 -- only `Approved` releases stock for sale or dispatch.
 QC_STATUSES = ["Approved", "Pending Approval", "Rejected", "Rework"]

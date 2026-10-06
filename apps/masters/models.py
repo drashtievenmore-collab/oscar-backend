@@ -19,6 +19,7 @@ ITEM_KINDS = [
     ("Service", "Service"),
     ("Component", "Component"),
     ("Consumable", "Consumable"),
+    ("Fabric", "Fabric"),
 ]
 
 #: Kinds that never hold stock (api.md §4.2).
@@ -31,7 +32,34 @@ DIMENSION_UNITS = [("mm", "mm"), ("cm", "cm"), ("m", "m"), ("in", "in")]
 # db.md §4.1 -- Parties
 # ---------------------------------------------------------------------------
 class Party(TenantModel, LegacyIdMixin):
-    TYPES = [("Customer", "Customer"), ("Vendor", "Vendor"), ("Both", "Both")]
+    TYPES = [
+        ("Customer", "Customer"),
+        ("Vendor", "Vendor"),
+        ("Both", "Both"),
+        ("Transporter", "Transporter"),
+    ]
+    #: Supplier classification (db.md §4.1 addendum) -- only meaningful when
+    #: ``type == "Vendor"``; left null for every other role.
+    VENDOR_TYPES = [
+        ("Manufacturing", "Manufacturing"),
+        ("Dyeing - Other Process", "Dyeing - Other Process"),
+    ]
+    #: Fleet classification -- only meaningful when ``type == "Transporter"``.
+    VEHICLE_TYPES = [
+        ("Truck", "Truck"),
+        ("Mini Truck / LCV", "Mini Truck / LCV"),
+        ("Trailer", "Trailer"),
+        ("Container", "Container"),
+        ("Tanker", "Tanker"),
+        ("Tempo", "Tempo"),
+        ("Other", "Other"),
+    ]
+    CAPACITY_UNITS = [
+        ("Tons", "Tons"),
+        ("Kg", "Kg"),
+        ("Litres", "Litres"),
+        ("Taka", "Taka"),
+    ]
     GST_TREATMENTS = [
         ("Registered Business", "Registered Business"),
         ("Unregistered Business", "Unregistered Business"),
@@ -44,6 +72,16 @@ class Party(TenantModel, LegacyIdMixin):
 
     code = models.TextField()
     type = models.TextField(choices=TYPES, default="Customer")
+    vendor_type = models.TextField(choices=VENDOR_TYPES, null=True, blank=True)
+    #: Transporter fleet details (``type == "Transporter"`` only).
+    vehicle_number = models.TextField(null=True, blank=True)
+    vehicle_type = models.TextField(choices=VEHICLE_TYPES, null=True, blank=True)
+    vehicle_capacity = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True
+    )
+    vehicle_capacity_unit = models.TextField(
+        choices=CAPACITY_UNITS, null=True, blank=True
+    )
     name = models.TextField()
     phone = models.TextField(null=True, blank=True)
     email = models.EmailField(null=True, blank=True)
@@ -312,6 +350,15 @@ class Item(TenantModel, LegacyIdMixin):
         max_digits=18, decimal_places=4, null=True, blank=True
     )
     dimension_unit = models.TextField(null=True, blank=True)  # legacy single-axis unit
+
+    # Fabric spec (``item_kind == "Fabric"``) — the textile catalogue fields:
+    # quality (Cotton/Polyester/…), weave design, colour, width and GSM.
+    fabric_quality = models.TextField(null=True, blank=True)
+    fabric_design = models.TextField(null=True, blank=True)
+    fabric_color = models.TextField(null=True, blank=True)
+    #: Width in inches (58", 60", …) — the way greige fabric is traded.
+    fabric_width = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    fabric_gsm = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
 
     class Meta:
         db_table = "items"

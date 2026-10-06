@@ -52,6 +52,7 @@ SERIES_DEFAULTS = {
     # Masters / HRMS
     "CUST": ("CUST", "never", 4, "-"),
     "VEND": ("VEND", "never", 4, "-"),
+    "TRNS": ("TRNS", "never", 4, "-"),
     "EMP": ("EMP", "never", 4, ""),
     "ASSET": ("AST", "never", 4, "-"),
     # Grey-fabric production wiring (HRMS_ERP_CHANGES.md)

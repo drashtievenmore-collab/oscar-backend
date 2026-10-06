@@ -60,7 +60,9 @@ class PartySerializer(BaseModelSerializer):
     class Meta:
         model = Party
         fields = [
-            "id", "code", "type", "name", "phone", "email",
+            "id", "code", "type", "vendor_type",
+            "vehicle_number", "vehicle_type", "vehicle_capacity", "vehicle_capacity_unit",
+            "name", "phone", "email",
             "gst_treatment", "gstin", "gst_notes", "place_of_supply",
             "tds_applicable", "tds_section", "tds_rate",
             "tcs_applicable", "tcs_rate",
@@ -244,6 +246,8 @@ class ItemSerializer(BaseModelSerializer):
             "has_sheet_spec", "sheet_height", "sheet_height_unit",
             "sheet_width", "sheet_width_unit", "sheet_length", "sheet_length_unit",
             "sheet_weight_kg", "dimension_unit",
+            "fabric_quality", "fabric_design", "fabric_color",
+            "fabric_width", "fabric_gsm",
             "custom_field_values",
             "created_at", "updated_at",
         ]

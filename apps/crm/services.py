@@ -160,11 +160,13 @@ def run_stage_automation(lead, stage, *, user=None):
 
     created = []
     for template in templates:
-        # A non-repeating template creates its task once per lead, so moving
-        # back and forth between stages does not pile up duplicates.
-        if not template.repeats and Task.objects.filter(
+        # ``repeats`` caps how many times the template fires per lead: 1 (or
+        # empty) creates the task once, so moving back and forth between
+        # stages does not pile up duplicates; N allows up to N copies.
+        limit = template.repeats if (template.repeats or 0) > 0 else 1
+        if Task.objects.filter(
             client_id=lead.client_id, lead=lead, stage_task=template, deleted_at__isnull=True
-        ).exists():
+        ).count() >= limit:
             continue
 
         assignee = resolve_assignee(

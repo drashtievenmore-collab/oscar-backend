@@ -83,7 +83,9 @@ class PartyViewSet(TenantModelViewSet):
         # The server owns the party code (api.md §1.7): the client must never
         # invent one, and a collision on a hand-typed code is a support ticket.
         if not serializer.validated_data.get("code"):
-            series = "VEND" if serializer.validated_data.get("type") == "Vendor" else "CUST"
+            series = {"Vendor": "VEND", "Transporter": "TRNS"}.get(
+                serializer.validated_data.get("type"), "CUST"
+            )
             serializer.validated_data["code"] = allocate_number(
                 self.request.user.client, series
             )

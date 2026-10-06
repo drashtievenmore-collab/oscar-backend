@@ -362,7 +362,9 @@ class StageTask(TenantModel):
     sort_order = models.IntegerField(default=0)
     required = models.BooleanField(default=False)
     auto_create = models.BooleanField(default=True)
-    repeats = models.BooleanField(default=False)
+    #: Max times the automation may fire this template for one lead
+    #: (1 = create the task once). The UI edits it as "MAX REPEATS".
+    repeats = models.IntegerField(default=1, null=True, blank=True)
 
     class Meta:
         db_table = "crm_stage_tasks"
