@@ -14,6 +14,7 @@ from apps.core.serializers import (
 from .models import (
     CategoryCustomField,
     CategoryPart,
+    Fabric,
     Item,
     ItemCategory,
     ItemPart,
@@ -60,7 +61,9 @@ class PartySerializer(BaseModelSerializer):
     class Meta:
         model = Party
         fields = [
-            "id", "code", "type", "name", "phone", "email",
+            "id", "code", "type", "vendor_type",
+            "vehicle_number", "vehicle_type", "vehicle_capacity", "vehicle_capacity_unit",
+            "name", "phone", "email",
             "gst_treatment", "gstin", "gst_notes", "place_of_supply",
             "tds_applicable", "tds_section", "tds_rate",
             "tcs_applicable", "tcs_rate",
@@ -193,6 +196,38 @@ class LocationSerializer(BaseModelSerializer):
         return attrs
 
 
+class FabricSerializer(BaseModelSerializer):
+    """Permanent fabric master -- the "Select fabric..." dropdown source."""
+
+    class Meta:
+        model = Fabric
+        fields = [
+            "id", "name", "code", "description", "is_active",
+            "created_at", "updated_at",
+        ]
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if not attrs.get("code") and not self.instance:
+            attrs["code"] = slug_code(attrs.get("name"), "FABRIC")
+        return attrs
+
+    def validate_name(self, value):
+        cleaned = (value or "").strip()
+        if not cleaned:
+            raise serializers.ValidationError("Fabric name is required.")
+        client_id = self.context.get("client_id")
+        existing = Fabric.objects.filter(
+            client_id=client_id, name__iexact=cleaned, deleted_at__isnull=True
+        )
+        if self.instance is not None:
+            existing = existing.exclude(pk=self.instance.pk)
+        if existing.exists():
+            raise serializers.ValidationError("This fabric already exists.")
+        return cleaned
+
+
 # ---------------------------------------------------------------------------
 # Items (api.md §4.2)
 # ---------------------------------------------------------------------------
@@ -244,6 +279,8 @@ class ItemSerializer(BaseModelSerializer):
             "has_sheet_spec", "sheet_height", "sheet_height_unit",
             "sheet_width", "sheet_width_unit", "sheet_length", "sheet_length_unit",
             "sheet_weight_kg", "dimension_unit",
+            "fabric_quality", "fabric_design", "fabric_color",
+            "fabric_width", "fabric_gsm",
             "custom_field_values",
             "created_at", "updated_at",
         ]

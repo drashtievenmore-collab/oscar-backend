@@ -42,6 +42,7 @@ from .models import (
     PurchaseBillLine,
     PurchaseOrder,
     PurchaseOrderLine,
+    VendorBill,
 )
 
 #: api.md §6.3 -- tolerancePct resolution order: line -> item -> 2.
@@ -817,3 +818,209 @@ def cancel_bill(bill, *, reason=None, user=None):
         deleted_at=timezone.now()
     )
     return bill
+
+
+# ---------------------------------------------------------------------------
+# Vendor-bill matching (VendorBill -> PO + GRN, read-only computation)
+# ---------------------------------------------------------------------------
+def compute_vendor_bill_matching(client_id, bill):
+    """Compare a vendor bill's lines against its PO and GRN.
+
+    Pure computation -- performs no DB writes. All Decimal values are
+    converted to float in the output so the result is JSON-serializable.
+    """
+    if not isinstance(bill, VendorBill):
+        bill = VendorBill.objects.filter(pk=getattr(bill, "pk", bill)).first()
+        if bill is None:
+            raise ValidationFailed(
+                "That vendor bill no longer exists.",
+                field_errors={"vendorBill": ["Not found."]},
+            )
+
+    bill_lines = list(
+        bill.line_items.filter(deleted_at__isnull=True)
+        .select_related("item")
+        .order_by("line_no")
+    )
+
+    po = bill.purchase_order
+    if po is not None and getattr(po, "deleted_at", None) is not None:
+        po = None
+    po_lines = []
+    if po is not None:
+        po_lines = list(
+            PurchaseOrderLine.objects.filter(
+                purchase_order=po, deleted_at__isnull=True
+            )
+            .select_related("item")
+            .order_by("line_no")
+        )
+
+    grn = None
+    if bill.goods_receipt_id is not None:
+        grn = (
+            GoodsReceipt.objects.filter(
+                pk=bill.goods_receipt_id, deleted_at__isnull=True
+            )
+            .prefetch_related("lines__item")
+            .first()
+        )
+    if grn is None and po is not None:
+        grn = (
+            GoodsReceipt.objects.filter(
+                client_id=client_id or bill.client_id,
+                purchase_order=po,
+                deleted_at__isnull=True,
+            )
+            .order_by("-receipt_date", "-created_at")
+            .prefetch_related("lines__item")
+            .first()
+        )
+    grn_lines = list(grn.lines.all()) if grn is not None else []
+
+    def _sku(value):
+        return (value or "").strip().lower() or None
+
+    def _po_line_key(line):
+        item_id = getattr(line, "item_id", None)
+        sku = _sku(getattr(line, "sku", None)) or _sku(
+            getattr(getattr(line, "item", None), "sku", None)
+        )
+        return item_id, sku, getattr(line, "line_no", None)
+
+    po_by_item = {}
+    po_by_sku = {}
+    po_by_line_no = {}
+    for po_line in po_lines:
+        item_id, sku, line_no = _po_line_key(po_line)
+        if item_id is not None:
+            po_by_item.setdefault(str(item_id), po_line)
+        if sku is not None:
+            po_by_sku.setdefault(sku, po_line)
+        if line_no is not None:
+            po_by_line_no.setdefault(line_no, po_line)
+
+    grn_by_item = {}
+    grn_by_sku = {}
+    for grn_line in grn_lines:
+        item_id = getattr(grn_line, "item_id", None)
+        sku = _sku(getattr(getattr(grn_line, "item", None), "sku", None))
+        if item_id is not None:
+            grn_by_item.setdefault(str(item_id), grn_line)
+        if sku is not None:
+            grn_by_sku.setdefault(sku, grn_line)
+
+    def _match_po(bill_line):
+        item_id = getattr(bill_line, "item_id", None)
+        if item_id is not None and str(item_id) in po_by_item:
+            return po_by_item[str(item_id)]
+        sku = _sku(getattr(bill_line, "sku", None)) or _sku(
+            getattr(getattr(bill_line, "item", None), "sku", None)
+        )
+        if sku is not None and sku in po_by_sku:
+            return po_by_sku[sku]
+        line_no = getattr(bill_line, "line_no", None)
+        if line_no is not None and line_no in po_by_line_no:
+            return po_by_line_no[line_no]
+        return None
+
+    def _match_grn(bill_line):
+        item_id = getattr(bill_line, "item_id", None)
+        if item_id is not None and str(item_id) in grn_by_item:
+            return grn_by_item[str(item_id)]
+        sku = _sku(getattr(bill_line, "sku", None)) or _sku(
+            getattr(getattr(bill_line, "item", None), "sku", None)
+        )
+        if sku is not None and sku in grn_by_sku:
+            return grn_by_sku[sku]
+        return None
+
+    rows = []
+    total_po_qty = ZERO
+    total_bill_qty = ZERO
+    total_grn_qty = ZERO
+    total_po_amount = ZERO
+    total_bill_amount = ZERO
+    first_rate_diff = None
+    all_match = True
+
+    for bill_line in bill_lines:
+        po_line = _match_po(bill_line) if po is not None else None
+        grn_line = _match_grn(bill_line) if grn is not None else None
+
+        bill_qty = D(getattr(bill_line, "qty", 0))
+        bill_rate = D(getattr(bill_line, "rate", 0))
+        bill_amount = D(getattr(bill_line, "amount", 0))
+        po_qty = D(getattr(po_line, "qty", 0)) if po_line is not None else ZERO
+        po_rate = D(getattr(po_line, "rate", 0)) if po_line is not None else ZERO
+        po_amount = D(getattr(po_line, "amount", 0)) if po_line is not None else ZERO
+        grn_qty = (
+            D(getattr(grn_line, "received_qty", 0))
+            if grn_line is not None
+            else ZERO
+        )
+
+        qty_match = bill_qty == po_qty
+        rate_match = bill_rate == po_rate
+        amount_match = bill_amount == po_amount
+        line_status = "Match" if (qty_match and rate_match and amount_match) else "Mismatch"
+        if line_status != "Match":
+            all_match = False
+            if first_rate_diff is None:
+                first_rate_diff = bill_rate - po_rate
+
+        total_po_qty += po_qty
+        total_bill_qty += bill_qty
+        total_grn_qty += grn_qty
+        total_po_amount += po_amount
+        total_bill_amount += bill_amount
+
+        fabric = (
+            getattr(bill_line, "item_name", None)
+            or getattr(po_line, "item_name", None)
+            or getattr(getattr(bill_line, "item", None), "name", None)
+        )
+        sku = getattr(bill_line, "sku", None) or getattr(
+            getattr(bill_line, "item", None), "sku", None
+        )
+        rows.append(
+            {
+                "lineNo": getattr(bill_line, "line_no", None),
+                "fabric": fabric,
+                "sku": sku,
+                "poQty": float(po_qty),
+                "grnQty": float(grn_qty),
+                "billQty": float(bill_qty),
+                "poRate": float(po_rate),
+                "billRate": float(bill_rate),
+                "poAmount": float(po_amount),
+                "billAmount": float(bill_amount),
+                "qtyMatch": qty_match,
+                "rateMatch": rate_match,
+                "amountMatch": amount_match,
+                "status": line_status,
+            }
+        )
+
+    overall = "Match" if all_match else "Mismatch"
+    summary = {
+        "poQty": float(total_po_qty),
+        "billQty": float(total_bill_qty),
+        "grnQty": float(total_grn_qty),
+        "poAmount": float(total_po_amount),
+        "billAmount": float(total_bill_amount),
+        "qtyDiff": float(total_bill_qty - total_po_qty),
+        "rateDiff": float(first_rate_diff) if first_rate_diff is not None else 0.0,
+        "amountDiff": float(total_bill_amount - total_po_amount),
+    }
+
+    result = {
+        "poNumber": getattr(po, "po_number", None),
+        "grnNumber": getattr(grn, "grn_number", None),
+        "lines": rows,
+        "summary": summary,
+        "overallStatus": overall,
+    }
+    if grn is None:
+        result["note"] = "No GRN found for this purchase order."
+    return result

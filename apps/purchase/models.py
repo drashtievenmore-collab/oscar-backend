@@ -21,7 +21,14 @@ from apps.core.documents import (
 )
 from apps.core.models import LegacyIdMixin, TenantModel
 
-PO_STATUSES = ["Draft", "Issued", "Pending", "Received", "Cancelled"]
+# Existing legacy values are retained; Oscar grey-fabric workflow adds the
+# following so the UI can track the real lifecycle (Draft -> Pending Approval
+# -> Approved -> In Production -> Partially/Fully Received -> Cancelled).
+PO_STATUSES = [
+    "Draft", "Issued", "Pending", "Received", "Cancelled",
+    "Pending Approval", "Approved", "In Production",
+    "Partially Received", "Fully Received",
+]
 BILL_STATUSES = ["Draft", "Unpaid", "Partially Paid", "Paid", "Cancelled"]
 #: api.md §6.4 -- only `Approved` releases stock for sale or dispatch.
 QC_STATUSES = ["Approved", "Pending Approval", "Rejected", "Rework"]
@@ -391,3 +398,133 @@ class Expense(TenantModel, LegacyIdMixin):
 
     def __str__(self):
         return self.expense_number
+
+
+# ---------------------------------------------------------------------------
+# Vendor bills -- manual entry, matched later to a real PurchaseBill
+# ---------------------------------------------------------------------------
+VENDOR_BILL_STATUSES = ["Pending", "Approved", "Rejected"]
+VENDOR_BILL_MATCH_STATUSES = ["Pending Matching", "Matched"]
+
+
+class VendorBill(TenantModel, LegacyIdMixin):
+    """A vendor invoice entered manually, before it is matched to a bill.
+
+    Deliberately separate from :class:`PurchaseBill`: the vendor's own
+    invoice number and tax are captured here, and ``send-for-matching``
+    creates the real ``PurchaseBill`` Draft from it. Creating or editing a
+    vendor bill never posts stock or ledger entries.
+    """
+
+    vendor_bill_number = models.TextField()
+    bill_date = models.DateField()
+    party = models.ForeignKey(
+        "masters.Party", on_delete=models.PROTECT, related_name="vendor_bills"
+    )
+    #: Frozen at creation -- editing the party later must not rewrite history.
+    party_name = models.TextField(null=True, blank=True)
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="vendor_bills",
+    )
+    goods_receipt = models.ForeignKey(
+        GoodsReceipt, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="vendor_bills",
+    )
+    attachment = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    gst_pct = models.DecimalField(max_digits=7, decimal_places=4, default=5)
+    #: All DERIVED from the lines (header-level GST, not per-line tax).
+    subtotal = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    gst_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    total = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    remarks = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=choices(VENDOR_BILL_STATUSES), default="Pending")
+    match_status = models.TextField(
+        choices=choices(VENDOR_BILL_MATCH_STATUSES), default="Pending Matching"
+    )
+    purchase_bill = models.ForeignKey(
+        PurchaseBill, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="vendor_bills",
+    )
+    approval_remarks = models.TextField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approval_history = models.JSONField(default=list)
+    match_result = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        db_table = "purchase_vendor_bills"
+        ordering = ["-bill_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "vendor_bill_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_vendor_bill_number",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["client", "status"], name="ix_vendor_bills_status"),
+            models.Index(
+                fields=["client", "match_status"], name="ix_vendor_bills_match"
+            ),
+        ]
+
+    def __str__(self):
+        return self.vendor_bill_number
+
+    def freeze_party_snapshot(self, party=None):
+        party = party or self.party
+        if party is None:
+            return
+        self.party_name = party.name
+
+
+class VendorBillLine(TenantModel):
+    vendor_bill = models.ForeignKey(
+        VendorBill, on_delete=models.CASCADE, related_name="line_items"
+    )
+    line_no = models.IntegerField(default=1)
+    item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.PROTECT, related_name="+"
+    )
+    # -- frozen display copies ----------------------------------------------
+    sku = models.TextField(null=True, blank=True)
+    item_name = models.TextField(null=True, blank=True)
+    uom = models.TextField(null=True, blank=True)
+
+    qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    rate = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    line_total = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+
+    class Meta:
+        db_table = "purchase_vendor_bill_lines"
+        ordering = ["line_no"]
+        constraints = [
+            # Partial like every unique index on a soft-deletable table: line
+            # replacement soft-deletes the old rows, which must not block the
+            # new rows reusing the same line numbers.
+            models.UniqueConstraint(
+                fields=["vendor_bill", "line_no"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_vendor_bill_line_no",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["item", "vendor_bill"], name="ix_vendor_bill_lines_item"
+            )
+        ]
+
+    def freeze_item_snapshot(self, item=None):
+        item = item or self.item
+        if item is None:
+            return
+        self.sku = item.sku
+        self.item_name = item.name
+        self.uom = self.uom or item.uom

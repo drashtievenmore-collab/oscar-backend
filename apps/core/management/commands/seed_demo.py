@@ -221,7 +221,18 @@ class Command(BaseCommand):
         return {"bank": bank}
 
     def _seed_masters(self, client, admin):
-        from apps.masters.models import Item, ItemCategory, Location, Party, Unit
+        from apps.masters.models import DEFAULT_FABRICS, Fabric, Item, ItemCategory, Location, Party, Unit
+
+        import re
+
+        def _slug(name):
+            cleaned = re.sub(r"[^A-Za-z0-9]+", "-", (name or "").strip()).strip("-").upper()
+            return cleaned[:24] or "FABRIC"
+
+        for name in DEFAULT_FABRICS:
+            Fabric.objects.get_or_create(
+                client=client, name=name, defaults={"code": _slug(name)}
+            )
 
         for code, label in (
             ("Nos", "Numbers"), ("Kg", "Kilogram"), ("Mtr", "Metre"),
@@ -247,6 +258,7 @@ class Command(BaseCommand):
             ("CAT-PIPE", "MS Pipe", "stock", "7306.30"),
             ("CAT-FAST", "Fasteners", "stock", "7318.15"),
             ("CAT-MACHINE", "Assembled Machines", "machine", "8479.89"),
+            ("CAT-FABRIC", "Grey Fabric", "stock", "5208.52"),
         ):
             category, _ = ItemCategory.objects.get_or_create(
                 client=client,
@@ -298,11 +310,37 @@ class Command(BaseCommand):
             )
             items[legacy] = item
 
+        # Fabric-kind items for the PO grey-fabric dropdown (meter-based).
+        def _sku(name):
+            cleaned = re.sub(r"[^A-Za-z0-9]+", "-", name.strip()).strip("-").upper()
+            return f"FAB-{cleaned}"[:40]
+
+        for name in DEFAULT_FABRICS:
+            item, _ = Item.objects.get_or_create(
+                client=client,
+                sku=_sku(name),
+                defaults={
+                    "name": f"{name} Grey Fabric",
+                    "category": categories["CAT-FABRIC"],
+                    "item_kind": "Fabric",
+                    "uom": "Mtr",
+                    "hsn_code": "5208.52",
+                    "cost_price": Decimal("0"),
+                    "selling_price": Decimal("0"),
+                    "reorder_level": Decimal("0"),
+                    "fabric_quality": name,
+                    "default_location": locations["WH-MAIN"],
+                    "created_by": admin,
+                },
+            )
+            items[_sku(name)] = item
+
         # A machine with a BOM, so the explosion endpoint has something to say.
         machine, made = Item.objects.get_or_create(
             client=client,
             sku="MCH-CONV-01",
             defaults={
+            
                 "legacy_id": "itm-100",
                 "name": "Belt Conveyor 6m",
                 "category": categories["CAT-MACHINE"],

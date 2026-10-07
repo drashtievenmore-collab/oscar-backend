@@ -1,5 +1,10 @@
 """
-PMS -- Project Management (db.md §10, api.md §10).
+PMS -- Project Management (db.md §10, api.md §10) plus grey fabric monitoring.
+
+Project work uses Project, Stage, Task, Document, Approval, Delay. Grey fabric
+work uses ProductionInstruction, DailyProductionEntry, IncentiveScheme,
+IncentiveCalculation with prod_* tables. The two tracks share the app but not
+the tables. HRMS Employee is read only here.
 
 Replaces ``stores/pmsStore.js`` (~3k lines, localStorage-persisted) and
 ``stores/proofShareStore.js``. The frontend keeps stages, tasks, documents,
@@ -503,3 +508,198 @@ class Settings(TenantModel):
         "Client Revision",
         "Other",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Grey fabric production monitoring (moved from apps.production per product
+# decision). Tables keep prod_* names so existing rows stay valid. HRMS is
+# read only here: instructions and entries point at hrms Employee.
+# ---------------------------------------------------------------------------
+class ProductionInstruction(TenantModel):
+    STATUSES = [
+        ("Draft", "Draft"),
+        ("In Progress", "In Progress"),
+        ("Completed", "Completed"),
+        ("Verified", "Verified"),
+        ("Closed", "Closed"),
+    ]
+
+    instruction_number = models.TextField(null=True, blank=True)
+    agency_name = models.TextField()
+    order_reference = models.TextField()
+    order_meter = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    pi_date = models.DateField(null=True, blank=True)
+    fabric = models.TextField(null=True, blank=True)
+    process_type = models.TextField(null=True, blank=True)
+    agreed_job_rate = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    rejected_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    verification_remarks = models.TextField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    completed_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    employee = models.ForeignKey(
+        "hrms.Employee",
+        on_delete=models.PROTECT,
+        related_name="production_instructions",
+    )
+    supervisor = models.ForeignKey(
+        "hrms.Employee",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="supervised_production_instructions",
+    )
+    status = models.TextField(choices=[(s, s) for s in
+                                       ["Draft", "In Progress", "Completed", "Verified", "Closed"]],
+                              default="Draft")
+    verified_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    verified_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "prod_instructions"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "instruction_number"],
+                condition=models.Q(
+                    deleted_at__isnull=True, instruction_number__isnull=False
+                ),
+                name="uq_prod_instructions_number",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(order_meter__gte=0), name="ck_prod_instructions_meter"
+            ),
+            models.CheckConstraint(
+                condition=models.Q(agreed_job_rate__gte=0),
+                name="ck_prod_instructions_rate",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(rejected_qty__gte=0),
+                name="ck_prod_instructions_rejected",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["client", "agency_name"], name="ix_prod_instructions_agency"),
+            models.Index(fields=["client", "employee"], name="ix_prod_instructions_emp"),
+        ]
+
+    def __str__(self):
+        return self.instruction_number or f"Instruction {self.id}"
+
+
+class DailyProductionEntry(TenantModel):
+    instruction = models.ForeignKey(
+        ProductionInstruction, on_delete=models.CASCADE, related_name="daily_entries"
+    )
+    entry_date = models.DateField()
+    meters = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    entered_by_employee = models.ForeignKey(
+        "hrms.Employee", on_delete=models.PROTECT, related_name="production_entries"
+    )
+    entered_by_user = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "prod_daily_entries"
+        ordering = ["entry_date", "-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(meters__gt=0), name="ck_prod_daily_entries_meters"
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["client", "instruction", "entry_date"],
+                name="ix_prod_daily_entries_instr",
+            ),
+            models.Index(
+                fields=["client", "entered_by_employee", "entry_date"],
+                name="ix_prod_daily_entries_emp",
+            ),
+        ]
+
+
+class IncentiveScheme(TenantModel):
+    name = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    rate_pct = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    applies_from = models.DateField(null=True, blank=True)
+    applies_to = models.DateField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "incentive_schemes"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "name"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_incentive_schemes_name",
+            ),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class IncentiveCalculation(TenantModel):
+    STATUSES = [("Calculated", "Calculated"), ("Posted", "Posted"), ("Reversed", "Reversed")]
+
+    calc_number = models.TextField(null=True, blank=True)
+    scheme = models.ForeignKey(
+        IncentiveScheme, on_delete=models.PROTECT, related_name="calculations"
+    )
+    employee = models.ForeignKey(
+        "hrms.Employee", on_delete=models.PROTECT, related_name="incentive_calcs"
+    )
+    period_label = models.TextField()
+    period_start = models.DateField()
+    period_end = models.DateField()
+    net_sales = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    returns_total = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    incentive_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    status = models.TextField(
+        choices=[(s, s) for s in ["Calculated", "Posted", "Reversed"]],
+        default="Calculated",
+    )
+    detail = models.JSONField(default=dict, blank=True)
+    journal_entry = models.ForeignKey(
+        "accounting.JournalEntry",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    reversed_at = models.DateTimeField(null=True, blank=True)
+    reversal_reason = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "incentive_calcs"
+        ordering = ["-period_start", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "calc_number"],
+                condition=models.Q(deleted_at__isnull=True, calc_number__isnull=False),
+                name="uq_incentive_calcs_number",
+            ),
+            models.UniqueConstraint(
+                fields=["client", "scheme", "employee", "period_label"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_incentive_calc_period",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["client", "employee", "period_start"],
+                name="ix_incentive_calcs_emp",
+            ),
+        ]
+
+    def __str__(self):
+        return self.calc_number or f"Incentive {self.id}"
