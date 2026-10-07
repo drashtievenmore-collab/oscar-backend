@@ -58,6 +58,10 @@ SERIES_DEFAULTS = {
     # Grey-fabric production wiring (HRMS_ERP_CHANGES.md)
     "PROD": ("PROD", "fy", 4, "-"),
     "INC": ("INC", "fy", 4, "-"),
+    # Job work
+    "PP": ("PP", "fy", 3, "-"),
+    "JWO": ("JWO", "fy", 3, "-"),
+    "VPI": ("VPI", "fy", 4, "-"),
 }
 
 

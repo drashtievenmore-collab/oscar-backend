@@ -28,34 +28,71 @@ class ProductionInstructionSerializer(BaseModelSerializer):
     employeeName = serializers.ReadOnlyField(source="employee.name")
     cumulative = serializers.SerializerMethodField()
     balance = serializers.SerializerMethodField()
+    totalProduced = serializers.SerializerMethodField()
+    acceptedQty = serializers.SerializerMethodField()
+    shortageQty = serializers.SerializerMethodField()
+    finalAmount = serializers.SerializerMethodField()
 
     class Meta:
         model = ProductionInstruction
         fields = [
             "id", "instruction_number", "agency_name", "order_reference", "order_meter",
+            "pi_date", "fabric", "process_type", "agreed_job_rate", "rejected_qty",
+            "verification_remarks", "completed_at",
             "employeeId", "employeeCode", "employeeName", "supervisorId",
             "status", "verified_by", "verified_at", "notes",
-            "cumulative", "balance", "created_at", "updated_at",
+            "cumulative", "balance", "totalProduced", "acceptedQty",
+            "shortageQty", "finalAmount", "created_at", "updated_at",
         ]
         read_only_fields = [
             "id", "instruction_number", "status", "verified_by", "verified_at",
+            "completed_at", "rejected_qty", "verification_remarks",
             "employeeCode", "employeeName", "cumulative", "balance",
+            "totalProduced", "acceptedQty", "shortageQty", "finalAmount",
             "created_at", "updated_at",
         ]
 
     def validate(self, attrs):
+        from apps.core.money import D, ZERO
+
         employee = attrs.get("employee", getattr(self.instance, "employee", None))
         supervisor = attrs.get("supervisor", getattr(self.instance, "supervisor", None))
         services.validate_employee_for_production(employee, field="employeeId")
         if supervisor is not None:
             services.validate_employee_for_production(supervisor, field="supervisorId")
+        if "agreed_job_rate" in attrs and D(attrs["agreed_job_rate"]) < ZERO:
+            from rest_framework import serializers as drf_serializers
+
+            raise drf_serializers.ValidationError(
+                {"agreed_job_rate": ["Must be zero or more."]}
+            )
         return attrs
+
+    def _completion(self, instance):
+        if not hasattr(self, "_completion_cache"):
+            self._completion_cache = {}
+        key = str(instance.pk)
+        if key not in self._completion_cache:
+            self._completion_cache[key] = services.instruction_completion(instance)
+        return self._completion_cache[key]
 
     def get_cumulative(self, instance):
         return services.instruction_progress(instance)["cumulative"]
 
     def get_balance(self, instance):
         return services.instruction_progress(instance)["balance"]
+
+    def get_totalProduced(self, instance):
+        return self._completion(instance)["totalProduced"]
+
+    def get_acceptedQty(self, instance):
+        return self._completion(instance)["acceptedQty"]
+
+    def get_shortageQty(self, instance):
+        return self._completion(instance)["shortageQty"]
+
+    def get_finalAmount(self, instance):
+        return self._completion(instance)["finalAmount"]
 
 
 class DailyProductionEntrySerializer(BaseModelSerializer):
@@ -125,3 +162,10 @@ class CalculateIncentiveSerializer(BaseSerializer):
     periodLabel = serializers.CharField()
     periodStart = serializers.DateField()
     periodEnd = serializers.DateField()
+
+
+class VerifyInstructionSerializer(BaseSerializer):
+    rejectedQty = serializers.DecimalField(
+        max_digits=18, decimal_places=4, required=False, default=0
+    )
+    reason = serializers.CharField(required=False, allow_blank=True, allow_null=True)

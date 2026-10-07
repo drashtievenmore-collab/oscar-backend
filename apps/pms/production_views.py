@@ -27,6 +27,7 @@ from .production_serializers import (
     IncentiveCalculationSerializer,
     IncentiveSchemeSerializer,
     ProductionInstructionSerializer,
+    VerifyInstructionSerializer,
 )
 
 
@@ -48,6 +49,8 @@ class ProductionInstructionViewSet(TenantModelViewSet):
         "write": ["enter_production"],
         "create": ["enter_production"],
         "verify": ["verify_production"],
+        "complete": ["enter_production"],
+        "completion": ["view_production"],
     }
 
     def get_aggregates(self, queryset):
@@ -55,6 +58,7 @@ class ProductionInstructionViewSet(TenantModelViewSet):
             total=Count("id"),
             inProgress=Count("id", filter=Q(status="In Progress")),
             verified=Count("id", filter=Q(status="Verified")),
+            completed=Count("id", filter=Q(status="Completed")),
         )
 
     def perform_create(self, serializer):
@@ -67,6 +71,10 @@ class ProductionInstructionViewSet(TenantModelViewSet):
             order_meter=data.get("order_meter") or 0,
             supervisor=data.get("supervisor"),
             notes=data.get("notes"),
+            pi_date=data.get("pi_date"),
+            fabric=data.get("fabric"),
+            process_type=data.get("process_type"),
+            agreed_job_rate=data.get("agreed_job_rate") or 0,
             user=self.request.user,
         )
         serializer.instance = instruction
@@ -76,10 +84,33 @@ class ProductionInstructionViewSet(TenantModelViewSet):
 
     @action(detail=True, methods=["post"])
     def verify(self, request, pk=None):
+        serializer = VerifyInstructionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        raw_rejected = (
+            request.data.get("rejectedQty")
+            if isinstance(request.data, dict) and "rejectedQty" in request.data
+            else data.get("rejectedQty", data.get("rejected_qty", 0))
+        )
         instruction = services.verify_instruction(
-            self.get_object(), user=request.user, reason=request.data.get("reason")
+            self.get_object(),
+            user=request.user,
+            reason=data.get("reason") or request.data.get("reason"),
+            rejected_qty=raw_rejected,
         )
         return Response(self.get_serializer(instruction).data)
+
+    @action(detail=True, methods=["post"])
+    def complete(self, request, pk=None):
+        self.check_concurrency(self.get_object())
+        instruction = services.complete_instruction(
+            self.get_object(), user=request.user
+        )
+        return Response(self.get_serializer(instruction).data)
+
+    @action(detail=True, methods=["get"])
+    def completion(self, request, pk=None):
+        return Response(services.instruction_completion(self.get_object()))
 
     @action(detail=True, methods=["get"])
     def progress(self, request, pk=None):

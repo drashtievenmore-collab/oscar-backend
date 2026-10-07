@@ -68,6 +68,7 @@ INSTALLED_APPS = [
     "apps.pms",
     "apps.hrms",
     "apps.reports",
+    "apps.jobwork",
 ]
 
 # --------------------------------------------------------------------------
@@ -92,6 +93,7 @@ FULL_MODULES = [
     "pms",
     "hrms",
     "production",
+    "jobwork",
     "reports",
     "dashboard",
     "public",

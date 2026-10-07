@@ -79,10 +79,80 @@ def instruction_progress(instruction):
     }
 
 
+def instruction_completion(instruction):
+    """Full Production Completion & Verification payload.
+
+    Derived only, never stored:
+      totalProduced = SUM(entries.meters)
+      acceptedQty = totalProduced - rejected_qty
+      shortageQty = order_meter - acceptedQty
+      finalAmount = acceptedQty * agreed_job_rate
+    Daily rows carry running cumulative/balance ordered by date.
+    """
+    from .models import DailyProductionEntry
+
+    entries = list(
+        DailyProductionEntry.objects.filter(
+            instruction=instruction, deleted_at__isnull=True
+        )
+        .select_related("entered_by_employee")
+        .order_by("entry_date", "created_at")
+    )
+    order_meter = D(instruction.order_meter)
+    rate = D(instruction.agreed_job_rate)
+    total = ZERO
+    rows = []
+    running = ZERO
+    for idx, entry in enumerate(entries, start=1):
+        meters = D(entry.meters)
+        total += meters
+        running += meters
+        employee = getattr(entry, "entered_by_employee", None)
+        rows.append(
+            {
+                "n": idx,
+                "id": str(entry.id),
+                "date": entry.entry_date.isoformat() if entry.entry_date else None,
+                "produced": meters,
+                "cumulative": running,
+                "balance": compute_balance(order_meter, running),
+                "enteredBy": getattr(employee, "name", "") if employee else "",
+                "employeeCode": getattr(employee, "employee_code", None) if employee else None,
+                "remarks": entry.remarks or "-",
+            }
+        )
+
+    rejected = D(getattr(instruction, "rejected_qty", 0))
+    accepted = total - rejected
+    if accepted < ZERO:
+        accepted = ZERO
+    shortage = order_meter - accepted
+    employee = getattr(instruction, "employee", None)
+    return {
+        "piNo": instruction.instruction_number,
+        "piDate": instruction.pi_date.isoformat() if getattr(instruction, "pi_date", None) else None,
+        "agency": instruction.agency_name,
+        "fabric": getattr(instruction, "fabric", None),
+        "processType": getattr(instruction, "process_type", None),
+        "assignedEmployee": getattr(employee, "name", "") if employee else "",
+        "employeeCode": getattr(employee, "employee_code", None) if employee else None,
+        "orderQty": order_meter,
+        "totalProduced": total,
+        "rejectedQty": rejected,
+        "acceptedQty": accepted,
+        "shortageQty": shortage,
+        "jobRate": rate,
+        "finalAmount": round2(accepted * rate),
+        "status": instruction.status,
+        "dailySummary": rows,
+    }
+
+
 @transaction.atomic
 def create_instruction(
     *, client, employee, agency_name, order_reference, order_meter=ZERO,
-    supervisor=None, user=None, notes=None,
+    supervisor=None, user=None, notes=None, pi_date=None, fabric=None,
+    process_type=None, agreed_job_rate=ZERO,
 ):
     """Create a PROD_INSTRUCTION_NEW row after the employee-status gate."""
     from .models import ProductionInstruction
@@ -95,6 +165,11 @@ def create_instruction(
             "Order meters cannot be negative.",
             field_errors={"orderMeter": ["Must be zero or more."]},
         )
+    if D(agreed_job_rate) < ZERO:
+        raise ValidationFailed(
+            "Job rate cannot be negative.",
+            field_errors={"agreedJobRate": ["Must be zero or more."]},
+        )
 
     instruction = ProductionInstruction.objects.create(
         client=client,
@@ -102,6 +177,10 @@ def create_instruction(
         agency_name=agency_name,
         order_reference=order_reference,
         order_meter=D(order_meter),
+        pi_date=pi_date,
+        fabric=fabric,
+        process_type=process_type,
+        agreed_job_rate=D(agreed_job_rate),
         employee=employee,
         supervisor=supervisor,
         status="In Progress",
@@ -123,20 +202,106 @@ def create_instruction(
 
 
 @transaction.atomic
-def verify_instruction(instruction, *, user=None, reason=None):
-    """Approve an instruction. Every approval lands in ``core.AUDIT_LOG``."""
-    from .models import ProductionInstruction
+def complete_instruction(instruction, *, user=None):
+    """Mark an instruction Completed (Verification Pending).
+
+    Requires at least one daily entry. Every transition lands in core.AUDIT_LOG.
+    """
+    from .models import DailyProductionEntry
+
+    instruction = instruction.__class__.objects.select_for_update().get(pk=instruction.pk)
+    if instruction.status in ("Completed", "Verified", "Closed"):
+        raise Conflict(
+            "This instruction is already completed.", code=Codes.ALREADY_DONE
+        )
+    if instruction.status == "Draft":
+        raise ValidationFailed(
+            "Start production before completing.",
+            field_errors={"status": ["Only an In Progress instruction can be completed."]},
+        )
+    has_entries = DailyProductionEntry.objects.filter(
+        instruction=instruction, deleted_at__isnull=True
+    ).exists()
+    if not has_entries:
+        raise ValidationFailed(
+            "Record at least one daily entry before completing.",
+            field_errors={"dailyEntries": ["At least one daily production entry is required."]},
+        )
+    before = {"status": instruction.status}
+    instruction.status = "Completed"
+    instruction.completed_at = timezone.now()
+    if getattr(user, "is_authenticated", False):
+        instruction.completed_by = user
+    instruction.save(update_fields=["status", "completed_at", "completed_by", "updated_at"])
+    record_audit(
+        client=instruction.client_id,
+        actor=user,
+        action="production_instruction_complete",
+        entity_type="ProductionInstruction",
+        entity_id=instruction.id,
+        entity_label=instruction.instruction_number,
+        description="Production marked completed, pending verification.",
+        before=before,
+        after={"status": "Completed"},
+        from_value=before["status"],
+        to_value="Completed",
+    )
+    return instruction
+
+
+@transaction.atomic
+def verify_instruction(instruction, *, user=None, reason=None, rejected_qty=None):
+    """Approve an instruction. Every approval lands in ``core.AUDIT_LOG``.
+
+    Guards: rejected must satisfy 0 <= rejected <= totalProduced.
+    """
+    from .models import DailyProductionEntry, ProductionInstruction
 
     instruction = ProductionInstruction.objects.select_for_update().get(pk=instruction.pk)
-    if instruction.status == "Verified":
+    if instruction.status in ("Verified", "Closed"):
         raise Conflict(
             "This instruction is already verified.", code=Codes.ALREADY_DONE
         )
+    if instruction.status == "Draft":
+        raise ValidationFailed(
+            "Complete production before verifying.",
+            field_errors={"status": ["Only a Completed or In Progress instruction can be verified."]},
+        )
+    total = (
+        DailyProductionEntry.objects.filter(
+            instruction=instruction, deleted_at__isnull=True
+        ).aggregate(value=Sum("meters"))["value"]
+        or ZERO
+    )
+    rejected = D(rejected_qty) if rejected_qty is not None else D(instruction.rejected_qty)
+    if rejected < ZERO:
+        raise ValidationFailed(
+            "Rejected quantity cannot be negative.",
+            field_errors={"rejectedQty": ["Must be zero or more."]},
+        )
+    if total > ZERO and rejected > D(total):
+        raise ValidationFailed(
+            "Rejected quantity cannot exceed total produced.",
+            field_errors={"rejectedQty": [f"Total produced is {total} M."]},
+        )
+    if total <= ZERO and rejected > ZERO:
+        raise ValidationFailed(
+            "No production recorded yet.",
+            field_errors={"rejectedQty": ["Record daily production before rejecting."]},
+        )
     before = {"status": instruction.status}
     instruction.status = "Verified"
+    instruction.rejected_qty = rejected
+    if reason is not None:
+        instruction.verification_remarks = reason
     instruction.verified_by = user if getattr(user, "is_authenticated", False) else None
     instruction.verified_at = timezone.now()
-    instruction.save(update_fields=["status", "verified_by", "verified_at", "updated_at"])
+    instruction.save(
+        update_fields=[
+            "status", "rejected_qty", "verification_remarks",
+            "verified_by", "verified_at", "updated_at",
+        ]
+    )
     record_audit(
         client=instruction.client_id,
         actor=user,
@@ -146,7 +311,7 @@ def verify_instruction(instruction, *, user=None, reason=None):
         entity_label=instruction.instruction_number,
         description=reason or "Instruction verified.",
         before=before,
-        after={"status": "Verified"},
+        after={"status": "Verified", "rejectedQty": str(rejected), "totalProduced": str(total)},
         from_value=before["status"],
         to_value="Verified",
         comments=reason,

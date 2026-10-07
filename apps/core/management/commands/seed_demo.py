@@ -340,6 +340,7 @@ class Command(BaseCommand):
             client=client,
             sku="MCH-CONV-01",
             defaults={
+            
                 "legacy_id": "itm-100",
                 "name": "Belt Conveyor 6m",
                 "category": categories["CAT-MACHINE"],

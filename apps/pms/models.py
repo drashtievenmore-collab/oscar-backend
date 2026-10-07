@@ -519,6 +519,7 @@ class ProductionInstruction(TenantModel):
     STATUSES = [
         ("Draft", "Draft"),
         ("In Progress", "In Progress"),
+        ("Completed", "Completed"),
         ("Verified", "Verified"),
         ("Closed", "Closed"),
     ]
@@ -527,6 +528,16 @@ class ProductionInstruction(TenantModel):
     agency_name = models.TextField()
     order_reference = models.TextField()
     order_meter = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    pi_date = models.DateField(null=True, blank=True)
+    fabric = models.TextField(null=True, blank=True)
+    process_type = models.TextField(null=True, blank=True)
+    agreed_job_rate = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    rejected_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    verification_remarks = models.TextField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    completed_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     employee = models.ForeignKey(
         "hrms.Employee",
         on_delete=models.PROTECT,
@@ -540,7 +551,7 @@ class ProductionInstruction(TenantModel):
         related_name="supervised_production_instructions",
     )
     status = models.TextField(choices=[(s, s) for s in
-                                       ["Draft", "In Progress", "Verified", "Closed"]],
+                                       ["Draft", "In Progress", "Completed", "Verified", "Closed"]],
                               default="Draft")
     verified_by = models.ForeignKey(
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
@@ -561,6 +572,14 @@ class ProductionInstruction(TenantModel):
             ),
             models.CheckConstraint(
                 condition=models.Q(order_meter__gte=0), name="ck_prod_instructions_meter"
+            ),
+            models.CheckConstraint(
+                condition=models.Q(agreed_job_rate__gte=0),
+                name="ck_prod_instructions_rate",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(rejected_qty__gte=0),
+                name="ck_prod_instructions_rejected",
             ),
         ]
         indexes = [

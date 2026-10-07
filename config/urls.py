@@ -61,6 +61,8 @@ if enabled("hrms"):
 if enabled("production"):
     # Served from apps.pms.production_urls. Code lives in PMS per product decision.
     api_v1.append(path("production/", include("apps.pms.production_urls")))
+if enabled("jobwork"):
+    api_v1.append(path("jobwork/", include("apps.jobwork.urls")))
 
 # Reports and dashboards (api.md §12). Imported lazily so HRMS-only mode
 # never imports reports (which pulls sales/inventory views at module load).
