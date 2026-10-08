@@ -23,11 +23,12 @@ from .models import (
     CrmProject,
     Deal,
     DealActivity,
+    DealDocument,
+    DealLine,
     DealStage,
     Form,
     Industry,
     Lead,
-    LeadCall,
     LeadEmail,
     LeadFile,
     LeadNote,
@@ -52,11 +53,12 @@ from .serializers import (
     ContractSerializer,
     CrmProjectSerializer,
     DealActivitySerializer,
+    DealDocumentSerializer,
+    DealLineSerializer,
     DealSerializer,
     DealStageSerializer,
     FormSerializer,
     IndustrySerializer,
-    LeadCallSerializer,
     LeadEmailSerializer,
     LeadFileSerializer,
     LeadNoteSerializer,
@@ -274,9 +276,11 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
     @action(detail=True, methods=["post"])
     @transaction.atomic
     def convert(self, request, pk=None):
-        """Lead -> Deal (+ optional customer) (api.md §9.1)."""
-        from apps.masters.models import Party
+        """Lead -> Deal (+ optional customer) (api.md §9.1).
 
+        The customer half reuses the quotation-approval conversion service so
+        manual and automatic conversion link/dedupe identically.
+        """
         lead = self.get_object()
         if lead.converted_deal_id:
             raise Conflict(
@@ -284,34 +288,17 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             )
 
         party = lead.party
+        created_customer = False
         if party is None and request.data.get("createCustomer", True):
-            # Link, don't duplicate: an identical live party (same tenant, same
-            # name) wins over a new row. Leads converted before this endpoint
-            # existed already have a customer on file, and re-running the UI's
-            # convert must never mint a second CUST- code for the same name.
-            party_name = lead.company or lead.name
-            party = (
-                Party.objects.filter(
-                    client_id=request.client_id,
-                    type__in=["Customer", "Both"],
-                    name__iexact=party_name,
-                    deleted_at__isnull=True,
-                )
-                .order_by("created_at")
-                .first()
+            result = services.convert_lead_to_customer(
+                lead,
+                user=request.user,
+                source="Manual Conversion",
+                reference=None,
             )
-            if party is None:
-                party = Party.objects.create(
-                    client_id=request.client_id,
-                    code=allocate_number(request.user.client, "CUST"),
-                    type="Customer",
-                    name=party_name,
-                    phone=lead.phone,
-                    email=lead.email,
-                    place_of_supply=lead.state,
-                    created_by=request.user,
-                )
-            lead.party = party
+            lead = result["lead"]
+            party = result["party"]
+            created_customer = result["created"]
 
         deal = Deal.objects.create(
             client_id=request.client_id,
@@ -353,11 +340,6 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             rows.append({"type": "note", "id": str(note.id), "at": note.created_at,
                          "title": "Note added", "body": note.body,
                          "actor": note.author.name if note.author_id else None})
-        for call in lead.calls.filter(deleted_at__isnull=True):
-            rows.append({"type": "call", "id": str(call.id), "at": call.called_at,
-                         "title": f"Call ({call.outcome or call.direction})",
-                         "body": call.notes,
-                         "actor": call.called_by.name if call.called_by_id else None})
         for email in lead.emails.filter(deleted_at__isnull=True):
             rows.append({"type": "email", "id": str(email.id),
                          "at": email.sent_at or email.created_at,
@@ -434,27 +416,168 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
     def lead_users(self, request, pk=None):
         return self._sub_resource(request, "lead_users", LeadUserSerializer)
 
+    @action(detail=True, methods=["delete"], url_path=r"users/(?P<user_id>[^/.]+)")
+    def lead_user_detail(self, request, pk=None, user_id=None):
+        """Unassign one user from a lead (the Users & Requirements tab)."""
+        lead = self.get_object()
+        row = lead.lead_users.filter(pk=user_id, deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound("That assignment no longer exists.")
+        row.soft_delete(request.user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     @action(detail=True, methods=["get", "post"], url_path="products")
     def products(self, request, pk=None):
         return self._sub_resource(request, "products", LeadProductSerializer)
 
+    @action(
+        detail=True,
+        methods=["patch", "delete"],
+        url_path=r"products/(?P<product_id>[^/.]+)",
+    )
+    def product_detail(self, request, pk=None, product_id=None):
+        """Edit / remove one fabric requirement line (the Users &
+        Requirements tab)."""
+        lead = self.get_object()
+        row = lead.products.filter(pk=product_id, deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound("That requirement no longer exists.")
+        if request.method == "DELETE":
+            row.soft_delete(request.user)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = LeadProductSerializer(
+            row,
+            data=request.data,
+            partial=True,
+            context=self.get_serializer_context(),
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(
+            LeadProductSerializer(row, context=self.get_serializer_context()).data
+        )
+
     @action(detail=True, methods=["get", "post"], url_path="sources")
     def sources(self, request, pk=None):
+        if request.method == "POST":
+            raw = request.data.dict() if hasattr(request.data, "dict") else dict(request.data)
+            data = dict(raw)
+            # The drawer posts a channel label (`source`/`name`/`campaign`);
+            # resolve it to a real `crm.Source` so GET returns `name`.
+            source_name = (
+                data.get("sourceName") or data.get("source_name")
+                or data.get("source") or data.get("name")
+                or data.get("campaign")
+            )
+            if not data.get("sourceId") and not data.get("source_id") and source_name:
+                label = str(source_name).strip()
+                if label:
+                    # Exact match first so iexact get_or_create never duplicates case variants.
+                    source_obj = Source.objects.filter(
+                        client_id=request.client_id, name__iexact=label, deleted_at__isnull=True
+                    ).first()
+                    if source_obj is None:
+                        source_obj = Source.objects.create(
+                            client_id=request.client_id, name=label,
+                            created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+                        )
+                    data["sourceId"] = str(source_obj.id)
+            lead = self.get_object()
+            serializer = LeadSourceSerializer(
+                data=data, context=self.get_serializer_context()
+            )
+            serializer.is_valid(raise_exception=True)
+            row = serializer.save(
+                client_id=request.client_id, lead=lead,
+                created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+            )
+            return Response(
+                LeadSourceSerializer(row, context=self.get_serializer_context()).data,
+                status=status.HTTP_201_CREATED,
+            )
         return self._sub_resource(request, "source_entries", LeadSourceSerializer)
 
     @action(detail=True, methods=["get", "post"], url_path="notes")
     def notes(self, request, pk=None):
         return self._sub_resource(request, "notes", LeadNoteSerializer, author=request.user)
 
-    @action(detail=True, methods=["get", "post"], url_path="calls")
-    def calls(self, request, pk=None):
-        return self._sub_resource(
-            request, "calls", LeadCallSerializer, called_by=request.user
-        )
-
     @action(detail=True, methods=["get", "post"], url_path="emails")
     def emails(self, request, pk=None):
+        if request.method == "POST":
+            raw = request.data.dict() if hasattr(request.data, "dict") else dict(request.data)
+            data = dict(raw)
+            # A drawer "Send Email" is sent, not a draft.
+            if not data.get("sent_at") and not data.get("sentAt"):
+                data["sent_at"] = timezone.now().isoformat()
+            lead = self.get_object()
+            serializer = LeadEmailSerializer(
+                data=data, context=self.get_serializer_context()
+            )
+            serializer.is_valid(raise_exception=True)
+            row = serializer.save(
+                client_id=request.client_id, lead=lead,
+                created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+            )
+            return Response(
+                LeadEmailSerializer(row, context=self.get_serializer_context()).data,
+                status=status.HTTP_201_CREATED,
+            )
         return self._sub_resource(request, "emails", LeadEmailSerializer)
+
+    def _delete_sub_resource(self, request, pk, row_id, related_name):
+        """Soft-delete one lead sub-resource row (sources, emails, …)."""
+        lead = self.get_object()
+        row = getattr(lead, related_name).filter(pk=row_id, deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound("That record no longer exists.")
+        row.soft_delete(request.user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"sources/(?P<row_id>[^/.]+)")
+    def source_detail(self, request, pk=None, row_id=None):
+        lead = self.get_object()
+        row = lead.source_entries.filter(pk=row_id, deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound("That record no longer exists.")
+        if request.method == "DELETE":
+            return self._delete_sub_resource(request, pk, row_id, "source_entries")
+        raw = request.data.dict() if hasattr(request.data, "dict") else dict(request.data)
+        data = dict(raw)
+        # Same label -> Source resolution as POST so an edit can change the
+        # channel ("Website", "Referral", …) without knowing the Source PK.
+        source_name = (
+            data.get("sourceName") or data.get("source_name")
+            or data.get("source") or data.get("name")
+            or (data.get("campaign") if not data.get("sourceId") and not data.get("source_id") else None)
+        )
+        if not data.get("sourceId") and not data.get("source_id") and source_name:
+            label = str(source_name).strip()
+            if label:
+                source_obj = Source.objects.filter(
+                    client_id=request.client_id, name__iexact=label, deleted_at__isnull=True
+                ).first()
+                if source_obj is None:
+                    source_obj = Source.objects.create(
+                        client_id=request.client_id, name=label,
+                        created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+                    )
+                data["sourceId"] = str(source_obj.id)
+        serializer = LeadSourceSerializer(
+            row, data=data, partial=True, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(
+            LeadSourceSerializer(row, context=self.get_serializer_context()).data
+        )
+
+    @action(detail=True, methods=["delete"], url_path=r"emails/(?P<row_id>[^/.]+)")
+    def email_detail(self, request, pk=None, row_id=None):
+        return self._delete_sub_resource(request, pk, row_id, "emails")
+
+    @action(detail=True, methods=["delete"], url_path=r"notes/(?P<row_id>[^/.]+)")
+    def note_detail(self, request, pk=None, row_id=None):
+        return self._delete_sub_resource(request, pk, row_id, "notes")
 
     @action(detail=True, methods=["get", "post"], url_path="files")
     def files(self, request, pk=None):
@@ -794,6 +917,75 @@ class DealViewSet(TenantModelViewSet):
         serializer.is_valid(raise_exception=True)
         row = serializer.save(deal=deal, actor=request.user)
         return Response(DealActivitySerializer(row).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get", "post"], url_path="lines")
+    def deal_lines(self, request, pk=None):
+        """Priced deliverable lines (the deal workspace Products tab)."""
+        deal = self.get_object()
+        if request.method == "GET":
+            rows = deal.lines.filter(deleted_at__isnull=True)
+            return Response(envelope(DealLineSerializer(rows, many=True).data))
+        serializer = DealLineSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        row = serializer.save(client_id=request.client_id, deal=deal)
+        return Response(
+            DealLineSerializer(row, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(
+        detail=True,
+        methods=["patch", "delete"],
+        url_path=r"lines/(?P<line_id>[^/.]+)",
+    )
+    def deal_line_detail(self, request, pk=None, line_id=None):
+        deal = self.get_object()
+        row = deal.lines.filter(pk=line_id, deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound("That deal line no longer exists.")
+        if request.method == "DELETE":
+            row.soft_delete(request.user)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = DealLineSerializer(
+            row, data=request.data, partial=True, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(
+            DealLineSerializer(row, context=self.get_serializer_context()).data
+        )
+
+    @action(detail=True, methods=["get", "post"], url_path="documents")
+    def deal_documents(self, request, pk=None):
+        """Files pinned to a deal (bytes live in ``core.File``)."""
+        deal = self.get_object()
+        if request.method == "GET":
+            rows = deal.documents.filter(deleted_at__isnull=True)
+            return Response(envelope(DealDocumentSerializer(rows, many=True).data))
+        serializer = DealDocumentSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        row = serializer.save(client_id=request.client_id, deal=deal)
+        return Response(
+            DealDocumentSerializer(row, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(
+        detail=True,
+        methods=["delete"],
+        url_path=r"documents/(?P<document_id>[^/.]+)",
+    )
+    def deal_document_detail(self, request, pk=None, document_id=None):
+        deal = self.get_object()
+        row = deal.documents.filter(pk=document_id, deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound("That document no longer exists.")
+        row.soft_delete(request.user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["get", "post"])
     def tasks(self, request, pk=None):

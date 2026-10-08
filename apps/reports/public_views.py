@@ -140,6 +140,17 @@ class PublicQuotationDecisionView(PublicWriteView):
                 comment=request.data.get("reason"),
                 ip=request_ip(request),
             )
+            if self.decision == "accept" and quotation.crm_lead_id is not None:
+                # Customer-portal approval converts the lead too, in the same
+                # transaction: a failed conversion rolls back the approval.
+                from apps.crm import services as crm_services
+
+                crm_services.convert_lead_to_customer(
+                    quotation.crm_lead,
+                    user=None,
+                    source="Customer Portal Approval",
+                    reference=quotation.quotation_number,
+                )
             if quotation.created_by_id:
                 notify(
                     client=quotation.client_id,

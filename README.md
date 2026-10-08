@@ -203,8 +203,12 @@ Stated plainly rather than stubbed silently:
   profile, document, totals in words). `/…/pdf/` returns `501
   PDF_RENDERER_UNAVAILABLE` rather than a broken file. Wiring WeasyPrint or a
   headless renderer is a drop-in at `apps/core/printing.py`.
-- **Outbound email / WhatsApp.** `/…/send/` records the intent and audits it;
-  delivery needs a provider. Password-reset tokens are logged, not mailed.
+- **Outbound email / WhatsApp.** `/…/send/` with `channel=email` delivers
+  for real through Django SMTP (`EMAIL_HOST`, `EMAIL_PORT`,
+  `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, `DEFAULT_FROM_EMAIL`); without
+  those it fails with a clear `EMAIL_NOT_CONFIGURED` error instead of fake
+  success. WhatsApp has no provider: `/…/send/` records the intent and says
+  so (`"sent": False`). Password-reset tokens are logged, not mailed.
 - **FIFO valuation.** WAC is implemented from movement unit costs (db.md
   Appendix B decision 5). FIFO needs a `stock_layers` table, so `?method=FIFO`
   reports that it is unavailable instead of quietly returning WAC.

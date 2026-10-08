@@ -160,6 +160,76 @@ class EmployeeViewSet(TenantModelViewSet):
             exited=Count("id", filter=Q(status__in=["Resigned", "Terminated"])),
         )
 
+    @staticmethod
+    def _normalize_employee_payload(raw, client_id, user):
+        """Accept the drawer's flat labels, not just FK ids.
+
+        The directory posts `department`/`designation`/`location` names and
+        `joiningDate`; the serializer's writable keys are the `…Id` FKs plus
+        `joining`. Without this the names are ignored (read-only) and the
+        create 400s on a missing `joining`.
+        """
+        data = dict(raw)
+        by_user = user if getattr(user, "is_authenticated", False) else None
+
+        def resolve(model, name, extra=None):
+            label = str(name or "").strip()
+            if not label:
+                return None
+            row = model.objects.filter(
+                client_id=client_id, name__iexact=label, deleted_at__isnull=True
+            ).first()
+            if row is None:
+                row = model.objects.create(
+                    client_id=client_id, name=label, created_by=by_user,
+                    **(extra or {}),
+                )
+            return str(row.id)
+
+        if not data.get("departmentId") and not data.get("department_id"):
+            name = data.get("department") or data.get("dept")
+            resolved = resolve(Department, name)
+            if resolved:
+                data["departmentId"] = resolved
+        if not data.get("designationId") and not data.get("designation_id"):
+            name = data.get("designation") or data.get("role")
+            resolved = resolve(Designation, name)
+            if resolved:
+                data["designationId"] = resolved
+        if not data.get("locationId") and not data.get("location_id"):
+            resolved = resolve(Location, data.get("location"))
+            if resolved:
+                data["locationId"] = resolved
+        if not data.get("joining") and data.get("joiningDate") is None and data.get("joining_date") is None:
+            # A display string (`Mar 15, 2022`) or nothing — serializer
+            # defaults to today; drop unparsable text instead of 400ing.
+            text = data.get("doj") or data.get("date")
+            if text:
+                data["joining"] = text
+        # Read-only display keys must not reach validation as unknowns.
+        for key in ("dept", "role", "doj", "date", "img", "empId", "id"):
+            data.pop(key, None)
+        return data
+
+    def create(self, request, *args, **kwargs):
+        raw = request.data.dict() if hasattr(request.data, "dict") else dict(request.data)
+        data = self._normalize_employee_payload(raw, self.get_client_id(), request.user)
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        instance = self.get_object()
+        raw = request.data.dict() if hasattr(request.data, "dict") else dict(request.data)
+        data = self._normalize_employee_payload(raw, self.get_client_id(), request.user)
+        serializer = self.get_serializer(instance, data=data, partial=partial or request.method == "PATCH")
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return Response(serializer.data)
+
     def perform_create(self, serializer):
         serializer.validated_data["employee_code"] = allocate_number(
             self.request.user.client, "EMP"

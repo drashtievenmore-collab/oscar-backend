@@ -731,6 +731,16 @@ class Offer(TenantModel):
     sent_at = models.DateTimeField(null=True, blank=True)
     responded_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
+    #: Offer-letter fields as typed in HR (position, work mode, reporting
+    #: manager …) so the letter survives refresh and other devices.
+    position = models.TextField(null=True, blank=True)
+    department = models.TextField(null=True, blank=True)
+    job_type = models.TextField(null=True, blank=True)
+    location = models.TextField(null=True, blank=True)
+    work_mode = models.TextField(null=True, blank=True)
+    reporting_manager = models.TextField(null=True, blank=True)
+    probation_period = models.TextField(null=True, blank=True)
+    expiry_date = models.DateField(null=True, blank=True)
 
     class Meta:
         db_table = "hrms_offers"
@@ -1211,6 +1221,11 @@ class Holiday(TenantModel, LegacyIdMixin):
         Location, null=True, blank=True, on_delete=models.CASCADE, related_name="holidays"
     )
     is_optional = models.BooleanField(default=False)
+    #: Free-text scope shown on the HRMS calendar (e.g. "All Locations").
+    applies_to = models.TextField(null=True, blank=True)
+    #: National Gazetted / Festival / Optional …
+    holiday_type = models.TextField(null=True, blank=True)
+    status = models.TextField(default="Upcoming")
 
     class Meta:
         db_table = "hrms_holidays"
@@ -1299,6 +1314,7 @@ class Resignation(TenantModel):
     last_working_day = models.DateField(null=True, blank=True)
     exit_interview_at = models.DateTimeField(null=True, blank=True)
     reason = models.TextField(null=True, blank=True)
+    handover_to = models.TextField(null=True, blank=True)
     status = models.TextField(default="Submitted")
 
     class Meta:

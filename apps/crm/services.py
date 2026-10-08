@@ -27,9 +27,9 @@ from .models import AUTOMATION_SOURCE, Lead, Stage, StageTask, Task
 #: matching template. The server prefers a template from the lead's current
 #: stage; these are what it falls back to.
 NEXT_ACTION_FALLBACKS = {
-    "call-again": {
-        "title": "Follow-up Call",
-        "role": "Tele Caller Executive",
+    "follow-up": {
+        "title": "Follow-up",
+        "role": "BDE",
         "due_in_days": 1,
     },
     "schedule-demo": {
@@ -96,7 +96,7 @@ def team_roster(client_id):
 def resolve_assignee(client_id, role=None, department=None):
     """Role + department, round-robin on open-task count (db.md §9.3).
 
-    The round-robin keeps one keen tele-caller from collecting every generated
+    The round-robin keeps one keen team member from collecting every generated
     task; ``ix_crm_tasks_assignee`` is what keeps the count cheap.
     """
     from apps.accounts.models import User
@@ -388,7 +388,7 @@ def annotate_lead_counters(client_id, leads):
 
     from apps.sales.models import DeliveryChallan, Estimate, SalesInvoice
 
-    from .models import LeadCall, LeadFile, LeadProduct, LeadSource
+    from .models import LeadFile, LeadProduct, LeadSource
 
     def counts(model, field="lead_id", extra=None):
         queryset = model.objects.filter(
@@ -403,7 +403,6 @@ def annotate_lead_counters(client_id, leads):
     products = counts(LeadProduct)
     sources = counts(LeadSource)
     files = counts(LeadFile)
-    calls = counts(LeadCall)
     open_tasks = counts(Task, extra={"status__in": ["Open", "In Progress", "Waiting"]})
     estimates = counts(Estimate, field="crm_lead_id")
     invoices = dict(
@@ -429,7 +428,6 @@ def annotate_lead_counters(client_id, leads):
         lead.products_count = products.get(lead.id, 0)
         lead.sources_count = sources.get(lead.id, 0)
         lead.files_count = files.get(lead.id, 0)
-        lead.calls_count = calls.get(lead.id, 0)
         lead.open_tasks_count = open_tasks.get(lead.id, 0)
         lead.estimates_count = estimates.get(lead.id, 0)
         lead.sales_invoices_count = invoices.get(lead.id, 0)
@@ -495,7 +493,227 @@ def seed_crm_configuration(client):
             defaults={"sequence": sequence, "is_won": is_won, "is_lost": is_lost},
         )
 
-    for name in ("Website", "Referral", "Cold Call", "Exhibition", "Walk-in", "Campaign"):
+    for name in ("Website", "Referral", "Exhibition", "Walk-in", "Campaign"):
         Source.objects.get_or_create(client=client, name=name)
 
     return created
+
+
+# ---------------------------------------------------------------------------
+# Lead -> Customer conversion (quotation approval)
+# ---------------------------------------------------------------------------
+def find_conversion_stage(client_id):
+    """The stage a converted lead moves to: won stage, else "Won"/"Converted"."""
+    stage = (
+        Stage.objects.filter(
+            client_id=client_id, is_won=True, deleted_at__isnull=True
+        )
+        .order_by("sequence")
+        .first()
+    )
+    if stage is not None:
+        return stage
+    return (
+        Stage.objects.filter(
+            client_id=client_id,
+            name__iexact="Converted",
+            deleted_at__isnull=True,
+        ).first()
+        or Stage.objects.filter(
+            client_id=client_id, name__iexact="Won", deleted_at__isnull=True
+        ).first()
+    )
+
+
+def find_matching_party(client_id, lead):
+    """Link, don't duplicate: existing live Customer/Both with the same name
+    (or email) wins over a new row."""
+    from apps.masters.models import Party
+
+    party_name = (lead.company or lead.name or "").strip()
+    if party_name:
+        match = (
+            Party.objects.filter(
+                client_id=client_id,
+                type__in=["Customer", "Both"],
+                name__iexact=party_name,
+                deleted_at__isnull=True,
+            )
+            .order_by("created_at")
+            .first()
+        )
+        if match is not None:
+            return match, "name"
+    email = (lead.email or "").strip()
+    if email:
+        match = (
+            Party.objects.filter(
+                client_id=client_id,
+                type__in=["Customer", "Both"],
+                email__iexact=email,
+                deleted_at__isnull=True,
+            )
+            .order_by("created_at")
+            .first()
+        )
+        if match is not None:
+            return match, "email"
+    return None, None
+
+
+@transaction.atomic
+def convert_lead_to_customer(lead, *, user=None, source="Quotation Approval", reference=None):
+    """Convert one lead into a Customer/Party, transactionally and idempotently.
+
+    - Reuses ``lead.party`` when already linked (no duplicate).
+    - Otherwise links a matching live Customer/Both (same name, then email).
+    - Otherwise creates the Party, preserving lead name/company/contact,
+      phone, email, address, source/owner (as audit + primary contact), and
+      links fabric requirements/notes via the lead itself (they stay on the
+      lead rows, reachable through ``lead.party``).
+    - Stamps converted_at/converted_by/source/reference, moves the lead to
+      the Won/Converted stage so it leaves the active pipeline but stays in
+      history.
+    - Returns ``{"party": party, "created": bool, "lead": lead}``.
+    """
+    from apps.masters.models import Party, PartyContact
+
+    lead = Lead.objects.select_for_update().get(pk=lead.pk)
+
+    # Idempotency: already converted and linked -> link, create nothing.
+    if lead.party_id is not None:
+        party = Party.objects.filter(
+            pk=lead.party_id, client_id=lead.client_id, deleted_at__isnull=True
+        ).first()
+        if party is not None:
+            if lead.converted_at is None:
+                lead.converted_at = timezone.now()
+                if getattr(user, "is_authenticated", False):
+                    lead.converted_by = user
+                lead.conversion_source = lead.conversion_source or source
+                if reference and not lead.conversion_reference:
+                    lead.conversion_reference = reference
+                lead.save(
+                    update_fields=[
+                        "converted_at", "converted_by", "conversion_source",
+                        "conversion_reference", "updated_at",
+                    ]
+                )
+            return {"party": party, "created": False, "lead": lead, "matched_on": "linked"}
+
+    party, matched_on = find_matching_party(lead.client_id, lead)
+    created = False
+    if party is None:
+        party_name = (lead.company or lead.name or "Untitled Customer").strip()
+        billing = {
+            k: v
+            for k, v in {
+                "city": lead.city,
+                "state": lead.state,
+                "country": lead.country,
+            }.items()
+            if v
+        }
+        party = Party.objects.create(
+            client_id=lead.client_id,
+            code=allocate_number(lead.client, "CUST"),
+            type="Customer",
+            name=party_name,
+            phone=lead.phone,
+            email=lead.email,
+            place_of_supply=lead.state,
+            billing_address=billing,
+            shipping_address=dict(billing),
+            created_by=user if getattr(user, "is_authenticated", False) else None,
+        )
+        created = True
+        # Keep the person's name when the company differs: the party is the
+        # company, the contact is the human who approved the quotation.
+        contact_name = (lead.name or "").strip()
+        if contact_name and contact_name.lower() != party_name.lower():
+            PartyContact.objects.create(
+                client_id=lead.client_id,
+                party=party,
+                name=contact_name,
+                role=lead.job_title,
+                phone=lead.phone,
+                email=lead.email,
+                is_primary=True,
+                created_by=user if getattr(user, "is_authenticated", False) else None,
+            )
+        record_audit(
+            client=lead.client_id,
+            actor=user,
+            action="create",
+            entity_type="Party",
+            entity_id=party.id,
+            entity_label=party.code,
+            description=(
+                f"Created from lead {lead.lead_number}"
+                + (f" on quotation approval ({reference})" if reference else "")
+            ),
+        )
+    else:
+        record_audit(
+            client=lead.client_id,
+            actor=user,
+            action="link",
+            entity_type="Party",
+            entity_id=party.id,
+            entity_label=party.code,
+            description=(
+                f"Lead {lead.lead_number} linked to existing customer"
+                + (f" on quotation approval ({reference})" if reference else "")
+            ),
+        )
+
+    lead.party = party
+    lead.converted_at = lead.converted_at or timezone.now()
+    if getattr(user, "is_authenticated", False):
+        lead.converted_by = lead.converted_by or user
+    lead.conversion_source = lead.conversion_source or source
+    if reference and not lead.conversion_reference:
+        lead.conversion_reference = reference
+
+    target_stage = find_conversion_stage(lead.client_id)
+    previous_stage = lead.stage.name if lead.stage_id else None
+    if target_stage is not None and str(target_stage.id) != str(lead.stage_id):
+        lead.stage = target_stage
+        lead.save(
+            update_fields=[
+                "party", "stage", "converted_at", "converted_by",
+                "conversion_source", "conversion_reference", "updated_at",
+            ]
+        )
+        record_audit(
+            client=lead.client_id,
+            actor=user,
+            action="stage_change",
+            entity_type="CrmLead",
+            entity_id=lead.id,
+            entity_label=lead.lead_number,
+            description=f"Converted to customer {party.code}",
+            from_value=previous_stage,
+            to_value=target_stage.name,
+        )
+    else:
+        lead.save(
+            update_fields=[
+                "party", "converted_at", "converted_by",
+                "conversion_source", "conversion_reference", "updated_at",
+            ]
+        )
+
+    record_audit(
+        client=lead.client_id,
+        actor=user,
+        action="convert",
+        entity_type="CrmLead",
+        entity_id=lead.id,
+        entity_label=lead.lead_number,
+        description=(
+            f"Converted to customer {party.code}"
+            + (f" via {reference}" if reference else "")
+        ),
+    )
+    return {"party": party, "created": created, "lead": lead, "matched_on": matched_on}

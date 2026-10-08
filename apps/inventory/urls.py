@@ -29,6 +29,7 @@ router.register("transfers", views.StockTransferViewSet, basename="inventory-tra
 router.register("faulty-parts", views.FaultyPartViewSet, basename="inventory-faulty-parts")
 router.register("service-usage", views.ServiceUsageViewSet, basename="inventory-service-usage")
 router.register("zone-requests", views.ZoneRequestViewSet, basename="inventory-zone-requests")
+router.register("item-parts", views.ItemPartViewSet, basename="inventory-item-parts")
 router.register("audits", views.StockAuditViewSet, basename="inventory-audits")
 
 urlpatterns = [

@@ -31,7 +31,7 @@ TASK_OUTCOMES = [
     ("Follow-up Required", "Follow-up Required"),
 ]
 NEXT_ACTIONS = [
-    ("call-again", "call-again"),
+    ("follow-up", "follow-up"),
     ("schedule-demo", "schedule-demo"),
     ("send-quotation", "send-quotation"),
     ("move-next-stage", "move-next-stage"),
@@ -171,6 +171,14 @@ class Lead(TenantModel, LegacyIdMixin):
     converted_deal = models.ForeignKey(
         "Deal", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    #: Automatic Lead -> Customer conversion on quotation approval.
+    #: ``party`` is the Customer/Party record; these columns record when/how.
+    converted_at = models.DateTimeField(null=True, blank=True)
+    converted_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    conversion_source = models.TextField(null=True, blank=True)
+    conversion_reference = models.TextField(null=True, blank=True)
     created_on = models.DateField(auto_now_add=True)
     #: Values captured by a dynamic form (db.md §9.1).
     custom_values = models.JSONField(default=dict, blank=True)
@@ -226,12 +234,33 @@ class LeadUser(LeadSubResource):
 
 
 class LeadProduct(LeadSubResource):
+    """One fabric requirement line on a lead (textile/fabric ERP).
+
+    ``product_name`` is the Fabric Quality / Item Name. Fabric attributes
+    live on the row itself so a requirement survives even when it is not
+    linked to a masters ``Item``; ``item`` is only the optional catalogue
+    link (its ``sku`` is shown when no free-text ``fabric_code`` is given).
+    ``expected_rate`` is the customer's expected rate -- never a confirmed
+    price. ``notes`` carries Remarks.
+    """
+
     lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name="products")
     item = models.ForeignKey(
         "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     product_name = models.TextField(null=True, blank=True)
+    fabric_code = models.TextField(null=True, blank=True)
+    fabric_type = models.TextField(null=True, blank=True)
+    fabric_design = models.TextField(null=True, blank=True)
+    fabric_color = models.TextField(null=True, blank=True)
+    #: Width in inches (58", 60", ...) -- the way greige fabric is traded.
+    fabric_width = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    fabric_gsm = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
     qty = models.DecimalField(max_digits=18, decimal_places=4, default=1)
+    #: Meter / Kg / Taka / Roll.
+    uom = models.TextField(null=True, blank=True)
+    expected_rate = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    status = models.TextField(default="Active")
     notes = models.TextField(null=True, blank=True)
 
     class Meta:
@@ -283,22 +312,6 @@ class LeadThreadMessage(TenantModel):
     class Meta:
         db_table = "crm_lead_thread_messages"
         ordering = ["sent_at"]
-
-
-class LeadCall(LeadSubResource):
-    lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name="calls")
-    direction = models.TextField(default="outbound")
-    outcome = models.TextField(null=True, blank=True)
-    duration_seconds = models.IntegerField(default=0)
-    notes = models.TextField(null=True, blank=True)
-    called_at = models.DateTimeField()
-    called_by = models.ForeignKey(
-        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
-    )
-
-    class Meta:
-        db_table = "crm_lead_calls"
-        ordering = ["-called_at"]
 
 
 class LeadEmail(LeadSubResource):
@@ -553,6 +566,41 @@ class DealActivity(models.Model):
         ordering = ["-created_at"]
 
 
+class DealLine(TenantModel):
+    """Priced lines on a deal (the Products tab of the deal workspace).
+
+    Kept deliberately separate from quotation lines: these are the
+    still-negotiated deliverables, not the frozen commercial offer.
+    """
+
+    deal = models.ForeignKey(Deal, on_delete=models.CASCADE, related_name="lines")
+    item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    name = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    qty = models.DecimalField(max_digits=18, decimal_places=4, default=1)
+    rate = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    unit = models.TextField(default="Qty")
+
+    class Meta:
+        db_table = "crm_deal_lines"
+        ordering = ["created_at"]
+
+
+class DealDocument(TenantModel):
+    """Files pinned to a deal. Bytes live in ``core.File`` (uploaded through
+    ``/files/`` first); this row is only the pin."""
+
+    deal = models.ForeignKey(Deal, on_delete=models.CASCADE, related_name="documents")
+    file = models.ForeignKey("core.File", on_delete=models.PROTECT, related_name="+")
+    label = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "crm_deal_documents"
+        ordering = ["-created_at"]
+
+
 class Contract(TenantModel, LegacyIdMixin):
     """``displayStatus`` (``Expiring Soon``, ``Expired``) is derived from
     ``end_date`` at read time, never stored (db.md §9.4)."""
@@ -577,6 +625,8 @@ class Contract(TenantModel, LegacyIdMixin):
     end_date = models.DateField()
     status = models.TextField(choices=STATUSES, default="Draft")
     body = models.TextField(null=True, blank=True)
+    #: Free-text scope summary (the UI's Description); ``body`` holds Terms.
+    description = models.TextField(null=True, blank=True)
     signed_file = models.ForeignKey(
         "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
@@ -615,6 +665,12 @@ class CrmProject(TenantModel, LegacyIdMixin):
     party = models.ForeignKey(
         "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="crm_projects"
     )
+    #: Free-text fallbacks when the project is not linked to a party/user row
+    #: (standalone projects typed by name). Linked rows ignore these.
+    customer_text = models.TextField(null=True, blank=True)
+    owner_text = models.TextField(null=True, blank=True)
+    team = models.TextField(null=True, blank=True)
+    project_type = models.TextField(null=True, blank=True)
     deal = models.ForeignKey(
         Deal, null=True, blank=True, on_delete=models.SET_NULL, related_name="crm_projects"
     )

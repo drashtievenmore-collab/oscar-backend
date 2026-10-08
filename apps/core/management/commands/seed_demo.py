@@ -129,7 +129,7 @@ class Command(BaseCommand):
         team = [
             ("priya@sweven.test", "Priya Patel", "AC", "Accounts", ["Area Sales Manager"]),
             ("rahul@sweven.test", "Rahul Verma", "SM", "Sales", ["BDE", "Area Sales Manager"]),
-            ("neha@sweven.test", "Neha Shah", "SM", "Sales", ["Tele Caller Executive"]),
+            ("neha@sweven.test", "Neha Shah", "SM", "Sales", ["BDE"]),
             ("arjun@sweven.test", "Arjun Mehta", "PU", "Purchase", []),
             ("kiran@sweven.test", "Kiran Rao", "PM", "Projects", ["Technical Lead"]),
             ("divya@sweven.test", "Divya Nair", "HR", "Human Resources", []),
@@ -682,7 +682,7 @@ class Command(BaseCommand):
 
         stages = {stage.name: stage for stage in Stage.objects.filter(client=client)}
         templates = [
-            ("New Lead", "Introductory Call", "Tele Caller Executive", 1),
+            ("New Lead", "Initial Follow-up", "BDE", 1),
             ("Details Collected", "Send Company Profile", "BDE", 1),
             ("Quotation Shared", "Quotation Follow-up", "BDE", 2),
             ("Demo Pending", "Schedule Demo", "Area Sales Manager", 2),

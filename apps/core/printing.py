@@ -22,6 +22,22 @@ class PdfNotAvailable(EvenmoreAPIError):
     default_message = "PDF rendering is not configured on this server."
 
 
+class EmailNotConfigured(EvenmoreAPIError):
+    status_code = 500
+    default_code = "EMAIL_NOT_CONFIGURED"
+    default_message = (
+        "Outbound email is not configured on this server. "
+        "Set EMAIL_HOST, EMAIL_PORT, EMAIL_HOST_USER, "
+        "EMAIL_HOST_PASSWORD and DEFAULT_FROM_EMAIL."
+    )
+
+
+class EmailDeliveryFailed(EvenmoreAPIError):
+    status_code = 502
+    default_code = "EMAIL_DELIVERY_FAILED"
+    default_message = "The email could not be delivered."
+
+
 def company_payload(client_id, request=None):
     from .models import CompanyProfile
 
@@ -98,11 +114,26 @@ def print_payload(document, serializer_class, *, request, title, terms_key=None)
 def send_payload(document, *, channel, recipients, subject=None, message=None):
     """``POST /{module}/{entity}/{id}/send/`` (api.md §12.1).
 
-    Queues the send and records the intent. Actual delivery belongs to the
-    notification service; the endpoint exists so the UI's send modals stop
-    being no-ops.
+    ``channel="email"`` is delivered for real through Django's SMTP backend
+    and then audited. Anything else (e.g. ``whatsapp``) only records the
+    intent, because delivery needs a provider that is not wired up — the
+    response says so honestly via ``"sent": False``.
     """
     from .audit import record_audit
+
+    sent = False
+    delivery_note = None
+    if (channel or "").lower() == "email":
+        sent = _deliver_email(
+            recipients=recipients or [],
+            subject=subject or f"{document} — document",
+            message=message or "",
+        )
+    else:
+        delivery_note = (
+            f"No delivery provider is wired up for channel {channel!r}; "
+            "the intent was recorded but nothing was sent."
+        )
 
     record_audit(
         client=document.client_id,
@@ -112,12 +143,43 @@ def send_payload(document, *, channel, recipients, subject=None, message=None):
         entity_id=document.id,
         entity_label=str(document),
         description=f"Queued for {channel} to {', '.join(recipients or []) or 'no recipients'}",
-        after={"channel": channel, "recipients": recipients, "subject": subject},
+        after={"channel": channel, "recipients": recipients, "subject": subject, "sent": sent},
     )
-    return {
+    payload = {
         "queued": True,
+        "sent": sent,
         "channel": channel,
         "recipients": recipients or [],
         "subject": subject,
         "message": message,
     }
+    if delivery_note:
+        payload["note"] = delivery_note
+    return payload
+
+
+def _deliver_email(*, recipients, subject, message):
+    """Send one plain-text email to every recipient. Raises on failure."""
+    from django.conf import settings
+    from django.core.mail import EmailMessage
+
+    to = [r for r in (recipients or []) if r]
+    if not to:
+        raise EmailDeliveryFailed("Add at least one recipient email address.")
+    if not getattr(settings, "EMAIL_HOST", ""):
+        raise EmailNotConfigured()
+    sender = getattr(settings, "DEFAULT_FROM_EMAIL", "") or getattr(
+        settings, "EMAIL_HOST_USER", ""
+    )
+    try:
+        EmailMessage(
+            subject=subject,
+            body=message,
+            from_email=sender or None,
+            to=to,
+        ).send(fail_silently=False)
+    except (EmailNotConfigured, EmailDeliveryFailed):
+        raise
+    except Exception as exc:
+        raise EmailDeliveryFailed(f"SMTP delivery failed: {exc}")
+    return True

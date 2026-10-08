@@ -16,7 +16,7 @@ from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
 from apps.core.permissions import HasModulePermission
 from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
-from apps.masters.models import Item, Location
+from apps.masters.models import Item, ItemPart, Location
 
 from . import services as stock
 from .models import (
@@ -34,6 +34,7 @@ from .models import (
 )
 from .serializers import (
     FaultyPartSerializer,
+    ItemPartSerializer,
     QualityStandardSerializer,
     ServiceUsageSerializer,
     StockAdjustmentSerializer,
@@ -534,6 +535,20 @@ class ZoneRequestViewSet(TenantModelViewSet):
             request_row.issued_by = self.request.user
             request_row.save(update_fields=["issued_by", "updated_at"])
         return request_row
+
+
+# ---------------------------------------------------------------------------
+# Machine BOM (masters.ItemPart lives here because items do)
+# ---------------------------------------------------------------------------
+class ItemPartViewSet(TenantModelViewSet):
+    queryset = ItemPart.objects.select_related("parent_item", "part_item")
+    serializer_class = ItemPartSerializer
+    audit_entity_type = "ItemPart"
+    status_field = None
+    filter_map = {"parentItemId": "parent_item_id"}
+    search_fields = ["part_item__name", "part_item__sku"]
+    ordering = ["part_item__name"]
+    required_permissions = ["view_inventory"]
 
 
 # ---------------------------------------------------------------------------

@@ -13,12 +13,13 @@ from .models import (
     CrmProject,
     Deal,
     DealActivity,
+    DealDocument,
+    DealLine,
     DealStage,
     Form,
     FormSubmission,
     Industry,
     Lead,
-    LeadCall,
     LeadEmail,
     LeadFile,
     LeadNote,
@@ -122,10 +123,16 @@ class LeadSerializer(BaseModelSerializer):
     sourcesCount = serializers.SerializerMethodField()
     filesCount = serializers.SerializerMethodField()
     openTasksCount = serializers.SerializerMethodField()
-    callsCount = serializers.SerializerMethodField()
     estimatesCount = serializers.SerializerMethodField()
     deliveryChallansCount = serializers.SerializerMethodField()
     salesInvoicesCount = serializers.SerializerMethodField()
+    #: Automatic Lead -> Customer conversion (quotation approval).
+    convertedAt = serializers.DateTimeField(source="converted_at", read_only=True)
+    convertedByName = serializers.CharField(source="converted_by.name", read_only=True)
+    conversionSource = serializers.CharField(source="conversion_source", read_only=True)
+    conversionReference = serializers.CharField(source="conversion_reference", read_only=True)
+    customerId = serializers.CharField(source="party.id", read_only=True)
+    customerName = serializers.CharField(source="party.name", read_only=True)
 
     class Meta:
         model = Lead
@@ -134,9 +141,12 @@ class LeadSerializer(BaseModelSerializer):
             "stageId", "owner", "ownerId", "createdOn", "source", "sourceId",
             "city", "state", "country", "amount", "job_title", "industry",
             "avatarColor", "latitude", "longitude", "is_pinned", "party",
+            "customerId", "customerName",
+            "convertedAt", "convertedByName", "conversionSource",
+            "conversionReference",
             "lost_reason", "custom_values",
             "productsCount", "sourcesCount", "filesCount", "openTasksCount",
-            "callsCount", "estimatesCount", "deliveryChallansCount",
+            "estimatesCount", "deliveryChallansCount",
             "salesInvoicesCount",
             "created_at", "updated_at",
         ]
@@ -156,9 +166,6 @@ class LeadSerializer(BaseModelSerializer):
 
     def get_openTasksCount(self, lead):
         return self._counter(lead, "open_tasks_count")
-
-    def get_callsCount(self, lead):
-        return self._counter(lead, "calls_count")
 
     def get_estimatesCount(self, lead):
         return self._counter(lead, "estimates_count")
@@ -188,7 +195,11 @@ class LeadProductSerializer(BaseModelSerializer):
 
     class Meta:
         model = LeadProduct
-        fields = ["id", "itemId", "sku", "product_name", "qty", "notes", "created_at"]
+        fields = [
+            "id", "itemId", "sku", "product_name", "fabric_code", "fabric_type",
+            "fabric_design", "fabric_color", "fabric_width", "fabric_gsm",
+            "qty", "uom", "expected_rate", "status", "notes", "created_at",
+        ]
 
 
 class LeadSourceSerializer(BaseModelSerializer):
@@ -196,10 +207,11 @@ class LeadSourceSerializer(BaseModelSerializer):
         source="source", model="crm.Source", required=False, allow_null=True
     )
     name = serializers.CharField(source="source.name", read_only=True)
+    createdByName = serializers.CharField(source="created_by.name", read_only=True)
 
     class Meta:
         model = LeadSource
-        fields = ["id", "sourceId", "name", "campaign", "medium", "attributed_at"]
+        fields = ["id", "sourceId", "name", "campaign", "medium", "attributed_at", "created_at", "createdByName"]
 
 
 class LeadNoteSerializer(BaseModelSerializer):
@@ -228,24 +240,14 @@ class LeadThreadSerializer(BaseModelSerializer):
         fields = ["id", "subject", "messages", "created_at"]
 
 
-class LeadCallSerializer(BaseModelSerializer):
-    calledByName = serializers.CharField(source="called_by.name", read_only=True)
-
-    class Meta:
-        model = LeadCall
-        fields = [
-            "id", "direction", "outcome", "duration_seconds", "notes",
-            "called_at", "called_by", "calledByName",
-        ]
-        read_only_fields = ["called_by"]
-
-
 class LeadEmailSerializer(BaseModelSerializer):
+    createdByName = serializers.CharField(source="created_by.name", read_only=True)
+
     class Meta:
         model = LeadEmail
         fields = [
             "id", "subject", "body", "to_addresses", "sent_at",
-            "provider_message_id", "created_at",
+            "provider_message_id", "created_at", "createdByName",
         ]
 
 
@@ -353,7 +355,7 @@ class CompleteTaskSerializer(BaseSerializer):
     outcome = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     nextAction = serializers.ChoiceField(
         choices=[
-            "call-again", "schedule-demo", "send-quotation",
+            "follow-up", "schedule-demo", "send-quotation",
             "move-next-stage", "finish",
         ],
         required=False,
@@ -436,6 +438,36 @@ class DealActivitySerializer(BaseModelSerializer):
         read_only_fields = ["actor"]
 
 
+class DealLineSerializer(BaseModelSerializer):
+    itemId = TenantPrimaryKeyRelatedField(
+        source="item", model="masters.Item", required=False, allow_null=True
+    )
+    sku = serializers.CharField(source="item.sku", read_only=True)
+
+    class Meta:
+        model = DealLine
+        fields = [
+            "id", "itemId", "sku", "name", "description", "qty", "rate",
+            "unit", "created_at",
+        ]
+
+
+class DealDocumentSerializer(BaseModelSerializer):
+    fileId = TenantPrimaryKeyRelatedField(source="file", model="core.File")
+    fileName = serializers.CharField(source="file.file_name", read_only=True)
+    fileSize = serializers.IntegerField(source="file.file_size", read_only=True)
+    url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DealDocument
+        fields = ["id", "fileId", "fileName", "fileSize", "label", "url", "created_at"]
+
+    def get_url(self, row):
+        from apps.core.files import public_url
+
+        return public_url(row.file, self.context.get("request"))
+
+
 class ContractSerializer(BaseModelSerializer):
     customerId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
     customerName = serializers.CharField(source="party.name", read_only=True)
@@ -447,7 +479,7 @@ class ContractSerializer(BaseModelSerializer):
         fields = [
             "id", "contract_number", "title", "customerId", "customerName",
             "deal", "template_key", "contract_type", "value", "start_date",
-            "end_date", "status", "displayStatus", "body", "signed_file",
+            "end_date", "status", "displayStatus", "body", "description", "signed_file",
             "signed_at", "expiring_soon_days", "created_at", "updated_at",
         ]
         read_only_fields = ["contract_number", "created_at", "updated_at"]
@@ -486,7 +518,8 @@ class CrmProjectSerializer(BaseModelSerializer):
         fields = [
             "id", "name", "code", "customerId", "customerName", "deal", "owner",
             "start_date", "end_date", "status", "value", "progress",
-            "description", "created_at", "updated_at",
+            "description", "customer_text", "owner_text", "team", "project_type",
+            "created_at", "updated_at",
         ]
 
 

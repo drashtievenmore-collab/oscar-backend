@@ -304,6 +304,93 @@ class QuotationViewSet(SalesDocumentViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    @action(detail=True, methods=["post"], url_path="approve")
+    @transaction.atomic
+    def approve(self, request, pk=None):
+        """Customer approval: Accepted + automatic Lead -> Customer conversion.
+
+        Transactional: if customer creation/linking fails, the approval rolls
+        back too. Idempotent: re-approving an Accepted quotation links (never
+        duplicates) and returns the same customer. Never creates a Sales Order.
+        """
+        from apps.crm import services as crm_services
+
+        quotation = Quotation.objects.select_for_update().get(
+            pk=self.get_object().pk
+        )
+        if quotation.status in ("Rejected", "Cancelled", "Expired"):
+            raise Conflict(
+                f"This quotation is {quotation.status} and cannot be approved.",
+                code=Codes.ALREADY_DONE,
+            )
+
+        conversion = {"party": None, "created": False, "lead": None}
+        if quotation.status not in ("Accepted", "Converted", "Invoiced"):
+            quotation.status = "Accepted"
+            quotation.save(update_fields=["status", "updated_at"])
+            QuotationActivity.objects.create(
+                quotation=quotation,
+                event="accepted",
+                actor_label=getattr(request.user, "name", None) or "staff",
+                comment=request.data.get("reason"),
+            )
+            self.write_audit(
+                "approve", quotation,
+                description=f"Approved ({quotation.quotation_number})",
+            )
+
+        if quotation.crm_lead_id is not None:
+            conversion = crm_services.convert_lead_to_customer(
+                quotation.crm_lead,
+                user=request.user,
+                source="Quotation Approval",
+                reference=quotation.quotation_number,
+            )
+            quotation.crm_lead = conversion["lead"]
+
+        party = conversion["party"]
+        # The approved quotation stays linked to the customer: point it at the
+        # converted (or matched) party so the follow-up Sales Order is raised
+        # on the right customer. The frozen address snapshot is only filled
+        # where the quotation has none, preserving what was agreed.
+        if party is not None and quotation.party_id != party.id:
+            quotation.party = party
+            quotation.freeze_party_snapshot(party)
+            quotation.save()
+        quotation.refresh_from_db()
+
+        lead_payload = None
+        if conversion["lead"] is not None:
+            from apps.crm.serializers import LeadSerializer
+
+            lead_payload = LeadSerializer(conversion["lead"]).data
+
+        return Response(
+            {
+                "quotation": QuotationSerializer(
+                    quotation, context=self.get_serializer_context()
+                ).data,
+                "customer": (
+                    {"id": str(party.id), "name": party.name, "code": party.code}
+                    if party is not None
+                    else None
+                ),
+                "customerCreated": conversion["created"],
+                "lead": lead_payload,
+                "message": (
+                    "Quotation approved. Lead has been converted to Customer "
+                    "successfully." if party is not None
+                    else "Quotation approved."
+                ),
+            }
+        )
+
+    @action(detail=True, methods=["post"], url_path="accept")
+    @transaction.atomic
+    def accept(self, request, pk=None):
+        """Alias of approve: staff-side acceptance (Approved/Accepted)."""
+        return self.approve(request, pk=pk)
+
     @action(detail=True, methods=["post", "delete"], url_path="share")
     def share(self, request, pk=None):
         """Opaque, hashed, single-quotation, expiring, revocable (api.md §5.3).

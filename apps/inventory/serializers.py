@@ -7,7 +7,7 @@ from apps.core.serializers import (
     QuantityField,
     TenantPrimaryKeyRelatedField,
 )
-from apps.masters.models import Item, Location
+from apps.masters.models import Item, ItemPart, Location
 
 from .models import (
     FaultyPart,
@@ -308,3 +308,21 @@ class ValuationRowSerializer(BaseSerializer):
     )
     value = serializers.DecimalField(max_digits=18, decimal_places=2, coerce_to_string=False)
     ageingBucket = serializers.CharField(allow_null=True)
+
+
+class ItemPartSerializer(BaseModelSerializer):
+    """Machine BOM lines (``itemParts``)."""
+
+    parentItemId = TenantPrimaryKeyRelatedField(source="parent_item", model="masters.Item")
+    partItemId = TenantPrimaryKeyRelatedField(source="part_item", model="masters.Item")
+    partName = serializers.CharField(source="part_item.name", read_only=True)
+    partSku = serializers.CharField(source="part_item.sku", read_only=True)
+    requiredQty = QuantityField(source="required_qty", required=False)
+
+    class Meta:
+        model = ItemPart
+        fields = [
+            "id", "parentItemId", "partItemId", "partName", "partSku",
+            "requiredQty", "created_at",
+        ]
+        read_only_fields = ["created_at"]

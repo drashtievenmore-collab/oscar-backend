@@ -125,7 +125,10 @@ class EmployeeSerializer(BaseModelSerializer):
     locationId = TenantPrimaryKeyRelatedField(
         source="location", model="hrms.Location", required=False, allow_null=True
     )
-    joining = serializers.DateField(source="joining_date")
+    joining = serializers.DateField(source="joining_date", required=False)
+    # Frontend posts `joiningDate` (hrmsSync.toApi); accept it as an alias so
+    # a missing `joining` never 400s the create.
+    joiningDate = serializers.DateField(write_only=True, required=False)
     employmentType = serializers.CharField(
         source="employment_type", required=False, allow_null=True
     )
@@ -140,7 +143,7 @@ class EmployeeSerializer(BaseModelSerializer):
         fields = [
             "id", "employeeCode", "name", "email", "phone", "avatar",
             "designation", "designationId", "department", "departmentId",
-            "manager", "managerId", "location", "locationId", "joining",
+            "manager", "managerId", "location", "locationId", "joining", "joiningDate",
             "employmentType", "shift", "salaryStructureId", "standard_salary",
             "status", "date_of_birth", "gender", "blood_group", "personal_email",
             "emergency_contact", "address", "bank_account_number", "ifsc_code",
@@ -150,9 +153,16 @@ class EmployeeSerializer(BaseModelSerializer):
         read_only_fields = ["employeeCode", "created_at", "updated_at"]
 
     def validate(self, attrs):
+        from django.utils import timezone as dj_timezone
         manager = attrs.get("manager")
         if manager is not None and self.instance is not None:
             services.assert_no_manager_cycle(self.instance, manager.id)
+        # `joiningDate` is the write alias for `joining_date`; default today.
+        alias = attrs.pop("joiningDate", None)
+        if attrs.get("joining_date") is None and alias is not None:
+            attrs["joining_date"] = alias
+        if attrs.get("joining_date") is None and self.instance is None:
+            attrs["joining_date"] = dj_timezone.localdate()
         return attrs
 
 
@@ -538,7 +548,8 @@ class OfferSerializer(BaseModelSerializer):
         fields = [
             "id", "applicationId", "candidateName", "offeredCtc", "joiningDate",
             "status", "letter_file", "sent_at", "responded_at", "notes",
-            "created_at",
+            "position", "department", "job_type", "location", "work_mode",
+            "reporting_manager", "probation_period", "expiry_date", "created_at",
         ]
         read_only_fields = ["sent_at", "responded_at", "created_at"]
 
@@ -897,7 +908,10 @@ class HolidaySerializer(BaseModelSerializer):
 
     class Meta:
         model = Holiday
-        fields = ["id", "date", "name", "locationId", "is_optional", "created_at"]
+        fields = [
+            "id", "date", "name", "locationId", "is_optional", "applies_to",
+            "holiday_type", "status", "created_at",
+        ]
 
 
 class WorkingDaySerializer(BaseModelSerializer):
@@ -966,7 +980,7 @@ class ResignationSerializer(BaseModelSerializer):
         model = Resignation
         fields = [
             "id", "employeeId", "employeeName", "submittedOn", "noticePeriodDays",
-            "lastWorkingDay", "exit_interview_at", "reason", "status",
+            "lastWorkingDay", "exit_interview_at", "reason", "handover_to", "status",
             "checklist", "created_at",
         ]
 

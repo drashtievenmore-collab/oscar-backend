@@ -5,6 +5,7 @@ from apps.core.serializers import (
     BaseModelSerializer,
     MoneyField,
     QuantityField,
+    TenantPrimaryKeyRelatedField,
 )
 
 from .models import (
@@ -202,8 +203,22 @@ class VPIProgressEntrySerializer(BaseModelSerializer):
     instructionId = serializers.UUIDField(source="instruction_id", required=False)
     producedQty = QuantityField(source="produced_qty", required=False)
     enteredBy = serializers.CharField(source="entered_by", required=False, allow_null=True, allow_blank=True)
+    photoFileId = TenantPrimaryKeyRelatedField(
+        source="photo_file", model="core.File", required=False, allow_null=True
+    )
+    photoUrl = serializers.SerializerMethodField()
 
     class Meta:
         model = VPIProgressEntry
-        fields = ["id", "instructionId", "date", "producedQty", "enteredBy", "remarks", "created_at"]
-        read_only_fields = ["id", "created_at"]
+        fields = [
+            "id", "instructionId", "date", "producedQty", "enteredBy", "remarks",
+            "photoFileId", "photoUrl", "created_at",
+        ]
+        read_only_fields = ["id", "photoUrl", "created_at"]
+
+    def get_photoUrl(self, row):
+        if not row.photo_file_id:
+            return None
+        from apps.core.files import public_url
+
+        return public_url(row.photo_file, self.context.get("request"))
