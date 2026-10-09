@@ -1,4 +1,5 @@
 """CRM endpoints (api.md §9)."""
+from datetime import timedelta
 from decimal import Decimal
 
 from django.db import transaction
@@ -361,21 +362,11 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
 
     @action(detail=True, methods=["get"])
     def documents(self, request, pk=None):
-        """Related estimates / quotations / invoices (api.md §9.2)."""
-        from apps.sales.models import Estimate, Quotation
+        """Related quotations / invoices (api.md §9.2)."""
+        from apps.sales.models import Quotation
 
         lead = self.get_object()
         rows = [
-            {
-                "documentType": "Estimate",
-                "id": str(row.id),
-                "number": row.estimate_number,
-                "date": row.doc_date,
-                "status": row.status,
-                "total": round2(row.total),
-            }
-            for row in Estimate.objects.filter(crm_lead=lead, deleted_at__isnull=True)
-        ] + [
             {
                 "documentType": "Quotation",
                 "id": str(row.id),
@@ -882,6 +873,29 @@ class DealViewSet(TenantModelViewSet):
         )
 
     def perform_create(self, serializer):
+        # Double-submit guard: an identical deal (same title, customer, owner,
+        # value and stage) created moments ago is the same user action echoing,
+        # not a second deal. Answer 409 with the existing row so the UI keeps
+        # one card. Checked BEFORE number allocation so a refusal never burns
+        # a DEAL number.
+        data = serializer.validated_data
+        recent = Deal.objects.filter(
+            client_id=self.get_client_id(),
+            deleted_at__isnull=True,
+            title=data.get("title"),
+            stage=data.get("stage") or "Draft",
+            value=data.get("value") or 0,
+            party=data.get("party"),
+            owner=data.get("owner"),
+            created_at__gte=timezone.now() - timedelta(minutes=5),
+        ).order_by("-created_at").first()
+        if recent is not None:
+            raise Conflict(
+                f"'{recent.title}' was just created as {recent.deal_number}.",
+                code=Codes.ALREADY_DONE,
+                detail="This looks like the same deal submitted twice.",
+                payload={"dealId": str(recent.id), "dealNumber": recent.deal_number},
+            )
         serializer.validated_data["deal_number"] = allocate_number(
             self.request.user.client, "DEAL"
         )

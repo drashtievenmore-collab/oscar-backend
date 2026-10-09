@@ -34,8 +34,6 @@ SNAPSHOT_MODELS = [
     "masters.Party",
     "masters.PartyContact",
     "masters.ItemSerial",
-    "sales.Estimate",
-    "sales.EstimateLine",
     "sales.Quotation",
     "sales.QuotationLine",
     "sales.SalesOrder",

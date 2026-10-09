@@ -1,4 +1,4 @@
-"""Lead -> Estimate -> Quotation -> Approval -> Customer auto-conversion."""
+"""Lead -> Quotation -> Approval -> Customer auto-conversion."""
 from django.test import TestCase
 from django.utils import timezone
 
@@ -6,7 +6,7 @@ from apps.accounts.models import Client, User
 from apps.crm.models import Lead, Stage
 from apps.crm.services import convert_lead_to_customer
 from apps.masters.models import Party
-from apps.sales.models import Estimate, Quotation
+from apps.sales.models import Quotation
 
 
 class LeadConversionFlowTest(TestCase):
@@ -42,13 +42,9 @@ class LeadConversionFlowTest(TestCase):
             name="Ravi Textiles", phone="9999999999", email="ravi@t.co",
             created_by=self.user,
         )
-        self.estimate = Estimate.objects.create(
-            client=self.client_obj, party=self.party, doc_date=timezone.localdate(),
-            status="Draft", crm_lead=self.lead, created_by=self.user,
-        )
         self.quotation = Quotation.objects.create(
             client=self.client_obj, party=self.party, doc_date=timezone.localdate(),
-            status="Sent", estimate=self.estimate, crm_lead=self.lead,
+            status="Sent", crm_lead=self.lead,
             subject="Fabric quote", created_by=self.user,
         )
 

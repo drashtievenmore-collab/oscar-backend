@@ -19,8 +19,6 @@ from . import services
 from .models import (
     DeliveryChallan,
     DeliveryChallanLine,
-    Estimate,
-    EstimateLine,
     PaymentAllocation,
     PaymentIn,
     ProformaInvoice,
@@ -61,7 +59,6 @@ def line_serializer_for(line_model, table_name, extra_fields=(), extra_read_only
     return _LineSerializer
 
 
-EstimateLineSerializer = line_serializer_for(EstimateLine, "estimate_lines")
 QuotationLineSerializer = line_serializer_for(QuotationLine, "quotation_lines")
 SalesOrderLineSerializer = line_serializer_for(
     SalesOrderLine,
@@ -82,21 +79,6 @@ SalesInvoiceLineSerializer = line_serializer_for(
 
 
 # ---------------------------------------------------------------------------
-# Estimates (api.md §5.2)
-# ---------------------------------------------------------------------------
-class EstimateSerializer(DocumentSerializer):
-    line_model = EstimateLine
-    line_serializer = EstimateLineSerializer
-    line_fk_name = "estimate"
-    line_table_name = "estimate_lines"
-
-    class Meta:
-        model = Estimate
-        fields = HEADER_FIELDS + ["estimate_number", "status", "valid_until", "crm_lead"]
-        read_only_fields = READ_ONLY_HEADER_FIELDS + ["estimate_number"]
-
-
-# ---------------------------------------------------------------------------
 # Quotations (api.md §5.3)
 # ---------------------------------------------------------------------------
 class QuotationSerializer(DocumentSerializer):
@@ -109,7 +91,7 @@ class QuotationSerializer(DocumentSerializer):
         model = Quotation
         fields = HEADER_FIELDS + [
             "quotation_number", "status", "valid_until", "subject",
-            "estimate", "crm_deal", "crm_lead",
+            "crm_deal", "crm_lead",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["quotation_number"]
 

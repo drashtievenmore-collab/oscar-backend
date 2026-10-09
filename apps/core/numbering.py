@@ -18,7 +18,6 @@ from .exceptions import Codes, EvenmoreAPIError
 #: (prefix, reset_policy, pad_width, separator)
 SERIES_DEFAULTS = {
     # Sales
-    "EST": ("EST", "fy", 4, "-"),
     "QT": ("QT", "fy", 4, "-"),
     "SO": ("SO", "fy", 4, "-"),
     "PI": ("PI", "fy", 4, "-"),

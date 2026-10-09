@@ -123,7 +123,6 @@ class LeadSerializer(BaseModelSerializer):
     sourcesCount = serializers.SerializerMethodField()
     filesCount = serializers.SerializerMethodField()
     openTasksCount = serializers.SerializerMethodField()
-    estimatesCount = serializers.SerializerMethodField()
     deliveryChallansCount = serializers.SerializerMethodField()
     salesInvoicesCount = serializers.SerializerMethodField()
     #: Automatic Lead -> Customer conversion (quotation approval).
@@ -146,7 +145,7 @@ class LeadSerializer(BaseModelSerializer):
             "conversionReference",
             "lost_reason", "custom_values",
             "productsCount", "sourcesCount", "filesCount", "openTasksCount",
-            "estimatesCount", "deliveryChallansCount",
+            "deliveryChallansCount",
             "salesInvoicesCount",
             "created_at", "updated_at",
         ]
@@ -166,9 +165,6 @@ class LeadSerializer(BaseModelSerializer):
 
     def get_openTasksCount(self, lead):
         return self._counter(lead, "open_tasks_count")
-
-    def get_estimatesCount(self, lead):
-        return self._counter(lead, "estimates_count")
 
     def get_deliveryChallansCount(self, lead):
         return self._counter(lead, "delivery_challans_count")

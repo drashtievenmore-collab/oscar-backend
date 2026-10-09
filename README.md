@@ -62,7 +62,7 @@ apps/
                    money, files, notifications, settings, search, dashboard
   accounts/        tenants, users, roles, permissions, sessions, auth (api.md §2-3)
   masters/         parties, items, categories, units, locations, BOM (api.md §4)
-  sales/           estimate -> quotation -> order -> challan -> invoice -> payment (§5)
+  sales/           quotation -> order -> challan -> invoice -> payment (§5)
   purchase/        PO -> GRN/QC -> bill -> payment out, expenses (§6)
   inventory/       the movement ledger, transfers, RMA, zones, audits (§7)
   accounting/      chart of accounts, journal, ledgers, financial reports (§8)
@@ -200,14 +200,18 @@ Wire`, `ACH`, `Corporate Card`).
 Stated plainly rather than stubbed silently:
 
 - **PDF rendering.** `/…/print/` returns the full JSON print payload (company
-  profile, document, totals in words). `/…/pdf/` returns `501
-  PDF_RENDERER_UNAVAILABLE` rather than a broken file. Wiring WeasyPrint or a
-  headless renderer is a drop-in at `apps/core/printing.py`.
+  profile, document, totals in words). Quotations additionally download a
+  rendered PDF via `GET /sales/quotations/{id}/pdf/` (reportlab, in
+  `apps/core/quotation_pdf.py`) — the same file the customer email attaches.
+  Other documents' `/…/pdf/` returns `501 PDF_RENDERER_UNAVAILABLE` rather
+  than a broken file.
 - **Outbound email / WhatsApp.** `/…/send/` with `channel=email` delivers
   for real through Django SMTP (`EMAIL_HOST`, `EMAIL_PORT`,
   `EMAIL_HOST_USER`, `EMAIL_HOST_PASSWORD`, `DEFAULT_FROM_EMAIL`); without
   those it fails with a clear `EMAIL_NOT_CONFIGURED` error instead of fake
-  success. WhatsApp has no provider: `/…/send/` records the intent and says
+  success. Quotation emails carry the rendered quotation PDF
+  (`{quotation_number}.pdf`, via `apps/core/quotation_pdf.py`) as an
+  attachment. WhatsApp has no provider: `/…/send/` records the intent and says
   so (`"sent": False`). Password-reset tokens are logged, not mailed.
 - **FIFO valuation.** WAC is implemented from movement unit costs (db.md
   Appendix B decision 5). FIFO needs a `stock_layers` table, so `?method=FIFO`

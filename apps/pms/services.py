@@ -504,7 +504,16 @@ def department_workload(client_id):
 
 def upcoming_deadlines(client_id, days=7):
     now = timezone.now()
-    horizon = now + timedelta(days=int(days or 7))
+    try:
+        days = int(days or 7)
+    except (TypeError, ValueError):
+        from apps.core.exceptions import ValidationFailed
+
+        raise ValidationFailed(
+            "Days must be a number.",
+            field_errors={"days": ["Expected a number of days."]},
+        )
+    horizon = now + timedelta(days=days)
     stages = (
         ProjectStage.objects.filter(
             client_id=client_id,

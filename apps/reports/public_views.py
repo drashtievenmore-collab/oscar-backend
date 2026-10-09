@@ -83,6 +83,15 @@ class PublicQuotationView(PublicView):
         if quotation.status == "Sent":
             quotation.status = "Viewed"
             quotation.save(update_fields=["status", "updated_at"])
+            # The customer opened the link: the linked deal is now Open.
+            from apps.crm import services as crm_services
+
+            crm_services.advance_deal_for_quotation(
+                quotation, "Open",
+                description=(
+                    f"Customer opened quotation {quotation.quotation_number}."
+                ),
+            )
 
         from apps.core.printing import company_payload
 
@@ -140,6 +149,28 @@ class PublicQuotationDecisionView(PublicWriteView):
                 comment=request.data.get("reason"),
                 ip=request_ip(request),
             )
+            # The customer's decision settles the linked deal: approval wins
+            # it, rejection loses it — same transaction as the decision.
+            from apps.crm import services as crm_services
+
+            if self.decision == "accept":
+                crm_services.advance_deal_for_quotation(
+                    quotation, "Won",
+                    description=(
+                        f"Deal won: customer accepted quotation "
+                        f"{quotation.quotation_number}."
+                    ),
+                )
+            else:
+                reason = (request.data.get("reason") or "").strip()
+                crm_services.advance_deal_for_quotation(
+                    quotation, "Lost",
+                    description=(
+                        f"Deal lost: customer rejected quotation "
+                        f"{quotation.quotation_number}."
+                        + (f" Reason: {reason}" if reason else "")
+                    ),
+                )
             if self.decision == "accept" and quotation.crm_lead_id is not None:
                 # Customer-portal approval converts the lead too, in the same
                 # transaction: a failed conversion rolls back the approval.

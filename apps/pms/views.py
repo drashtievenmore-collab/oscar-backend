@@ -159,20 +159,14 @@ class StageConfigViewSet(TenantModelViewSet):
         return super().perform_create(serializer)
 
     def check_delete_allowed(self, config):
-        in_use = ProjectStage.objects.filter(
-            stage_config=config, deleted_at__isnull=True
-        ).count()
-        if in_use:
-            raise Conflict(
-                f"{in_use} project stage(s) were instantiated from this template.",
-                code=Codes.IN_USE,
-                detail="Deactivate it instead -- running projects keep their copy.",
-                payload={"projectStages": in_use},
-            )
-        if StageConfig.objects.filter(
-            client_id=self.get_client_id(), deleted_at__isnull=True
-        ).count() <= 1:
-            raise Conflict("At least one stage template must remain.", code=Codes.LAST_ONE)
+        # Instances are frozen copies (name, gates, durations) and
+        # ``stage_config`` is SET_NULL, so removing a template never rewrites a
+        # running project -- it only stops future projects from getting it.
+        # That is what the delete dialog promises, so a template must delete
+        # cleanly instead of resurrecting with a 409. Even the last template
+        # may go: an empty pipeline is a valid state (the list renders its
+        # empty state and new projects simply start with no stages).
+        return None
 
     @action(detail=True, methods=["get"])
     def usage(self, request, pk=None):
@@ -291,7 +285,8 @@ class PmsSettingsView(APIView):
 # Projects (api.md §10.2)
 # ---------------------------------------------------------------------------
 def create_project_from_order(order, *, project_manager_id=None, priority="Medium",
-                              stage_config_ids=None, stage_weights=None, user=None):
+                              stage_config_ids=None, stage_weights=None, user=None,
+                              start_date=None, specifications=None):
     """``POST /pms/projects/from-order/`` -- pulls customer + product from the order."""
     first_line = order.line_items.filter(deleted_at__isnull=True).order_by("line_no").first()
 
@@ -304,10 +299,11 @@ def create_project_from_order(order, *, project_manager_id=None, priority="Mediu
         product_name=first_line.item_name if first_line else None,
         order_value=order.total,
         quantity=first_line.qty if first_line else None,
+        specifications=specifications,
         project_manager_id=project_manager_id,
         priority=priority,
         status="Draft",
-        start_date=timezone.now(),
+        start_date=start_date or timezone.now(),
         created_by=user if getattr(user, "is_authenticated", False) else None,
     )
     order.pms_project = project
@@ -558,12 +554,30 @@ class ProjectViewSet(TenantModelViewSet):
         )
         return super().perform_create(serializer)
 
+    def perform_update(self, serializer):
+        # A generic PATCH must never slip past the completion gate: completing
+        # goes through the service so open stages still block it (api.md §10.3).
+        instance = serializer.instance
+        if (
+            serializer.validated_data.get("status") == "Completed"
+            and getattr(instance, "status", None) != "Completed"
+        ):
+            serializer.validated_data.pop("status", None)
+            updated = super().perform_update(serializer)
+            services.complete_project(updated, user=self.request.user, force=False)
+            updated.refresh_from_db()
+            self._concurrency_instance = updated
+            return updated
+        return super().perform_update(serializer)
+
     @action(detail=False, methods=["post"], url_path="from-order")
     @transaction.atomic
     def from_order(self, request):
         from apps.sales.models import SalesOrder
 
-        serializer = FromOrderSerializer(data=request.data)
+        serializer = FromOrderSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
@@ -605,6 +619,8 @@ class ProjectViewSet(TenantModelViewSet):
             stage_config_ids=data.get("stageConfigIds") or list(stage_weights.keys()),
             stage_weights=stage_weights or None,
             user=request.user,
+            start_date=data.get("startDate"),
+            specifications=data.get("specifications"),
         )
         return Response(
             ProjectDetailSerializer(project, context=self._detail_context(project)).data,
@@ -612,9 +628,12 @@ class ProjectViewSet(TenantModelViewSet):
         )
 
     @action(detail=True, methods=["post"], url_path="apply-stage-template")
+    @transaction.atomic
     def apply_stage_template(self, request, pk=None):
         project = self.get_object()
-        serializer = ApplyTemplateSerializer(data=request.data)
+        serializer = ApplyTemplateSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
         serializer.is_valid(raise_exception=True)
         apply_stage_template(
             project,
@@ -738,12 +757,29 @@ class ProjectViewSet(TenantModelViewSet):
 
     # -- stages ------------------------------------------------------------
     def _get_stage(self, project, stage_id):
-        stage = project.stages.filter(pk=stage_id, deleted_at__isnull=True).first()
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        try:
+            stage = project.stages.filter(pk=stage_id, deleted_at__isnull=True).first()
+        except (DjangoValidationError, ValueError, TypeError):
+            stage = None
         if stage is None:
             raise NotFound("That stage no longer exists.")
         return stage
 
+    def _get_document(self, stage, doc_id):
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        try:
+            document = stage.documents.filter(pk=doc_id, deleted_at__isnull=True).first()
+        except (DjangoValidationError, ValueError, TypeError):
+            document = None
+        if document is None:
+            raise NotFound("That document no longer exists.")
+        return document
+
     @action(detail=True, methods=["get", "post"], url_path="stages")
+    @transaction.atomic
     def stages(self, request, pk=None):
         project = self.get_object()
         if request.method == "GET":
@@ -814,6 +850,7 @@ class ProjectViewSet(TenantModelViewSet):
         )
 
     @action(detail=True, methods=["patch"], url_path=r"stages/(?P<stage_id>[^/.]+)")
+    @transaction.atomic
     def stage_detail(self, request, pk=None, stage_id=None):
         project = self.get_object()
         stage = self._get_stage(project, stage_id)
@@ -828,6 +865,18 @@ class ProjectViewSet(TenantModelViewSet):
             ):
                 raise PermissionDenied("Only the project creator can modify stage percentages.")
 
+        # Completing goes through the handoff gate so documents, approvals and
+        # open delays still block it (api.md §10.3).
+        if isinstance(request.data, dict) and request.data.get("status") == "Completed":
+            result = services.handoff_stage(stage, user=request.user, force=False)
+            project.refresh_from_db()
+            return Response(
+                ProjectStageSerializer(
+                    result["stage"], context=self.get_serializer_context()
+                ).data
+            )
+
+        previous_status = stage.status
         serializer = ProjectStageSerializer(
             stage, data=request.data, partial=True, context=self.get_serializer_context()
         )
@@ -836,6 +885,14 @@ class ProjectViewSet(TenantModelViewSet):
 
         if any(k in request.data for k in ("percentage", "weightPct", "weight", "weight_pct")):
             services.recalculate_project(project)
+
+        if previous_status != stage.status:
+            record_audit(
+                client=request.client_id, actor=request.user, action="STAGE_STATUS_CHANGED",
+                entity_type="PmsStage", entity_id=stage.id, entity_label=stage.name,
+                description=f"Status changed to {stage.status}",
+                from_value=previous_status, to_value=stage.status,
+            )
 
         return Response(serializer.data)
 
@@ -848,7 +905,9 @@ class ProjectViewSet(TenantModelViewSet):
 
         project = self.get_object()
         stage = self._get_stage(project, stage_id)
-        serializer = AssignStageSerializer(data=request.data)
+        serializer = AssignStageSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
@@ -898,6 +957,7 @@ class ProjectViewSet(TenantModelViewSet):
         )
 
     @action(detail=True, methods=["post"], url_path=r"stages/(?P<stage_id>[^/.]+)/start")
+    @transaction.atomic
     def start_stage(self, request, pk=None, stage_id=None):
         project = self.get_object()
         stage = self._get_stage(project, stage_id)
@@ -930,10 +990,13 @@ class ProjectViewSet(TenantModelViewSet):
         )
 
     @action(detail=True, methods=["post"], url_path=r"stages/(?P<stage_id>[^/.]+)/progress")
+    @transaction.atomic
     def stage_progress(self, request, pk=None, stage_id=None):
         project = self.get_object()
         stage = self._get_stage(project, stage_id)
-        serializer = ProgressSerializer(data=request.data)
+        serializer = ProgressSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
         serializer.is_valid(raise_exception=True)
 
         previous = stage.completion_pct
@@ -958,11 +1021,23 @@ class ProjectViewSet(TenantModelViewSet):
         )
 
     @action(detail=True, methods=["post"], url_path=r"stages/(?P<stage_id>[^/.]+)/status")
+    @transaction.atomic
     def stage_status(self, request, pk=None, stage_id=None):
         project = self.get_object()
         stage = self._get_stage(project, stage_id)
         serializer = StageStatusSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+
+        # Completing goes through the handoff gate so documents, approvals and
+        # open delays still block it (api.md §10.3).
+        if serializer.validated_data["status"] == "Completed":
+            result = services.handoff_stage(stage, user=request.user, force=False)
+            project.refresh_from_db()
+            return Response(
+                ProjectStageSerializer(
+                    result["stage"], context=self.get_serializer_context()
+                ).data
+            )
 
         previous = stage.status
         stage.status = serializer.validated_data["status"]
@@ -1111,9 +1186,14 @@ class ProjectViewSet(TenantModelViewSet):
     )
     @transaction.atomic
     def stage_task_detail(self, request, pk=None, stage_id=None, task_id=None):
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
         project = self.get_object()
         stage = self._get_stage(project, stage_id)
-        task = stage.tasks.filter(pk=task_id, deleted_at__isnull=True).first()
+        try:
+            task = stage.tasks.filter(pk=task_id, deleted_at__isnull=True).first()
+        except (DjangoValidationError, ValueError, TypeError):
+            task = None
         if task is None:
             raise NotFound("That task no longer exists.")
 
@@ -1216,9 +1296,7 @@ class ProjectViewSet(TenantModelViewSet):
     def document_detail(self, request, pk=None, stage_id=None, doc_id=None):
         project = self.get_object()
         stage = self._get_stage(project, stage_id)
-        document = stage.documents.filter(pk=doc_id, deleted_at__isnull=True).first()
-        if document is None:
-            raise NotFound("That document no longer exists.")
+        document = self._get_document(stage, doc_id)
 
         versions = Document.objects.filter(
             stage=stage, doc_key=document.doc_key, deleted_at__isnull=True
@@ -1236,14 +1314,15 @@ class ProjectViewSet(TenantModelViewSet):
         methods=["post"],
         url_path=r"stages/(?P<stage_id>[^/.]+)/documents/(?P<doc_id>[^/.]+)/request-approval",
     )
+    @transaction.atomic
     def request_approval(self, request, pk=None, stage_id=None, doc_id=None):
         project = self.get_object()
         stage = self._get_stage(project, stage_id)
-        document = stage.documents.filter(pk=doc_id, deleted_at__isnull=True).first()
-        if document is None:
-            raise NotFound("That document no longer exists.")
+        document = self._get_document(stage, doc_id)
 
-        serializer = RequestApprovalSerializer(data=request.data)
+        serializer = RequestApprovalSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
@@ -1299,9 +1378,7 @@ class ProjectViewSet(TenantModelViewSet):
 
         project = self.get_object()
         stage = self._get_stage(project, stage_id)
-        document = stage.documents.filter(pk=doc_id, deleted_at__isnull=True).first()
-        if document is None:
-            raise NotFound("That document no longer exists.")
+        document = self._get_document(stage, doc_id)
 
         serializer = DecideSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -1442,11 +1519,15 @@ class ProjectViewSet(TenantModelViewSet):
     )
     def share_document(self, request, pk=None, doc_id=None):
         from apps.core.permissions import require_permission
+        from django.core.exceptions import ValidationError as DjangoValidationError
 
         require_permission(request.user, "share_client_proof")
 
         project = self.get_object()
-        document = project.documents.filter(pk=doc_id, deleted_at__isnull=True).first()
+        try:
+            document = project.documents.filter(pk=doc_id, deleted_at__isnull=True).first()
+        except (DjangoValidationError, ValueError, TypeError):
+            document = None
         if document is None:
             raise NotFound("That document no longer exists.")
 
@@ -1582,8 +1663,10 @@ class MyTasksView(APIView):
         if due_before:
             queryset = queryset.filter(due_date__lte=due_before)
 
-        rows = TaskSerializer(queryset.order_by("due_date"), many=True).data
-        for row, task in zip(rows, queryset):
+        # Evaluate once so each row joins to its own task (never re-query).
+        tasks = list(queryset.order_by("due_date"))
+        rows = TaskSerializer(tasks, many=True).data
+        for row, task in zip(rows, tasks):
             row["projectCode"] = task.project.code
             row["stageName"] = task.stage.name
         return Response(
@@ -1618,7 +1701,9 @@ class AllTasksView(APIView):
             if value:
                 queryset = queryset.filter(**{field: value})
 
-        return Response(envelope(TaskSerializer(queryset[:500], many=True).data))
+        return Response(
+            envelope(TaskSerializer(queryset.order_by("due_date")[:500], many=True).data)
+        )
 
 
 class MyProjectsView(APIView):
@@ -1657,8 +1742,11 @@ class DelayViewSet(TenantModelViewSet):
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
         page = self.paginate_queryset(queryset)
+        if page is None:
+            rows = DelaySerializer(queryset, many=True).data
+            return Response(envelope(rows))
         rows = DelaySerializer(page, many=True).data
-        for row, delay in zip(rows, page):
+        for row, delay in zip(rows, list(page)):
             row["projectId"] = str(delay.project_id)
             row["projectCode"] = delay.project.code
             row["stageId"] = str(delay.stage_id)
@@ -1752,7 +1840,14 @@ class PmsActivityView(APIView):
         from apps.core.models import AuditLog
         from apps.core.serializers_platform import AuditLogSerializer
 
-        limit = min(int(request.query_params.get("limit") or 20), 200)
+        try:
+            limit = int(request.query_params.get("limit") or 20)
+        except (TypeError, ValueError):
+            raise ValidationFailed(
+                "Limit must be a number.",
+                field_errors={"limit": ["Expected a number between 1 and 200."]},
+            )
+        limit = max(1, min(limit, 200))
         rows = AuditLog.objects.filter(
             client_id=request.client_id,
             entity_type__in=[
@@ -1835,9 +1930,16 @@ class DocumentSharesView(APIView):
     required_permissions = ["view_pms"]
 
     def get(self, request, doc_id):
-        rows = ProofShare.objects.filter(
-            client_id=request.client_id, document_id=doc_id, deleted_at__isnull=True
-        )
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
+        try:
+            rows = ProofShare.objects.filter(
+                client_id=request.client_id, document_id=doc_id, deleted_at__isnull=True
+            )
+            # Force evaluation inside the guard so a malformed id 404s here.
+            rows = list(rows)
+        except (DjangoValidationError, ValueError, TypeError):
+            raise NotFound("That document no longer exists.")
         return Response(envelope(ProofShareSerializer(rows, many=True).data))
 
 
@@ -1852,13 +1954,18 @@ class RevokeShareView(APIView):
     required_permissions = ["share_client_proof"]
 
     def post(self, request, token):
+        from django.core.exceptions import ValidationError as DjangoValidationError
+
         share = ProofShare.objects.filter(
             client_id=request.client_id, token_hash=hash_token(token)
         ).first()
         if share is None:
-            share = ProofShare.objects.filter(
-                client_id=request.client_id, pk=token
-            ).first()
+            try:
+                share = ProofShare.objects.filter(
+                    client_id=request.client_id, pk=token
+                ).first()
+            except (DjangoValidationError, ValueError, TypeError):
+                share = None
         if share is None:
             raise NotFound("That share link no longer exists.")
 

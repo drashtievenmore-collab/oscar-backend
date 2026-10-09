@@ -23,9 +23,61 @@ from apps.core.numbering import allocate_number
 
 from .models import AUTOMATION_SOURCE, Lead, Stage, StageTask, Task
 
-#: api.md §9.3 -- the fallback roles and offsets when the target stage has no
-#: matching template. The server prefers a template from the lead's current
-#: stage; these are what it falls back to.
+#: Deal pipeline stages driven by the quotation lifecycle: a new deal sits
+#: in Draft; sending the quotation moves it to Sent; the customer opening
+#: the link moves it to Open; approval moves it to Won and rejection (or an
+#: explicit mark-lost) moves it to Lost. Won/Lost are terminal — neither
+#: overwrites the other, and every move is idempotent.
+QUOTATION_DEAL_TRANSITIONS = {
+    "Sent": ("Draft",),
+    "Open": ("Draft", "Sent"),
+    "Won": ("Draft", "Sent", "Open", "Revised", "Declined"),
+    "Lost": ("Draft", "Sent", "Open", "Revised", "Declined"),
+}
+
+
+def advance_deal_for_quotation(quotation, stage, *, actor=None, description=None):
+    """Move the deal linked to ``quotation`` to ``stage`` (or no-op).
+
+    Resolves the deal through ``quotation.crm_deal`` — quotations created
+    from a deal carry the link (``POST /crm/deals/{id}/create-quotation/``
+    or ``crmDeal`` on quotation create). Returns the deal, or ``None`` when
+    there is no linked deal or no move was needed.
+    """
+    from .models import Deal, DealActivity
+
+    deal_id = getattr(quotation, "crm_deal_id", None)
+    if not deal_id or stage not in QUOTATION_DEAL_TRANSITIONS:
+        return None
+    with transaction.atomic():
+        try:
+            deal = Deal.objects.select_for_update().get(pk=deal_id)
+        except Deal.DoesNotExist:
+            return None
+        if deal.stage == stage:
+            return deal
+        if deal.stage in ("Won", "Lost"):
+            return deal
+        if deal.stage not in QUOTATION_DEAL_TRANSITIONS[stage]:
+            return deal
+        previous = deal.stage
+        deal.stage = stage
+        if stage in ("Won", "Lost") and deal.closed_at is None:
+            deal.closed_at = timezone.now()
+        deal.save(update_fields=["stage", "closed_at", "updated_at"])
+        DealActivity.objects.create(
+            deal=deal,
+            type="stage_change",
+            description=(
+                description
+                or f"Deal moved from {previous} to {stage} "
+                f"by quotation {getattr(quotation, 'quotation_number', '')}."
+            ),
+            actor=actor if getattr(actor, "is_authenticated", False) else None,
+        )
+        return deal
+
+
 NEXT_ACTION_FALLBACKS = {
     "follow-up": {
         "title": "Follow-up",
@@ -386,7 +438,7 @@ def annotate_lead_counters(client_id, leads):
         return leads
     lead_ids = [lead.id for lead in leads]
 
-    from apps.sales.models import DeliveryChallan, Estimate, SalesInvoice
+    from apps.sales.models import DeliveryChallan, SalesInvoice
 
     from .models import LeadFile, LeadProduct, LeadSource
 
@@ -404,7 +456,6 @@ def annotate_lead_counters(client_id, leads):
     sources = counts(LeadSource)
     files = counts(LeadFile)
     open_tasks = counts(Task, extra={"status__in": ["Open", "In Progress", "Waiting"]})
-    estimates = counts(Estimate, field="crm_lead_id")
     invoices = dict(
         SalesInvoice.objects.filter(
             client_id=client_id,
@@ -429,7 +480,6 @@ def annotate_lead_counters(client_id, leads):
         lead.sources_count = sources.get(lead.id, 0)
         lead.files_count = files.get(lead.id, 0)
         lead.open_tasks_count = open_tasks.get(lead.id, 0)
-        lead.estimates_count = estimates.get(lead.id, 0)
         lead.sales_invoices_count = invoices.get(lead.id, 0)
         lead.delivery_challans_count = challans.get(lead.id, 0)
     return leads

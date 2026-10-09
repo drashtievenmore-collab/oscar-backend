@@ -102,9 +102,10 @@ class ProductionInstructionViewSet(TenantModelViewSet):
 
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
-        self.check_concurrency(self.get_object())
+        instruction = self.get_object()
+        self.check_concurrency(instruction)
         instruction = services.complete_instruction(
-            self.get_object(), user=request.user
+            instruction, user=request.user
         )
         return Response(self.get_serializer(instruction).data)
 
@@ -235,11 +236,25 @@ class SalespersonView(APIView):
     required_permissions = ["view_production"]
 
     def get(self, request):
+        from apps.core.exceptions import ValidationFailed
+
+        employee_id = request.query_params.get("employeeId")
+        period_start = request.query_params.get("periodStart")
+        period_end = request.query_params.get("periodEnd")
+        missing = {}
+        if not employee_id:
+            missing["employeeId"] = ["An employee is required."]
+        if not period_start:
+            missing["periodStart"] = ["A period start date is required."]
+        if not period_end:
+            missing["periodEnd"] = ["A period end date is required."]
+        if missing:
+            raise ValidationFailed("Some fields need attention.", field_errors=missing)
         row = reports.salesperson_view(
             request.client_id,
-            employee_id=request.query_params.get("employeeId"),
-            period_start=request.query_params.get("periodStart"),
-            period_end=request.query_params.get("periodEnd"),
+            employee_id=employee_id,
+            period_start=period_start,
+            period_end=period_end,
         )
         if row is None:
             raise NotFound("That employee no longer exists.")

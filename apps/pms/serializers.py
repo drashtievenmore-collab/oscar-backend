@@ -5,6 +5,8 @@ each project object. The tables are flat (db.md §10), so the *detail*
 serializer re-assembles that nesting -- one round trip per child table with
 ``= any($ids)``, not N+1 per stage (db.md §15).
 """
+from decimal import Decimal
+
 from rest_framework import serializers
 
 from apps.core.serializers import (
@@ -90,7 +92,9 @@ class TaskSerializer(BaseModelSerializer):
     )
     projectId = serializers.CharField(source="project_id", read_only=True)
     stageId = serializers.CharField(source="stage_id", read_only=True)
-    completionPct = serializers.IntegerField(source="completion_pct", required=False)
+    completionPct = serializers.IntegerField(
+        source="completion_pct", required=False, min_value=0, max_value=100
+    )
     startDate = serializers.DateField(source="start_date", required=False, allow_null=True)
     dueDate = serializers.DateField(source="due_date", required=False, allow_null=True)
 
@@ -228,6 +232,18 @@ class ProjectStageSerializer(BaseModelSerializer):
     percentage = serializers.DecimalField(
         source="weight_pct", max_digits=5, decimal_places=2,
         coerce_to_string=False, required=False,
+        min_value=Decimal("0"), max_value=Decimal("100"),
+    )
+    # Aliases the UI emits for the same weight; all write ``weight_pct``.
+    weightPct = serializers.DecimalField(
+        max_digits=5, decimal_places=2, coerce_to_string=False,
+        required=False, write_only=True,
+        min_value=Decimal("0"), max_value=Decimal("100"),
+    )
+    weight = serializers.DecimalField(
+        max_digits=5, decimal_places=2, coerce_to_string=False,
+        required=False, write_only=True,
+        min_value=Decimal("0"), max_value=Decimal("100"),
     )
     requiredApproval = serializers.BooleanField(source="required_approval", required=False)
     requiredDocument = serializers.BooleanField(source="required_document", required=False)
@@ -246,10 +262,23 @@ class ProjectStageSerializer(BaseModelSerializer):
             "id", "name", "sequence", "department", "departmentId", "assignedTeam",
             "assignedUser", "assignedUserId", "plannedDuration", "durationUnit",
             "startDateTime", "expectedCompletionDateTime", "actualStartDateTime",
-            "actualCompletionDateTime", "completionPct", "percentage", "requiredApproval",
+            "actualCompletionDateTime", "completionPct", "percentage", "weightPct",
+            "weight", "requiredApproval",
             "requiredDocument", "status", "tasks", "documents", "approvals",
             "delayDetails", "isOverdue", "isAtRisk", "created_at", "updated_at",
         ]
+
+    def validate(self, attrs):
+        # Fold the weight aliases into ``weight_pct`` (``percentage`` already
+        # lands there via its source). Explicit ``percentage`` wins.
+        weight = attrs.pop("weight", None)
+        weight_pct_alias = attrs.pop("weightPct", None)
+        if "weight_pct" not in attrs:
+            if weight_pct_alias is not None:
+                attrs["weight_pct"] = weight_pct_alias
+            elif weight is not None:
+                attrs["weight_pct"] = weight
+        return attrs
 
     def get_assignedUser(self, stage):
         if not stage.assigned_user_id:
@@ -425,6 +454,8 @@ def models_q(project):
 # ---------------------------------------------------------------------------
 class AssignStageSerializer(BaseSerializer):
     departmentId = serializers.CharField(required=False, allow_null=True)
+    # pmsStore.assignStage sends the department *name*; resolve it server-side.
+    department = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     assignedTeam = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     assignedUserId = serializers.CharField(required=False, allow_null=True)
     plannedDuration = serializers.DecimalField(
@@ -435,9 +466,74 @@ class AssignStageSerializer(BaseSerializer):
     )
     startDateTime = serializers.DateTimeField(required=False, allow_null=True)
 
+    def validate(self, attrs):
+        from django.apps import apps as django_apps
+
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None) or self.context.get("client_id")
+        Department = django_apps.get_model("pms", "Department")
+        User = django_apps.get_model("accounts", "User")
+
+        if attrs.get("department") and not attrs.get("departmentId"):
+            match = Department.objects.filter(
+                client_id=client_id, name=attrs["department"], deleted_at__isnull=True
+            ).first()
+            if match is None:
+                raise serializers.ValidationError(
+                    {"department": "Unknown department for this tenant."}
+                )
+            attrs["departmentId"] = str(match.id)
+
+        if attrs.get("departmentId"):
+            try:
+                exists = Department.objects.filter(
+                    pk=attrs["departmentId"], client_id=client_id,
+                    deleted_at__isnull=True,
+                ).exists()
+            except Exception:
+                exists = False
+            if not exists:
+                raise serializers.ValidationError(
+                    {"departmentId": "Unknown department for this tenant."}
+                )
+
+        if attrs.get("assignedUserId"):
+            try:
+                exists = User.objects.filter(
+                    pk=attrs["assignedUserId"], client_id=client_id,
+                    deleted_at__isnull=True,
+                ).exists()
+            except Exception:
+                exists = False
+            if not exists:
+                raise serializers.ValidationError(
+                    {"assignedUserId": "Unknown user for this tenant."}
+                )
+        return attrs
+
 
 class ProgressSerializer(BaseSerializer):
-    pct = serializers.IntegerField(min_value=0, max_value=100)
+    pct = serializers.IntegerField(required=False, min_value=0, max_value=100)
+    # The PMS store sends ``{ completionPct }`` (pmsSync.setStageProgress);
+    # accept every alias the UI emits so progress is never dropped as unknown.
+    completionPct = serializers.IntegerField(required=False, min_value=0, max_value=100)
+    completion_pct = serializers.IntegerField(required=False, min_value=0, max_value=100)
+    percentage = serializers.IntegerField(required=False, min_value=0, max_value=100)
+
+    def validate(self, attrs):
+        pct = (
+            attrs.get("pct", None)
+            if attrs.get("pct") is not None
+            else attrs.get("completionPct", None)
+            if attrs.get("completionPct") is not None
+            else attrs.get("completion_pct", None)
+            if attrs.get("completion_pct") is not None
+            else attrs.get("percentage", None)
+        )
+        if pct is None:
+            raise serializers.ValidationError({"pct": "A completion percentage is required."})
+        attrs["pct"] = pct
+        return attrs
 
 
 class StageStatusSerializer(BaseSerializer):
@@ -459,6 +555,26 @@ class RequestApprovalSerializer(BaseSerializer):
     approverType = serializers.ChoiceField(choices=["PM", "Client"])
     approverName = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     approverUserId = serializers.CharField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        if attrs.get("approverUserId"):
+            from django.apps import apps as django_apps
+
+            request = self.context.get("request")
+            client_id = getattr(request, "client_id", None) or self.context.get("client_id")
+            User = django_apps.get_model("accounts", "User")
+            try:
+                exists = User.objects.filter(
+                    pk=attrs["approverUserId"], client_id=client_id,
+                    deleted_at__isnull=True,
+                ).exists()
+            except Exception:
+                exists = False
+            if not exists:
+                raise serializers.ValidationError(
+                    {"approverUserId": "Unknown user for this tenant."}
+                )
+        return attrs
 
 
 class DecideSerializer(BaseSerializer):
@@ -507,8 +623,23 @@ class ProofShareSerializer(BaseModelSerializer):
 
 
 class ApplyTemplateSerializer(BaseSerializer):
-    configIds = serializers.ListField(child=serializers.CharField(), allow_empty=False)
+    configIds = serializers.ListField(
+        child=serializers.CharField(), required=False, allow_empty=False
+    )
+    # pmsStore sends ``stageConfigIds``; accept it as the same list.
+    stageConfigIds = serializers.ListField(
+        child=serializers.CharField(), required=False, allow_empty=False
+    )
     stageWeights = serializers.DictField(required=False, default=dict)
+
+    def validate(self, attrs):
+        ids = attrs.get("configIds") or attrs.get("stageConfigIds")
+        if not ids:
+            raise serializers.ValidationError(
+                {"configIds": "At least one stage template is required."}
+            )
+        attrs["configIds"] = ids
+        return attrs
 
 
 class CompleteProjectSerializer(BaseSerializer):
@@ -523,6 +654,8 @@ class FromOrderSerializer(BaseSerializer):
     priority = serializers.ChoiceField(
         choices=["Low", "Medium", "High", "Urgent"], required=False, default="Medium"
     )
+    startDate = serializers.DateTimeField(required=False, allow_null=True)
+    specifications = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     stageConfigIds = serializers.ListField(
         child=serializers.CharField(), required=False, default=list
     )
@@ -537,6 +670,24 @@ class FromOrderSerializer(BaseSerializer):
             if not order_id:
                 raise serializers.ValidationError({"salesOrderId": "A sales order id is required."})
             attrs["salesOrderId"] = order_id
+
+        if attrs.get("projectManagerId"):
+            from django.apps import apps as django_apps
+
+            request = self.context.get("request")
+            client_id = getattr(request, "client_id", None) or self.context.get("client_id")
+            User = django_apps.get_model("accounts", "User")
+            try:
+                exists = User.objects.filter(
+                    pk=attrs["projectManagerId"], client_id=client_id,
+                    deleted_at__isnull=True,
+                ).exists()
+            except Exception:
+                exists = False
+            if not exists:
+                raise serializers.ValidationError(
+                    {"projectManagerId": "Unknown user for this tenant."}
+                )
         return attrs
 
 

@@ -608,7 +608,7 @@ def assert_no_dependents(document, dependents):
 def number_of(document):
     for field in (
         "invoice_number", "challan_number", "order_number", "quotation_number",
-        "estimate_number", "proforma_number", "return_number", "bill_number",
+        "proforma_number", "return_number", "bill_number",
         "po_number", "payment_number", "card_number",
     ):
         value = getattr(document, field, None)
