@@ -138,7 +138,10 @@ def team_roster(client_id):
             "department": user.department,
             "isProjectManager": role_code == "PM",
         }
-        for role in user.crm_roles or []:
+        roles = user.crm_roles or []
+        if not roles and role_code != "PM":
+            roles = ["General"]
+        for role in roles:
             roster.setdefault(role, []).append(dict(person))
         if role_code == "PM" and "Project Manager" not in (user.crm_roles or []):
             roster.setdefault("Project Manager", []).append(dict(person))

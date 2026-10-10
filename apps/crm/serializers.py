@@ -274,13 +274,14 @@ class MasterTaskSerializer(BaseModelSerializer):
     order = serializers.IntegerField(source="sort_order", required=False)
     dueIn = serializers.IntegerField(source="duration_days", required=False)
     status = serializers.SerializerMethodField()
+    taskFormId = serializers.CharField(source="task_form_id", required=False, allow_null=True, allow_blank=True)
 
     class Meta:
         model = MasterTask
         fields = [
             "id", "order", "sort_order", "title", "description", "role",
             "department", "dueIn", "duration_days", "priority", "stages",
-            "stageNames", "is_active", "status", "created_at",
+            "stageNames", "is_active", "status", "taskFormId", "created_at",
         ]
 
     def get_stageNames(self, task):

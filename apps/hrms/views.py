@@ -235,29 +235,83 @@ class EmployeeViewSet(TenantModelViewSet):
             self.request.user.client, "EMP"
         )
         employee = super().perform_create(serializer)
+        self._ensure_user_for_employee(
+            employee, self.get_client_id(), actor=self.request.user
+        )
+        return employee
 
-        # api.md §11.1 -- "also provisions a user account when asked".
-        if self.request.data.get("createUserAccount") and employee.email:
+    @staticmethod
+    def _ensure_user_for_employee(employee, client_id, actor=None):
+        if not employee or not employee.email:
+            return None
+        from apps.accounts.models import User
+
+        email = str(employee.email).lower().strip()
+        if not email:
+            return None
+        existing = User.objects.filter(
+            client_id=client_id, email=email, deleted_at__isnull=True
+        ).first()
+        if existing is not None:
+            updates = []
+            if existing.employee_id is None:
+                existing.employee = employee
+                updates.append("employee")
+            if existing.status != "Active" or not existing.is_active:
+                existing.status = "Active"
+                existing.is_active = True
+                updates.extend(["status", "is_active"])
+            if updates:
+                updates.append("updated_at")
+                existing.save(update_fields=list(dict.fromkeys(updates)))
+            return existing
+        user = User.objects.create_user(
+            email=email,
+            client_id=client_id,
+            name=employee.name,
+            phone=employee.phone,
+            employee=employee,
+            department=employee.department.name if employee.department_id else None,
+            status="Active",
+        )
+        return user
+
+    def perform_update(self, serializer):
+        employee = super().perform_update(serializer)
+        self._ensure_user_for_employee(
+            employee, self.get_client_id(), actor=self.request.user
+        )
+        return employee
+
+    @action(detail=False, methods=["post"], url_path="backfill-users")
+    @transaction.atomic
+    def backfill_users(self, request):
+        rows = Employee.objects.filter(
+            client_id=request.client_id, deleted_at__isnull=True
+        ).select_related("department")
+        created = linked = skipped = 0
+        for employee in rows:
+            if not employee.email:
+                skipped += 1
+                continue
             from apps.accounts.models import User
 
-            if not User.objects.filter(
-                client_id=self.get_client_id(), email=employee.email.lower(),
-                deleted_at__isnull=True,
-            ).exists():
-                user = User.objects.create_user(
-                    email=employee.email,
-                    client_id=self.get_client_id(),
-                    name=employee.name,
-                    phone=employee.phone,
-                    employee=employee,
-                    department=employee.department.name if employee.department_id else None,
-                    status="Invited",
+            email = str(employee.email).lower().strip()
+            existing = User.objects.filter(
+                client_id=request.client_id, email=email, deleted_at__isnull=True
+            ).first()
+            if existing is None:
+                self._ensure_user_for_employee(
+                    employee, request.client_id, actor=request.user
                 )
-                self.write_audit(
-                    "provision_user", employee,
-                    description=f"User account created for {user.email}",
+                created += 1
+            else:
+                before = (existing.employee_id, existing.status)
+                self._ensure_user_for_employee(
+                    employee, request.client_id, actor=request.user
                 )
-        return employee
+                linked += 1 if before[0] is None or before[1] != "Active" else 0
+        return Response({"created": created, "linked": linked, "skipped": skipped})
 
     @action(detail=True, methods=["post"])
     @transaction.atomic
@@ -1068,7 +1122,9 @@ class OnboardingViewSet(TenantModelViewSet):
         candidate.employee = employee
         candidate.stage = "Hired"
         candidate.save(update_fields=["employee", "stage", "updated_at"])
-
+        EmployeeViewSet._ensure_user_for_employee(
+            employee, request.client_id, actor=request.user
+        )
         record_audit(
             client=request.client_id,
             actor=request.user,
