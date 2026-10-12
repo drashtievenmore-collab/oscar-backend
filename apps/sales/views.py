@@ -291,6 +291,12 @@ class QuotationViewSet(SalesDocumentViewSet):
             raise Conflict(
                 f"This quotation is {quotation.status}.", code=Codes.ALREADY_DONE
             )
+        if quotation.party_id is None:
+            raise Conflict(
+                "This quotation has no customer account yet. Approve it first -- "
+                "the lead is converted to a customer on approval.",
+                code="CUSTOMER_REQUIRED",
+            )
 
         order = _clone_document(
             quotation,

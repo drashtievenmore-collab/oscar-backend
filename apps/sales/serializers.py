@@ -87,6 +87,13 @@ class QuotationSerializer(DocumentSerializer):
     line_fk_name = "quotation"
     line_table_name = "quotation_lines"
 
+    #: ``DocumentSerializer`` makes the party mandatory for every document;
+    #: the quotation is the exception -- it can be raised against a lead that
+    #: has no Customer row yet (see ``Quotation.party``).
+    partyId = TenantPrimaryKeyRelatedField(
+        source="party", model="masters.Party", required=False, allow_null=True
+    )
+
     class Meta:
         model = Quotation
         fields = HEADER_FIELDS + [

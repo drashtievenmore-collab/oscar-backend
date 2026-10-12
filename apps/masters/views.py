@@ -95,10 +95,20 @@ class PartyViewSet(TenantModelViewSet):
 
     @action(detail=False, methods=["get"])
     def customers(self, request):
-        """``type in (Customer, Both)``."""
-        queryset = self.filter_queryset(self.get_queryset()).filter(
-            type__in=["Customer", "Both"]
-        )
+        """``type in (Customer, Both)`` -- the one customer list.
+
+        Also what Administration -> Clients reads, so the admin screen and the
+        Parties module can never disagree about who the customers are. The
+        ``lead_count`` annotation says which of these arrived through a lead
+        conversion (db.md §4.1: a converted lead creates the Customer row).
+        """
+        queryset = self.filter_queryset(
+            self.get_queryset().annotate(
+                lead_count=Count(
+                    "leads", filter=Q(leads__deleted_at__isnull=True), distinct=True
+                )
+            )
+        ).filter(type__in=["Customer", "Both"])
         page = self.paginate_queryset(queryset)
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
 

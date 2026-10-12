@@ -281,7 +281,7 @@ class MasterTaskSerializer(BaseModelSerializer):
         fields = [
             "id", "order", "sort_order", "title", "description", "role",
             "department", "dueIn", "duration_days", "priority", "stages",
-            "stageNames", "is_active", "status", "taskFormId", "created_at",
+            "stageNames", "is_active", "status", "icon", "taskFormId", "created_at",
         ]
 
     def validate_taskFormId(self, value):

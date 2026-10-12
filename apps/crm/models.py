@@ -356,6 +356,10 @@ class MasterTask(TenantModel):
     #: A master task may apply to several stages (the frontend's `stages[]`).
     stages = models.ManyToManyField(Stage, blank=True, related_name="master_tasks")
     is_active = models.BooleanField(default=True)
+    #: Icon shown in the master-task list. The column is NOT NULL in Postgres
+    #: with no database default, so this field must stay on the model -- without
+    #: it the INSERT omits the column and raises an IntegrityError (0004).
+    icon = models.TextField(default="call")
     task_form_id = models.TextField(null=True, blank=True)
 
     class Meta:

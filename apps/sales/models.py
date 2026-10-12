@@ -57,6 +57,15 @@ def choices(values):
 # Quotations (api.md §5.3)
 # ---------------------------------------------------------------------------
 class Quotation(DocumentHeader):
+    #: A quotation can be raised against a lead that has no Customer/Party row
+    #: yet (api.md §5.3) -- it is priced and sent first and only becomes a
+    #: billable document when the customer accepts it. ``QuotationViewSet
+    #: .approve`` is what links (or creates) the party at that point, so
+    #: ``party`` is the one header relation this document may leave empty.
+    party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.PROTECT, related_name="+"
+    )
+
     quotation_number = models.TextField(null=True, blank=True)
     status = models.TextField(choices=choices(QUOTATION_STATUSES), default="Draft")
     valid_until = models.DateField(null=True, blank=True)
@@ -78,6 +87,33 @@ class Quotation(DocumentHeader):
 
     def __str__(self):
         return self.quotation_number or f"Quotation {self.id}"
+
+    def freeze_party_snapshot(self, party=None):
+        """db.md §3.1 -- freeze the party onto the document.
+
+        With no party yet (a quotation raised against a lead), the lead's own
+        identity is frozen instead so the quotation still prints a customer
+        name, place of supply and address. Approval re-freezes from the
+        converted party, which wins because it is a real Customer row.
+        """
+        super().freeze_party_snapshot(party)
+        if self.party_id is not None:
+            return
+        lead = self.crm_lead
+        if lead is None:
+            return
+        self.party_name = self.party_name or (lead.company or lead.name)
+        self.place_of_supply = self.place_of_supply or lead.state
+        address = {
+            key: value
+            for key, value in (
+                ("city", lead.city), ("state", lead.state), ("country", lead.country),
+            )
+            if value
+        }
+        if address and not self.billing_address:
+            self.billing_address = address
+            self.shipping_address = self.shipping_address or dict(address)
 
 
 class QuotationLine(DocumentLine):

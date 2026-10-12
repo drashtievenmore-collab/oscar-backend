@@ -57,6 +57,11 @@ class PartySerializer(BaseModelSerializer):
     ledgerAccountId = TenantPrimaryKeyRelatedField(
         source="ledger_account", model="accounting.Account", required=False, allow_null=True
     )
+    #: How many CRM leads were converted into this party. Lets the admin
+    #: customer list show which accounts came from a lead conversion and which
+    #: were entered by hand, without a second round trip. Annotated by
+    #: ``PartyViewSet.customers``; absent (0) everywhere else.
+    leadCount = serializers.SerializerMethodField()
 
     class Meta:
         model = Party
@@ -69,7 +74,7 @@ class PartySerializer(BaseModelSerializer):
             "tcs_applicable", "tcs_rate",
             "ledgerAccount", "ledgerAccountId", "credit_limit", "payment_terms",
             "bank_account_number", "ifsc_code", "bank_name", "account_holder_name",
-            "opening_balance", "balance",
+            "opening_balance", "balance", "leadCount",
             "billing_address", "shipping_address", "contacts", "status",
             "created_at", "updated_at",
         ]
@@ -78,6 +83,9 @@ class PartySerializer(BaseModelSerializer):
         # ``PartyViewSet.perform_create``; the client must never invent one, so
         # it is optional on the wire rather than required.
         extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+    def get_leadCount(self, party):
+        return getattr(party, "lead_count", 0) or 0
 
     def validate_code(self, value):
         client_id = self.context.get("client_id")

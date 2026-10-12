@@ -242,6 +242,16 @@ class EmployeeViewSet(TenantModelViewSet):
 
     @staticmethod
     def _ensure_user_for_employee(employee, client_id, actor=None):
+        """Keep the Administration -> Users row in step with the employee row.
+
+        The employee record is the source of truth for who someone is and what
+        they do; the user row is the login that goes with it. So a create
+        *and* an edit both land here: existing accounts are re-pointed at the
+        employee and have their identity fields refreshed, and an employee with
+        no account yet gets one. Matching is by email, which is what makes the
+        create path idempotent -- re-saving an employee never makes a second
+        login.
+        """
         if not employee or not employee.email:
             return None
         from apps.accounts.models import User
@@ -249,6 +259,7 @@ class EmployeeViewSet(TenantModelViewSet):
         email = str(employee.email).lower().strip()
         if not email:
             return None
+        department = employee.department.name if employee.department_id else None
         existing = User.objects.filter(
             client_id=client_id, email=email, deleted_at__isnull=True
         ).first()
@@ -257,6 +268,19 @@ class EmployeeViewSet(TenantModelViewSet):
             if existing.employee_id is None:
                 existing.employee = employee
                 updates.append("employee")
+            # An admin editing the login row must not freeze the person's name
+            # in place of the HR record -- the next employee edit carries the
+            # truth back. A blank user field always yields to the employee.
+            for field, value in (
+                ("name", employee.name),
+                ("phone", employee.phone),
+                ("department", department),
+                ("avatar_url", employee.avatar_url),
+                ("joined_date", employee.joining_date),
+            ):
+                if value and getattr(existing, field) != value:
+                    setattr(existing, field, value)
+                    updates.append(field)
             if existing.status != "Active" or not existing.is_active:
                 existing.status = "Active"
                 existing.is_active = True
@@ -271,7 +295,9 @@ class EmployeeViewSet(TenantModelViewSet):
             name=employee.name,
             phone=employee.phone,
             employee=employee,
-            department=employee.department.name if employee.department_id else None,
+            department=department,
+            avatar_url=employee.avatar_url,
+            joined_date=employee.joining_date,
             status="Active",
         )
         return user
