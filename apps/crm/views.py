@@ -784,6 +784,15 @@ class TaskViewSet(TenantModelViewSet):
         return task
 
     @action(detail=True, methods=["post"])
+    def start(self, request, pk=None):
+        task = self.get_object()
+        task.status = "In Progress"
+        if not task.started_at:
+            task.started_at = timezone.now()
+        task.save(update_fields=["status", "started_at", "updated_at"])
+        return Response(TaskSerializer(task).data)
+
+    @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
         serializer = CompleteTaskSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -797,6 +806,9 @@ class TaskViewSet(TenantModelViewSet):
             user=request.user,
             next_follow_up_at=data.get("nextFollowUpAt"),
             target_stage_id=data.get("targetStageId") or None,
+            started_at=data.get("startedAt"),
+            ended_at=data.get("endedAt"),
+            duration_seconds=data.get("durationSeconds"),
         )
         return Response(
             {

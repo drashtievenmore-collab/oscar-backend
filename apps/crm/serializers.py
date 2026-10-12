@@ -274,18 +274,14 @@ class MasterTaskSerializer(BaseModelSerializer):
     order = serializers.IntegerField(source="sort_order", required=False)
     dueIn = serializers.IntegerField(source="duration_days", required=False)
     status = serializers.SerializerMethodField()
-    taskFormId = serializers.CharField(source="task_form_id", required=False, allow_null=True, allow_blank=True)
 
     class Meta:
         model = MasterTask
         fields = [
             "id", "order", "sort_order", "title", "description", "role",
             "department", "dueIn", "duration_days", "priority", "stages",
-            "stageNames", "is_active", "status", "icon", "taskFormId", "created_at",
+            "stageNames", "is_active", "status", "icon", "created_at",
         ]
-
-    def validate_taskFormId(self, value):
-        return value or None
 
     def get_stageNames(self, task):
         return [stage.name for stage in task.stages.all()]
@@ -373,14 +369,20 @@ class TaskSerializer(BaseModelSerializer):
     )
     assigneeName = serializers.CharField(source="assignee.name", read_only=True)
     dueDate = serializers.DateField(source="due_date", required=False, allow_null=True)
+    dueTime = serializers.CharField(source="due_time", required=False, allow_null=True, allow_blank=True)
+    startedAt = serializers.DateTimeField(source="started_at", required=False, allow_null=True)
+    endedAt = serializers.DateTimeField(source="ended_at", required=False, allow_null=True)
+    durationSeconds = serializers.IntegerField(source="duration_seconds", required=False)
+    icon = serializers.CharField(required=False, default="call")
 
     class Meta:
         model = Task
         fields = [
             "id", "task_number", "leadId", "leadName", "dealId", "title",
             "description", "assigneeId", "assigneeName", "assignee_role",
-            "department", "dueDate", "priority", "status", "source", "outcome",
-            "next_action", "completion_note", "completed_at", "follow_up_task",
+            "department", "dueDate", "dueTime", "priority", "status", "source", "outcome",
+            "next_action", "completion_note", "completed_at", "startedAt", "endedAt",
+            "durationSeconds", "icon", "follow_up_task",
             "created_at", "updated_at",
         ]
         read_only_fields = [
@@ -409,6 +411,9 @@ class CompleteTaskSerializer(BaseSerializer):
     completedBy = serializers.CharField(required=False, allow_null=True)
     nextFollowUpAt = serializers.DateTimeField(required=False, allow_null=True)
     targetStageId = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    startedAt = serializers.DateTimeField(required=False, allow_null=True)
+    endedAt = serializers.DateTimeField(required=False, allow_null=True)
+    durationSeconds = serializers.IntegerField(required=False, allow_null=True)
 
 
 class TaskAllocationAuditSerializer(BaseModelSerializer):

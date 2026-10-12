@@ -360,7 +360,6 @@ class MasterTask(TenantModel):
     #: with no database default, so this field must stay on the model -- without
     #: it the INSERT omits the column and raises an IntegrityError (0004).
     icon = models.TextField(default="call")
-    task_form_id = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "crm_master_tasks"
@@ -431,6 +430,11 @@ class Task(TenantModel, LegacyIdMixin):
     follow_up_task = models.ForeignKey(
         "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="spawned_from"
     )
+    started_at = models.DateTimeField(null=True, blank=True)
+    ended_at = models.DateTimeField(null=True, blank=True)
+    duration_seconds = models.IntegerField(default=0)
+    due_time = models.CharField(max_length=16, null=True, blank=True)
+    icon = models.TextField(default="call")
 
     class Meta:
         db_table = "crm_tasks"

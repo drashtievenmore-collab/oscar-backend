@@ -320,7 +320,7 @@ def next_stage_after(client_id, stage):
 # Task completion (api.md §9.3)
 # ---------------------------------------------------------------------------
 @transaction.atomic
-def complete_task(task, *, outcome=None, next_action=None, note=None, user=None, next_follow_up_at=None, target_stage_id=None):
+def complete_task(task, *, outcome=None, next_action=None, note=None, user=None, next_follow_up_at=None, target_stage_id=None, started_at=None, ended_at=None, duration_seconds=None):
     if task.status == "Completed":
         from apps.core.exceptions import Conflict, Codes
 
@@ -328,12 +328,23 @@ def complete_task(task, *, outcome=None, next_action=None, note=None, user=None,
 
     normalized_action = NEXT_ACTION_ALIASES.get(next_action, next_action)
 
+    now = timezone.now()
     task.status = "Completed"
     task.outcome = outcome
     task.next_action = normalized_action or next_action
     task.completion_note = note
-    task.completed_at = timezone.now()
+    task.completed_at = now
     task.completed_by = user if getattr(user, "is_authenticated", False) else None
+    if started_at:
+        task.started_at = started_at
+    if ended_at:
+        task.ended_at = ended_at
+    elif not task.ended_at:
+        task.ended_at = now
+    if duration_seconds is not None:
+        task.duration_seconds = max(0, int(duration_seconds))
+    elif task.started_at and task.ended_at:
+        task.duration_seconds = max(0, int((task.ended_at - task.started_at).total_seconds()))
     task.save()
 
     follow_up = None
