@@ -79,6 +79,11 @@ def advance_deal_for_quotation(quotation, stage, *, actor=None, description=None
 
 
 NEXT_ACTION_FALLBACKS = {
+    "needs-another-attempt": {
+        "title": "Follow-up",
+        "role": "BDE",
+        "due_in_days": 1,
+    },
     "follow-up": {
         "title": "Follow-up",
         "role": "BDE",
@@ -94,6 +99,12 @@ NEXT_ACTION_FALLBACKS = {
         "role": "BDE",
         "due_in_days": 1,
     },
+}
+
+NEXT_ACTION_ALIASES = {
+    "follow-up": "needs-another-attempt",
+    "move-next-stage": "ready-to-move-on",
+    "finish": "finished-with-lead",
 }
 
 #: api.md §9.3 -- priority nudges the computed due date forward.
@@ -309,21 +320,17 @@ def next_stage_after(client_id, stage):
 # Task completion (api.md §9.3)
 # ---------------------------------------------------------------------------
 @transaction.atomic
-def complete_task(task, *, outcome=None, next_action=None, note=None, user=None):
-    """``POST /crm/tasks/{id}/complete/``.
-
-    The ``nextAction`` table from api.md §9.3, with the server preferring a
-    matching template from the lead's current stage over the hardcoded
-    fallbacks.
-    """
+def complete_task(task, *, outcome=None, next_action=None, note=None, user=None, next_follow_up_at=None, target_stage_id=None):
     if task.status == "Completed":
         from apps.core.exceptions import Conflict, Codes
 
         raise Conflict("This task is already completed.", code=Codes.ALREADY_DONE)
 
+    normalized_action = NEXT_ACTION_ALIASES.get(next_action, next_action)
+
     task.status = "Completed"
     task.outcome = outcome
-    task.next_action = next_action
+    task.next_action = normalized_action or next_action
     task.completion_note = note
     task.completed_at = timezone.now()
     task.completed_by = user if getattr(user, "is_authenticated", False) else None
@@ -332,17 +339,74 @@ def complete_task(task, *, outcome=None, next_action=None, note=None, user=None)
     follow_up = None
     stage_changed = False
     created_tasks = []
+    current_lead = task.lead if task.lead_id else None
 
-    if next_action == "move-next-stage" and task.lead_id:
+    if normalized_action == "ready-to-move-on" and task.lead_id:
         lead = task.lead
-        target = next_stage_after(lead.client_id, lead.stage)
-        if target is not None:
-            # Advancing runs the target stage's own automation, per api.md §9.3.
+        blocking = list(
+            Task.objects.filter(
+                client_id=lead.client_id,
+                lead=lead,
+                status__in=["Open", "In Progress", "Waiting"],
+                deleted_at__isnull=True,
+            ).exclude(pk=task.pk).values_list("title", flat=True)[:10]
+        )
+        if blocking:
+            raise ValidationFailed(
+                "Complete the remaining tasks before moving to the next stage.",
+                field_errors={"nextAction": [f"Blocked until these are completed: {', '.join(blocking)}"]},
+            )
+        target = None
+        if target_stage_id:
+            target = Stage.objects.filter(
+                client_id=lead.client_id,
+                pk=target_stage_id,
+                deleted_at__isnull=True,
+                is_active=True,
+            ).first()
+            if target is None:
+                raise ValidationFailed(
+                    "The selected stage is no longer available.",
+                    field_errors={"targetStageId": ["Select a valid stage."]},
+                )
+        else:
+            target = next_stage_after(lead.client_id, lead.stage)
+        if target is not None and not previous_id_equals(lead.stage, target):
             lead, created_tasks = change_lead_stage(lead, target, user=user)
+            current_lead = lead
             stage_changed = True
+            if next_follow_up_at is not None and created_tasks:
+                try:
+                    due_date = next_follow_up_at.date() if hasattr(next_follow_up_at, "date") else next_follow_up_at
+                except Exception:
+                    due_date = None
+                if due_date is not None:
+                    for created in created_tasks:
+                        created.due_date = due_date
+                        created.save(update_fields=["due_date", "updated_at"])
+
+    elif normalized_action == "finished-with-lead" and task.lead_id:
+        lead = task.lead
+        current_lead = lead
+        Task.objects.filter(
+            client_id=lead.client_id,
+            lead=lead,
+            status__in=["Open", "In Progress", "Waiting"],
+            deleted_at__isnull=True,
+        ).exclude(pk=task.pk).update(
+            status="Cancelled",
+            updated_at=timezone.now(),
+        )
+
+    elif normalized_action == "needs-another-attempt" and task.lead_id:
+        follow_up = _create_follow_up(task, "needs-another-attempt", user=user, due_at=next_follow_up_at)
+        if follow_up is not None:
+            created_tasks = [follow_up]
+            task.follow_up_task = follow_up
+            task.save(update_fields=["follow_up_task", "updated_at"])
 
     elif next_action in NEXT_ACTION_FALLBACKS and task.lead_id:
-        follow_up = _create_follow_up(task, next_action, user=user)
+        follow_up = _create_follow_up(task, next_action, user=user, due_at=next_follow_up_at)
         if follow_up is not None:
             created_tasks = [follow_up]
             task.follow_up_task = follow_up
@@ -364,10 +428,11 @@ def complete_task(task, *, outcome=None, next_action=None, note=None, user=None)
         "followUpTask": follow_up,
         "createdTasks": created_tasks,
         "stageChanged": stage_changed,
+        "lead": current_lead,
     }
 
 
-def _create_follow_up(task, next_action, *, user=None):
+def _create_follow_up(task, next_action, *, user=None, due_at=None):
     fallback = NEXT_ACTION_FALLBACKS[next_action]
     lead = task.lead
 
@@ -394,6 +459,13 @@ def _create_follow_up(task, next_action, *, user=None):
     title = template.title if template else fallback["title"]
 
     assignee = resolve_assignee(lead.client_id, role, department)
+    if due_at is not None:
+        try:
+            due_date = due_at.date() if hasattr(due_at, "date") else due_at
+        except Exception:
+            due_date = compute_due_date(offset, priority)
+    else:
+        due_date = compute_due_date(offset, priority)
     follow_up = Task.objects.create(
         client_id=lead.client_id,
         task_number=allocate_number(lead.client, "TSK"),
@@ -404,7 +476,7 @@ def _create_follow_up(task, next_action, *, user=None):
         assignee=assignee,
         assignee_role=role,
         department=department,
-        due_date=compute_due_date(offset, priority),
+        due_date=due_date,
         priority=priority,
         status="Open",
         source=AUTOMATION_SOURCE,

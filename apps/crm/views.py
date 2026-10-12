@@ -11,6 +11,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.core.audit import notify
 from apps.core.exceptions import Codes, Conflict, NotFound, ValidationFailed
 from apps.core.money import ZERO, round2
 from apps.core.numbering import allocate_number
@@ -748,11 +749,42 @@ class TaskViewSet(TenantModelViewSet):
             self.request.user.client, "TSK"
         )
         serializer.validated_data.setdefault("source", "Manual")
-        return super().perform_create(serializer)
+        task = super().perform_create(serializer)
+        if task.assignee_id:
+            lead_name = task.lead.name if task.lead_id and task.lead else ""
+            notify(
+                client=task.client_id,
+                recipients=[task.assignee_id],
+                type="crm.task_assigned",
+                category="crm",
+                title=f"New task: {task.title}",
+                body=f"{lead_name} task assigned to you." if lead_name else "A lead task was assigned to you.",
+                entity_type="CrmTask",
+                entity_id=task.id,
+                actor=self.request.user,
+            )
+        return task
+
+    def perform_update(self, serializer):
+        previous_assignee = serializer.instance.assignee_id if serializer.instance else None
+        task = super().perform_update(serializer)
+        if task.assignee_id and task.assignee_id != previous_assignee:
+            lead_name = task.lead.name if task.lead_id and task.lead else ""
+            notify(
+                client=task.client_id,
+                recipients=[task.assignee_id],
+                type="crm.task_assigned",
+                category="crm",
+                title=f"New task: {task.title}",
+                body=f"{lead_name} task assigned to you." if lead_name else "A lead task was assigned to you.",
+                entity_type="CrmTask",
+                entity_id=task.id,
+                actor=self.request.user,
+            )
+        return task
 
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
-        """``{ outcome, nextAction, note, completedBy }`` (api.md §9.3)."""
         serializer = CompleteTaskSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -763,6 +795,8 @@ class TaskViewSet(TenantModelViewSet):
             next_action=data.get("nextAction"),
             note=data.get("note"),
             user=request.user,
+            next_follow_up_at=data.get("nextFollowUpAt"),
+            target_stage_id=data.get("targetStageId") or None,
         )
         return Response(
             {
@@ -774,6 +808,8 @@ class TaskViewSet(TenantModelViewSet):
                 ),
                 "createdTasks": TaskSerializer(result["createdTasks"], many=True).data,
                 "stageChanged": result["stageChanged"],
+                "lead": LeadSerializer(result["lead"]).data if result.get("lead") is not None else None,
+                "leadId": str(result["lead"].id) if result.get("lead") is not None else None,
             }
         )
 

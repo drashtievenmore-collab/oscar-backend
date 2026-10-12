@@ -31,6 +31,9 @@ TASK_OUTCOMES = [
     ("Follow-up Required", "Follow-up Required"),
 ]
 NEXT_ACTIONS = [
+    ("needs-another-attempt", "needs-another-attempt"),
+    ("ready-to-move-on", "ready-to-move-on"),
+    ("finished-with-lead", "finished-with-lead"),
     ("follow-up", "follow-up"),
     ("schedule-demo", "schedule-demo"),
     ("send-quotation", "send-quotation"),
@@ -383,6 +386,13 @@ class StageTask(TenantModel):
     class Meta:
         db_table = "crm_stage_tasks"
         ordering = ["sort_order", "title"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "stage", "title"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_crm_stage_task_title",
+            )
+        ]
 
 
 class Task(TenantModel, LegacyIdMixin):

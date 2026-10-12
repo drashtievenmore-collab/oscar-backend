@@ -284,11 +284,33 @@ class MasterTaskSerializer(BaseModelSerializer):
             "stageNames", "is_active", "status", "taskFormId", "created_at",
         ]
 
+    def validate_taskFormId(self, value):
+        return value or None
+
     def get_stageNames(self, task):
         return [stage.name for stage in task.stages.all()]
 
     def get_status(self, task):
         return "Active" if task.is_active else "Inactive"
+
+    def validate(self, attrs):
+        title = attrs.get("title", getattr(self.instance, "title", None))
+        if title:
+            request = self.context.get("request")
+            client_id = getattr(getattr(request, "user", None), "client_id", None)
+            qs = MasterTask.objects.filter(
+                title__iexact=title.strip(),
+                deleted_at__isnull=True,
+            )
+            if client_id:
+                qs = qs.filter(client_id=client_id)
+            if self.instance is not None:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError(
+                    {"title": ["A master task with this name already exists."]}
+                )
+        return attrs
 
 
 class StageTaskSerializer(BaseModelSerializer):
@@ -316,6 +338,25 @@ class StageTaskSerializer(BaseModelSerializer):
     def validate(self, attrs):
         if not attrs.get("title") and self.instance is None:
             raise serializers.ValidationError({"name": ["Required."]})
+        # Prevent duplicate task names within the same stage (case-insensitive).
+        title = attrs.get("title", getattr(self.instance, "title", None))
+        stage = attrs.get("stage", getattr(self.instance, "stage", None))
+        if title and stage:
+            request = self.context.get("request")
+            client_id = getattr(getattr(request, "user", None), "client_id", None)
+            qs = StageTask.objects.filter(
+                stage=stage,
+                title__iexact=title.strip(),
+                deleted_at__isnull=True,
+            )
+            if client_id:
+                qs = qs.filter(client_id=client_id)
+            if self.instance is not None:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError(
+                    {"name": ["A task with this name already exists in this stage."]}
+                )
         return attrs
 
 
@@ -352,14 +393,22 @@ class CompleteTaskSerializer(BaseSerializer):
     outcome = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     nextAction = serializers.ChoiceField(
         choices=[
-            "follow-up", "schedule-demo", "send-quotation",
-            "move-next-stage", "finish",
+            "needs-another-attempt",
+            "ready-to-move-on",
+            "finished-with-lead",
+            "follow-up",
+            "schedule-demo",
+            "send-quotation",
+            "move-next-stage",
+            "finish",
         ],
         required=False,
         allow_null=True,
     )
     note = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     completedBy = serializers.CharField(required=False, allow_null=True)
+    nextFollowUpAt = serializers.DateTimeField(required=False, allow_null=True)
+    targetStageId = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
 
 class TaskAllocationAuditSerializer(BaseModelSerializer):

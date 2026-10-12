@@ -3,11 +3,13 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from . import views
+from .customer_clients import CustomerClientViewSet
 
 router = DefaultRouter(trailing_slash=True)
 router.register("users", views.UserViewSet, basename="admin-users")
 router.register("roles", views.RoleViewSet, basename="admin-roles")
 router.register("clients", views.ClientViewSet, basename="admin-clients")
+router.register("customer-clients", CustomerClientViewSet, basename="admin-customer-clients")
 
 auth_urlpatterns = [
     path("login/", views.LoginView.as_view(), name="auth-login"),
