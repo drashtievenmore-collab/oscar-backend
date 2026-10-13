@@ -3,7 +3,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, DecimalField, Q, Sum, Value
+from django.db.models import Count, DecimalField, Max, Q, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import status
@@ -118,6 +118,8 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         "partial_update": ["edit_lead"],
         "destroy": ["delete_lead"],
         "bulk_delete": ["delete_lead"],
+        "mark_lost": ["edit_lead"],
+        "bulk_mark_lost": ["edit_lead"],
     }
 
     def filter_queryset(self, queryset):
@@ -221,6 +223,148 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         lead.is_pinned = False
         lead.save(update_fields=["is_pinned", "updated_at"])
         return Response({"isPinned": False})
+
+    def _resolve_lost_stage(self):
+        stage = (
+            Stage.objects.filter(
+                client_id=self.get_client_id(),
+                is_lost=True,
+                is_active=True,
+                deleted_at__isnull=True,
+            )
+            .order_by("sequence")
+            .first()
+        )
+        if stage is None:
+            stage = Stage.objects.filter(
+                client_id=self.get_client_id(),
+                name__iexact="Lost",
+                deleted_at__isnull=True,
+            ).first()
+        if stage is None:
+            stage = Stage.objects.filter(
+                client_id=self.get_client_id(),
+                name__iexact="Closed",
+                deleted_at__isnull=True,
+            ).first()
+        if stage is None:
+            stages = Stage.objects.filter(
+                client_id=self.get_client_id(), deleted_at__isnull=True
+            )
+            last_sequence = stages.aggregate(value=Max("sequence"))["value"] or 0
+            stage, _ = stages.get_or_create(
+                name="Lost",
+                defaults={
+                    "client_id": self.get_client_id(),
+                    "sequence": last_sequence + 1,
+                    "is_lost": True,
+                    "is_active": True,
+                    "created_by": self.request.user,
+                },
+            )
+        return stage
+
+    def _resolve_lost_reason(self, data):
+        reason_id = data.get("lostReasonId") or data.get("lost_reason")
+        if reason_id:
+            reason = LostReason.objects.filter(
+                client_id=self.get_client_id(), pk=reason_id, deleted_at__isnull=True
+            ).first()
+            if reason is None:
+                raise ValidationFailed(
+                    "The selected lost reason is no longer available.",
+                    field_errors={"lostReasonId": ["Select a valid lost reason."]},
+                )
+            return reason
+        name = data.get("lostReason") or data.get("reason")
+        name = str(name or "").strip()
+        if not name:
+            return None
+        reason = LostReason.objects.filter(
+            client_id=self.get_client_id(), name__iexact=name, deleted_at__isnull=True
+        ).first()
+        if reason is None:
+            reason = LostReason.objects.create(
+                client_id=self.get_client_id(),
+                name=name,
+                created_by=self.request.user,
+            )
+        return reason
+
+    @transaction.atomic
+    def _mark_lead_lost(self, lead, reason, note):
+        lost_stage = self._resolve_lost_stage()
+        previous_stage = lead.stage.name if lead.stage_id else ""
+        lead.stage = lost_stage
+        lead.lost_reason = reason
+        lead.save(update_fields=["stage", "lost_reason", "updated_at"])
+        moved_deals = []
+        open_deals = lead.deals.filter(deleted_at__isnull=True).exclude(stage__in=["Won", "Lost"])
+        for deal in open_deals:
+            deal.stage = "Lost"
+            if deal.closed_at is None:
+                deal.closed_at = timezone.now()
+            if reason is not None:
+                deal.lost_reason = reason
+            deal.save(update_fields=["stage", "closed_at", "lost_reason", "updated_at"])
+            DealActivity.objects.create(
+                deal=deal,
+                type="stage_change",
+                description=(
+                    f"Lead {lead.lead_number} marked as lost"
+                    + (f" ({reason.name})" if reason else "")
+                    + (f" — {note}" if note else "")
+                ),
+                actor=self.request.user if getattr(self.request.user, "is_authenticated", False) else None,
+            )
+            moved_deals.append(str(deal.id))
+        services.annotate_lead_counters(self.get_client_id(), [lead])
+        description = f"Marked as lost (moved from {previous_stage})" if previous_stage else "Marked as lost"
+        if reason:
+            description += f" — {reason.name}"
+        if note:
+            description += f" — {note}"
+        self.write_audit("mark_lost", lead, description=description)
+        return lost_stage, moved_deals
+
+    @action(detail=True, methods=["post"], url_path="mark-lost")
+    @transaction.atomic
+    def mark_lost(self, request, pk=None):
+        """Move one lead to the Lost stage and move its open deals to Lost."""
+        lead = self.get_object()
+        reason = self._resolve_lost_reason(request.data or {})
+        note = str((request.data or {}).get("note") or "").strip()
+        _, moved_deals = self._mark_lead_lost(lead, reason, note)
+        lead.refresh_from_db()
+        services.annotate_lead_counters(request.client_id, [lead])
+        return Response(
+            {
+                "lead": LeadSerializer(lead).data,
+                "movedDeals": moved_deals,
+                "dealsMoved": len(moved_deals),
+            }
+        )
+
+    @action(detail=False, methods=["post"], url_path="bulk-mark-lost")
+    @transaction.atomic
+    def bulk_mark_lost(self, request):
+        """Move several leads to the Lost stage together with their open deals."""
+        ids = (request.data or {}).get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            raise ValidationFailed(
+                "Select at least one lead to mark as lost.",
+                field_errors={"ids": ["Provide a non-empty list of ids."]},
+            )
+        reason = self._resolve_lost_reason(request.data or {})
+        note = str((request.data or {}).get("note") or "").strip()
+        leads = list(self.get_queryset().filter(pk__in=ids))
+        total_moved = 0
+        marked = []
+        for lead in leads:
+            _, moved_deals = self._mark_lead_lost(lead, reason, note)
+            total_moved += len(moved_deals)
+            marked.append(str(lead.id))
+        return Response({"marked": marked, "markedCount": len(marked), "dealsMoved": total_moved})
 
     @action(detail=False, methods=["get"])
     def stats(self, request):
