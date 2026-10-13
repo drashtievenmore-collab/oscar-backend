@@ -27,6 +27,7 @@ from apps.core.exceptions import (
 from apps.core.money import ZERO, D, ROUNDING_TOLERANCE, round2, round4
 from apps.core.numbering import allocate_number
 from apps.inventory import services as stock
+from apps.masters import uom
 from apps.sales.services import (
     allocated_to,
     assert_no_dependents,
@@ -319,6 +320,10 @@ def _create_goods_receipt(bill, lines, location_id, qc_status, *, user=None):
                 purchase_order_line=line.purchase_order_line,
                 purchase_bill_line=line,
                 item=line.item,
+                uom=line.uom,
+                uom_factor=line.uom_factor or 1,
+                stock_uom=line.item.uom,
+                stock_qty=round4(uom.to_stock_qty(line.received_qty, line.uom_factor)),
                 ordered_qty=line.qty,
                 received_qty=line.received_qty,
                 weighed_qty=line.received_weight,
@@ -338,18 +343,22 @@ def _post_receipt_stock(bill, lines, location_id, overrides, receipt, *, user=No
     for line in lines:
         if line.item_id is None or not line.item.holds_stock:
             continue
-        quantity = D(line.received_qty)
+        # received_qty is in the purchase unit; stock is kept in the item's unit.
+        factor = D(line.uom_factor or 1)
+        quantity = uom.to_stock_qty(line.received_qty, factor)
         if quantity <= ZERO:
             continue
 
         movement = stock.post_movement(
             client_id=bill.client_id,
-            item=line.item_id,
+            item=line.item,
             location=location_id,
             type="PURCHASE",
             quantity=quantity,
             weighed_qty=line.received_weight if line.is_weight_item else None,
-            unit_cost=line.landed_unit_cost,
+            unit_cost=(
+                D(line.landed_unit_cost) / factor if line.landed_unit_cost is not None else None
+            ),
             reference_type="PurchaseBill",
             reference_id=bill.id,
             reference_number=bill.bill_number,
@@ -410,8 +419,13 @@ def _bump_po_received(lines):
         po_line = PurchaseOrderLine.objects.select_for_update().get(
             pk=line.purchase_order_line_id
         )
-        po_line.received_qty = round4(D(po_line.received_qty) + D(line.received_qty))
-        po_line.billed_qty = round4(D(po_line.billed_qty) + D(line.qty))
+        # The bill may be in another (compatible) unit than the order.
+        po_line.received_qty = round4(
+            D(po_line.received_qty) + uom.between_lines(line.received_qty, line, po_line)
+        )
+        po_line.billed_qty = round4(
+            D(po_line.billed_qty) + uom.between_lines(line.qty, line, po_line)
+        )
         po_line.save(update_fields=["received_qty", "billed_qty", "updated_at"])
 
 

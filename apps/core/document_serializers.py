@@ -13,7 +13,7 @@ from .serializers import BaseModelSerializer, TenantPrimaryKeyRelatedField
 #: The frozen and computed line fields, in the order the UI renders them.
 LINE_FIELDS = [
     "id", "line_no", "itemId", "sku", "itemName", "description", "hsn_code", "uom",
-    "qty", "rate", "amount", "discount", "discount_amount", "tax", "tax_amount",
+    "uom_factor", "qty", "rate", "amount", "discount", "discount_amount", "tax", "tax_amount",
     "line_total", "serials",
     "isBomGenerated", "bomSourceItemId", "parentLineId", "isBomPart",
     "isUserModified", "parent_sku",
@@ -79,7 +79,7 @@ class DocumentLineSerializer(BaseModelSerializer):
 
     class Meta:
         fields = LINE_FIELDS
-        read_only_fields = ["amount", "discount_amount", "tax_amount", "line_total"]
+        read_only_fields = ["amount", "discount_amount", "tax_amount", "line_total", "uom_factor"]
 
     def get_isBomPart(self, line):
         """db.md §3.2 -- derived as ``parent_line_id is not null``."""

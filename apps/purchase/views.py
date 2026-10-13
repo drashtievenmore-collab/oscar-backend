@@ -22,6 +22,7 @@ from apps.core.pagination import envelope
 from apps.core.printing import PdfNotAvailable, print_payload, send_payload
 from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
 from apps.inventory import services as stock
+from apps.masters import uom
 from apps.sales.views import SalesDocumentViewSet, _clone_document
 
 from . import services
@@ -513,17 +514,23 @@ class PurchaseReturnViewSet(SalesDocumentViewSet):
             bill_line.save(update_fields=["returned_qty", "updated_at"])
 
             if line.item_id and line.item.holds_stock and location_id:
+                # returned_qty is counted in the bill line's unit.
+                factor = D(bill_line.uom_factor or 1)
+                stock_qty = uom.to_stock_qty(line.returned_qty, factor)
                 stock.assert_sufficient_stock(
-                    purchase_return.client_id, line.item, line.returned_qty,
+                    purchase_return.client_id, line.item, stock_qty,
                     location_id, line.item_name,
                 )
                 stock.post_movement(
                     client_id=purchase_return.client_id,
-                    item=line.item_id,
+                    item=line.item,
                     location=location_id,
                     type="PURCHASE_RETURN",
-                    quantity=-D(line.returned_qty),
-                    unit_cost=bill_line.landed_unit_cost or line.item.cost_price,
+                    quantity=-stock_qty,
+                    unit_cost=(
+                        D(bill_line.landed_unit_cost) / factor
+                        if bill_line.landed_unit_cost else line.item.cost_price
+                    ),
                     reference_type="PurchaseReturn",
                     reference_id=purchase_return.id,
                     reference_number=purchase_return.return_number,
@@ -722,6 +729,10 @@ class VendorBillViewSet(TenantModelViewSet):
                     sku=line.sku or (line.item.sku if line.item else None),
                     item_name=line.item_name or (line.item.name if line.item else None),
                     uom=line.uom or (line.item.uom if line.item else None),
+                    uom_factor=uom.line_factor(
+                        request.client_id, line.item,
+                        line.uom or (line.item.uom if line.item else None),
+                    ),
                     qty=line.qty,
                     rate=line.rate,
                     tax_pct=bill.gst_pct,

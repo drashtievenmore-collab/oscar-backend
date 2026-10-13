@@ -14,10 +14,15 @@ from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
 from apps.core.viewsets import TenantModelViewSet
 from apps.inventory import services as stock
+from apps.masters import uom
 
 from .models import (
     CategoryPart,
+    Design,
     Fabric,
+    FabricQuality,
+    FabricType,
+    FabricVariant,
     Item,
     ItemCategory,
     ItemPart,
@@ -25,11 +30,16 @@ from .models import (
     Location,
     Party,
     PartyContact,
+    Shade,
     Unit,
 )
 from .serializers import (
     CategoryPartSerializer,
+    DesignSerializer,
+    FabricQualitySerializer,
     FabricSerializer,
+    FabricTypeSerializer,
+    FabricVariantSerializer,
     ImportRowsSerializer,
     ItemCategorySerializer,
     ItemPartSerializer,
@@ -38,6 +48,7 @@ from .serializers import (
     LocationSerializer,
     PartyContactSerializer,
     PartySerializer,
+    ShadeSerializer,
     UnitSerializer,
 )
 
@@ -739,14 +750,19 @@ def _import_rows(request, rows, dry_run, serializer_class, model, required=()):
 # Categories, units, locations (api.md §4.3)
 # ---------------------------------------------------------------------------
 class ItemCategoryViewSet(TenantModelViewSet):
-    queryset = ItemCategory.objects.prefetch_related("custom_fields")
+    queryset = ItemCategory.objects.select_related("parent", "created_by", "updated_by", "image_file").prefetch_related("custom_fields")
     serializer_class = ItemCategorySerializer
     audit_entity_type = "ItemCategory"
     audit_label_field = "name"
-    search_fields = ["name", "code", "description"]
-    ordering = ["name"]
+    search_fields = ["name", "code", "description", "parent__name", "parent__code"]
+    ordering = ["code", "name"]
     status_field = None
-    filter_map = {"kind": "kind"}
+    filter_map = {
+        "kind": "kind",
+        "isActive": "is_active",
+        "is_active": "is_active",
+        "parentId": "parent_id",
+    }
 
     def get_queryset(self):
         return super().get_queryset().annotate(
@@ -788,13 +804,37 @@ class ItemCategoryViewSet(TenantModelViewSet):
 
 
 class UnitViewSet(TenantModelViewSet):
-    queryset = Unit.objects.all()
+    queryset = Unit.objects.select_related("image_file")
     serializer_class = UnitSerializer
     audit_entity_type = "Unit"
     audit_label_field = "code"
-    search_fields = ["code", "label"]
+    search_fields = ["code", "label", "uom_type", "description"]
     ordering = ["code"]
     status_field = None
+    filter_map = {
+        "isActive": "is_active",
+        "is_active": "is_active",
+        "uomType": "uom_type",
+        "isBaseUnit": "is_base_unit",
+    }
+
+    def check_delete_allowed(self, unit):
+        client_id = self.get_client_id()
+        count = (
+            FabricQuality.objects.filter(client_id=client_id, uom=unit, deleted_at__isnull=True).count()
+            + FabricVariant.objects.filter(client_id=client_id, uom=unit, deleted_at__isnull=True).count()
+        )
+        usage = uom.item_unit_usage(client_id, unit)
+        total = count + usage["items"] + usage["documentLines"]
+        if total:
+            # History keeps the unit by its code -- deleting it would orphan
+            # those records. Inactivating hides it from new entries instead.
+            raise Conflict(
+                f"{unit.code} is used by {count} fabric master(s), {usage['items']} item(s) "
+                f"and {usage['documentLines']} document line(s). Mark it Inactive instead.",
+                code="UNIT_IN_USE",
+                payload={"usageCount": total, "fabricMasters": count, **usage},
+            )
 
 
 class LocationViewSet(TenantModelViewSet):
@@ -806,6 +846,117 @@ class LocationViewSet(TenantModelViewSet):
     ordering = ["name"]
     status_field = None
     filter_map = {"type": "type", "isActive": "is_active"}
+
+
+class TextileMasterViewSet(TenantModelViewSet):
+    """CRUD for the code + name textile masters."""
+
+    audit_label_field = "name"
+    search_fields = ["name", "code", "description"]
+    ordering = ["name"]
+    status_field = None
+    filter_map = {"isActive": "is_active", "is_active": "is_active"}
+
+
+class VariantPartViewSet(TextileMasterViewSet):
+    """A master that fabric items point at: archiving it while a live fabric
+    item still uses it would leave that item describing nothing."""
+
+    variant_field = None
+
+    def check_delete_allowed(self, part):
+        count = FabricVariant.objects.filter(
+            client_id=self.get_client_id(), deleted_at__isnull=True, **{self.variant_field: part}
+        ).count()
+        if count:
+            raise Conflict(
+                f"{part.name} is used by {count} fabric item(s).",
+                code=f"{self.audit_entity_type.upper()}_IN_USE",
+                payload={"variantCount": count},
+            )
+
+
+class FabricTypeViewSet(TextileMasterViewSet):
+    queryset = FabricType.objects.select_related("image_file")
+    serializer_class = FabricTypeSerializer
+    audit_entity_type = "FabricType"
+    search_fields = TextileMasterViewSet.search_fields + ["process_stage"]
+    ordering = ["code"]
+    filter_map = {
+        **TextileMasterViewSet.filter_map,
+        "processStage": "process_stage",
+    }
+
+    def check_delete_allowed(self, fabric_type):
+        count = FabricQuality.objects.filter(
+            client_id=self.get_client_id(), fabric_type=fabric_type, deleted_at__isnull=True
+        ).count()
+        if count:
+            raise Conflict(
+                f"{fabric_type.name} is used by {count} quality record(s).",
+                code="FABRIC_TYPE_IN_USE",
+                payload={"qualityCount": count},
+            )
+
+
+class FabricQualityViewSet(VariantPartViewSet):
+    variant_field = "quality"
+    queryset = FabricQuality.objects.select_related("fabric", "fabric_type", "uom")
+    serializer_class = FabricQualitySerializer
+    audit_entity_type = "FabricQuality"
+    search_fields = ["name", "code", "description", "composition"]
+    filter_map = {
+        **TextileMasterViewSet.filter_map,
+        "fabricId": "fabric_id",
+        "fabricTypeId": "fabric_type_id",
+        "uomId": "uom_id",
+    }
+
+
+class DesignViewSet(VariantPartViewSet):
+    variant_field = "design"
+    queryset = Design.objects.select_related("image_file")
+    serializer_class = DesignSerializer
+    audit_entity_type = "Design"
+    search_fields = TextileMasterViewSet.search_fields + ["pattern_type", "season", "reference"]
+    filter_map = {
+        **TextileMasterViewSet.filter_map,
+        "patternType": "pattern_type",
+        "season": "season",
+    }
+
+
+class ShadeViewSet(VariantPartViewSet):
+    variant_field = "shade"
+    queryset = Shade.objects.select_related("image_file")
+    serializer_class = ShadeSerializer
+    audit_entity_type = "Shade"
+    search_fields = TextileMasterViewSet.search_fields + ["colour_type", "pantone_reference"]
+    filter_map = {
+        **TextileMasterViewSet.filter_map,
+        "colourType": "colour_type",
+    }
+
+
+class FabricVariantViewSet(TextileMasterViewSet):
+    """Fabric item / variant master -- ``/inventory/fabric-variants/``."""
+
+    queryset = FabricVariant.objects.select_related(
+        "quality", "quality__uom", "design", "shade", "uom", "image_file"
+    )
+    serializer_class = FabricVariantSerializer
+    search_fields = TextileMasterViewSet.search_fields + [
+        "hsn_code", "quality__name", "quality__code", "design__name", "design__code",
+        "shade__name", "shade__code", "fabric_type", "construction",
+    ]
+    filter_map = {
+        **TextileMasterViewSet.filter_map,
+        "qualityId": "quality_id",
+        "designId": "design_id",
+        "shadeId": "shade_id",
+        "fabricType": "fabric_type",
+        "construction": "construction",
+    }
 
 
 class FabricViewSet(TenantModelViewSet):

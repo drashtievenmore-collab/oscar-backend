@@ -24,6 +24,7 @@ from apps.core.pagination import envelope
 from apps.core.printing import PdfNotAvailable, print_payload, send_payload
 from apps.core.viewsets import TenantModelViewSet
 from apps.inventory import services as stock
+from apps.masters import uom
 
 from . import services
 from .models import (
@@ -214,7 +215,7 @@ def _clone_document(source, target_model, overrides, *, number_field, series,
 
     line_fields = [
         "client_id", "line_no", "item_id", "sku", "item_name", "description",
-        "hsn_code", "uom", "qty", "rate", "discount_pct", "tax_pct",
+        "hsn_code", "uom", "uom_factor", "qty", "rate", "discount_pct", "tax_pct",
         "is_bom_generated", "bom_source_item_id", "is_user_modified", "parent_sku",
     ]
     for line in source_lines:
@@ -696,6 +697,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 description=source.description,
                 hsn_code=source.hsn_code,
                 uom=source.uom,
+                uom_factor=source.uom_factor,
                 qty=qty,
                 rate=source.rate,
                 discount_pct=source.discount_pct,
@@ -896,6 +898,7 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
                 description=line.description,
                 hsn_code=line.hsn_code,
                 uom=line.uom,
+                uom_factor=line.uom_factor,
                 qty=line.qty,
                 rate=line.rate,
                 discount_pct=line.discount_pct,
@@ -1251,7 +1254,8 @@ class SalesReturnViewSet(SalesDocumentViewSet):
                     item=line.item_id,
                     location=location_id,
                     type="SALES_RETURN",
-                    quantity=D(line.returned_qty),
+                    # returned_qty is counted in the invoice line's unit.
+                    quantity=uom.to_stock_qty(line.returned_qty, invoice_line.uom_factor),
                     unit_cost=line.item.cost_price,
                     reference_type="SalesReturn",
                     reference_id=sales_return.id,

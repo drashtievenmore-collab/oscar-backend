@@ -153,7 +153,9 @@ DATABASES = {
         "PASSWORD": env("DB_PASSWORD", "postgres"),
         "HOST": env("DB_HOST", "localhost"),
         "PORT": env("DB_PORT", "5432"),
-        "CONN_MAX_AGE": 60,
+        # The development server creates short-lived request threads; keeping
+        # their connections open can exhaust PostgreSQL's connection limit.
+        "CONN_MAX_AGE": int(env("DB_CONN_MAX_AGE", "0" if DEBUG else "60")),
     }
 }
 

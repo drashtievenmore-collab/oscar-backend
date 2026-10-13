@@ -55,6 +55,7 @@ def post_movement(
     notes=None,
     user=None,
     original_movement=None,
+    uom=None,
 ):
     """Append one movement and update the balance in the same transaction.
 
@@ -92,12 +93,21 @@ def post_movement(
             field_errors={"reason": ["Required for a manual adjustment."]},
         )
 
+    if uom is None:
+        # ``quantity`` is in the item's stock unit; record which one that is.
+        uom = getattr(item, "uom", None)
+        if uom is None:
+            from apps.masters.models import Item
+
+            uom = Item.objects.filter(pk=item_id).values_list("uom", flat=True).first()
+
     movement = StockMovement.objects.create(
         client_id=client_id,
         item_id=item_id,
         location_id=location_id,
         type=type,
         quantity=quantity,
+        uom=uom,
         weighed_qty=round4(weighed_qty) if weighed_qty is not None else None,
         unit_cost=round4(unit_cost) if unit_cost is not None else None,
         reference_type=reference_type,
@@ -193,6 +203,7 @@ def reverse_movements(*, reference_type, reference_id, client_id, user=None, not
                 notes=notes or f"Reversal of {original.type}",
                 user=user,
                 original_movement=original,
+                uom=original.uom,
             )
         )
     return reversals
@@ -232,7 +243,7 @@ def reserved_quantity(client_id, item_ids=None):
         queryset.values("item_id")
         .annotate(
             reserved=Coalesce(
-                Sum(F("qty") - F("dispatched_qty")),
+                Sum((F("qty") - F("dispatched_qty")) * F("uom_factor")),
                 Value(ZERO_QTY),
                 output_field=DecimalField(max_digits=18, decimal_places=4),
             )

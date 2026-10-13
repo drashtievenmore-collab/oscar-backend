@@ -39,6 +39,7 @@ from apps.core.money import (
 from apps.core.numbering import allocate_number
 from apps.core.permissions import has_permission
 from apps.inventory import services as stock
+from apps.masters import uom
 
 from .models import (
     NON_RESERVING_STAGES,
@@ -385,8 +386,9 @@ def _post_invoice_stock(invoice, lines, *, user=None):
             continue
 
         stock.assert_not_qc_blocked(invoice.client_id, line.item_id, line.item_name)
+        stock_qty = uom.to_stock_qty(line)
         stock.assert_sufficient_stock(
-            invoice.client_id, line.item, line.qty, location_id, line.item_name
+            invoice.client_id, line.item, stock_qty, location_id, line.item_name
         )
 
         serials = stock.serials_for_lines(
@@ -400,7 +402,7 @@ def _post_invoice_stock(invoice, lines, *, user=None):
             item=line.item_id,
             location=location_id,
             type="SALE",
-            quantity=-D(line.qty),
+            quantity=-stock_qty,
             unit_cost=line.item.cost_price,
             reference_type="SalesInvoice",
             reference_id=invoice.id,
@@ -450,7 +452,9 @@ def _bump_order_invoiced_qty(lines):
         order_line = SalesOrderLine.objects.select_for_update().get(
             pk=line.sales_order_line_id
         )
-        new_value = round4(D(order_line.invoiced_qty) + D(line.qty))
+        new_value = round4(
+            D(order_line.invoiced_qty) + uom.between_lines(line.qty, line, order_line)
+        )
         if new_value > D(order_line.qty) + ROUNDING_TOLERANCE:
             raise BusinessRuleViolation(
                 f"Invoicing {round4(line.qty)} of {line.item_name} would exceed the "
@@ -515,8 +519,9 @@ def dispatch_challan(challan, *, user=None):
             continue
 
         stock.assert_not_qc_blocked(challan.client_id, line.item_id, line.item_name)
+        stock_qty = uom.to_stock_qty(line)
         stock.assert_sufficient_stock(
-            challan.client_id, line.item, line.qty, location_id, line.item_name
+            challan.client_id, line.item, stock_qty, location_id, line.item_name
         )
 
         serial_numbers = serial_map.get(line.id, [])
@@ -528,7 +533,7 @@ def dispatch_challan(challan, *, user=None):
             item=line.item_id,
             location=location_id,
             type="SALE",
-            quantity=-D(line.qty),
+            quantity=-stock_qty,
             unit_cost=line.item.cost_price,
             reference_type="DeliveryChallan",
             reference_id=challan.id,
@@ -555,7 +560,9 @@ def dispatch_challan(challan, *, user=None):
 
 def _bump_order_dispatched_qty(line):
     order_line = SalesOrderLine.objects.select_for_update().get(pk=line.sales_order_line_id)
-    new_value = round4(D(order_line.dispatched_qty) + D(line.qty))
+    new_value = round4(
+        D(order_line.dispatched_qty) + uom.between_lines(line.qty, line, order_line)
+    )
     if new_value > D(order_line.qty) + ROUNDING_TOLERANCE:
         raise BusinessRuleViolation(
             f"Dispatching {round4(line.qty)} of {line.item_name} would exceed the "
@@ -659,7 +666,9 @@ def cancel_invoice(invoice, *, reason=None, user=None):
                 pk=line.sales_order_line_id
             )
             order_line.invoiced_qty = max(
-                round4(D(order_line.invoiced_qty) - D(line.qty)), ZERO
+                round4(
+                    D(order_line.invoiced_qty) - uom.between_lines(line.qty, line, order_line)
+                ), ZERO
             )
             order_line.save(update_fields=["invoiced_qty", "updated_at"])
 
@@ -693,7 +702,9 @@ def cancel_challan(challan, *, reason=None, user=None):
                 pk=line.sales_order_line_id
             )
             order_line.dispatched_qty = max(
-                round4(D(order_line.dispatched_qty) - D(line.qty)), ZERO
+                round4(
+                    D(order_line.dispatched_qty) - uom.between_lines(line.qty, line, order_line)
+                ), ZERO
             )
             order_line.save(update_fields=["dispatched_qty", "updated_at"])
 

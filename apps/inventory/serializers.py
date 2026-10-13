@@ -42,7 +42,7 @@ class StockMovementSerializer(BaseModelSerializer):
         model = StockMovement
         fields = [
             "id", "itemId", "itemSku", "itemName", "locationId", "locationName",
-            "type", "quantity", "weighed_qty", "unit_cost",
+            "type", "quantity", "uom", "weighed_qty", "unit_cost",
             "reference_type", "referenceId", "reference_number",
             "source_document_type", "sourceDocumentId",
             "originalMovementId", "reversalMovementId",
