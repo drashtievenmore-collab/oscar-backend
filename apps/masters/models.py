@@ -310,6 +310,9 @@ class Location(TenantModel, LegacyIdMixin):
     TYPES = [
         ("Warehouse", "Warehouse"),
         ("Zone", "Zone"),
+        ("Godown", "Godown"),
+        ("Rack", "Rack"),
+        ("Bin", "Bin"),
         ("Transit", "Transit"),
         ("Scrap", "Scrap"),
     ]
@@ -321,6 +324,10 @@ class Location(TenantModel, LegacyIdMixin):
         "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="children"
     )
     address = models.JSONField(null=True, blank=True)
+    description = models.TextField(null=True, blank=True)
+    capacity = models.DecimalField(max_digits=18, decimal_places=4, default=0, null=True, blank=True)
+    capacity_uom = models.TextField(default="Meter (m)", null=True, blank=True)
+    manager = models.TextField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
 
     class Meta:

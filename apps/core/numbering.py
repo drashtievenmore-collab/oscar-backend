@@ -39,6 +39,7 @@ SERIES_DEFAULTS = {
     "REQ": ("REQ", "never", 4, "-"),
     "TKT": ("TKT", "never", 4, "-"),
     "AUD": ("AUD", "fy", 4, "-"),
+    "TAK": ("TAK", "never", 6, "-"),
     # Accounts
     "JE": ("JE", "fy", 3, "-"),
     # PMS -- calendar year, three digits: PRJ-2026-001

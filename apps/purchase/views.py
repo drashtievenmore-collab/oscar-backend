@@ -396,6 +396,14 @@ class GoodsReceiptViewSet(ReadOnlyTenantViewSet):
                 receipt.purchase_bill, verdict,
                 note=receipt.qc_note, user=request.user,
             )
+
+        # Synchronize QC status with Lot / Taka Register
+        from apps.inventory.models import LotTaka
+        lot_qc = "Passed" if verdict == "Approved" else ("Rejected" if verdict == "Rejected" else "On Hold")
+        LotTaka.objects.filter(
+            client_id=receipt.client_id, source_document_id=receipt.id
+        ).update(qc_status=lot_qc, qc_notes=receipt.qc_note)
+
         return Response(self.get_serializer(receipt).data)
 
 

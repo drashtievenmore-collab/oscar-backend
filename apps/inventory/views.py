@@ -5,6 +5,7 @@ import json
 from django.db import transaction
 from django.db.models import Count, DecimalField, F, Q, Sum, Value
 from django.db.models.functions import Coalesce
+from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import action
@@ -19,7 +20,7 @@ from apps.core.permissions import HasModulePermission
 from datetime import date, timedelta
 
 from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
-from apps.accounts.models import User
+from apps.accounts.models import Client, User
 from apps.masters import uom
 from apps.masters.models import Design, Fabric, FabricQuality, Item, ItemCategory, ItemPart, Location, Party, Shade
 from apps.purchase.models import GoodsReceipt, GoodsReceiptLine, PurchaseBill, PurchaseBillLine
@@ -40,6 +41,7 @@ from .models import (
     ZoneRequest,
     ZoneRequestLine,
     LotTaka,
+    TakaTagPrintLog,
 )
 from .serializers import (
     FaultyPartSerializer,
@@ -375,6 +377,31 @@ class StockTransferViewSet(TenantModelViewSet):
                     movement_date=transfer.transfer_date,
                     user=request.user,
                 )
+                # Update location on corresponding LotTaka records
+                taka_ids = request.data.get("takas") or []
+                if taka_ids:
+                    LotTaka.objects.filter(
+                        client_id=request.client_id,
+                        id__in=taka_ids,
+                        location_id=transfer.from_location_id,
+                    ).update(location_id=transfer.to_location_id)
+                else:
+                    matching_takas = list(LotTaka.objects.filter(
+                        client_id=request.client_id,
+                        item_id=line.item_id,
+                        location_id=transfer.from_location_id,
+                        deleted_at__isnull=True,
+                        status="Active",
+                    ).order_by("received_date", "created_at"))
+                    rem = D(line.qty)
+                    for tk in matching_takas:
+                        if rem <= 0:
+                            break
+                        tk_qty = tk.available_quantity or tk.received_quantity or 0
+                        tk.location_id = transfer.to_location_id
+                        tk.save(update_fields=["location", "updated_at"])
+                        rem -= D(tk_qty)
+
             transfer.status = "In Transit"
             transfer.save(update_fields=["status", "updated_at"])
             self.write_audit("dispatch", transfer, description="Transfer dispatched")
@@ -1458,27 +1485,64 @@ class InventoryDashboardView(APIView):
                     "date": fp.created_at.strftime("%d-%m-%Y") if fp.created_at else "",
                 })
 
-        # 4. Good Fabric Stock Records
+        # 4. Good Fabric Stock Records (Taka-level inventory from LotTaka, backed by StockBalance)
+        active_takas = list(
+            LotTaka.objects.filter(
+                client_id=client_id,
+                deleted_at__isnull=True,
+                status="Active",
+                item_id__in=item_ids,
+            ).select_related("item", "location")
+        )
+        taka_by_item_loc = {}
+        for lt in active_takas:
+            key = (lt.item_id, lt.location_id)
+            if key not in taka_by_item_loc:
+                taka_by_item_loc[key] = []
+            taka_by_item_loc[key].append(lt)
+
         good_records = []
         for b in balance_rows:
             if float(b.on_hand) <= 0:
                 continue
             it = b.item
             avail = float(b.on_hand)
-            good_records.append({
-                "id": str(b.id),
-                "itemCode": it.sku if it else "—",
-                "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "Fabric"),
-                "design": it.fabric_design if it and it.fabric_design else "Plain",
-                "shade": it.fabric_color if it and it.fabric_color else "Default",
-                "lotNo": f"LT-{it.sku[-4:] if it and len(it.sku) >= 4 else '001'}",
-                "totalQty": avail,
-                "available": avail,
-                "reserved": 0.0,
-                "uom": it.uom if it else "m",
-                "godown": b.location.name if b.location else "Main Godown",
-                "status": "Available" if avail > 50 else "Low Stock",
-            })
+            key = (b.item_id, b.location_id)
+            takas = taka_by_item_loc.get(key, [])
+            if takas:
+                for lt in takas:
+                    lt_avail = float(lt.available_quantity)
+                    taka_id = lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}"
+                    good_records.append({
+                        "id": str(lt.id),
+                        "takaId": taka_id,
+                        "itemCode": it.sku if it else "—",
+                        "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "Fabric"),
+                        "design": it.fabric_design if it and it.fabric_design else "Plain",
+                        "shade": it.fabric_color if it and it.fabric_color else "Default",
+                        "lotNo": f"{lt.lot_number} / #{lt.taka_number}",
+                        "totalQty": float(lt.received_quantity),
+                        "available": lt_avail,
+                        "reserved": 0.0,
+                        "uom": lt.uom or (it.uom if it else "m"),
+                        "godown": lt.location.name if lt.location else (b.location.name if b.location else "Main Godown"),
+                        "status": "Available" if lt_avail > 50 else "Low Stock",
+                    })
+            else:
+                good_records.append({
+                    "id": str(b.id),
+                    "itemCode": it.sku if it else "—",
+                    "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "Fabric"),
+                    "design": it.fabric_design if it and it.fabric_design else "Plain",
+                    "shade": it.fabric_color if it and it.fabric_color else "Default",
+                    "lotNo": f"LT-{it.sku[-4:] if it and len(it.sku) >= 4 else '001'}",
+                    "totalQty": avail,
+                    "available": avail,
+                    "reserved": 0.0,
+                    "uom": it.uom if it else "m",
+                    "godown": b.location.name if b.location else "Main Godown",
+                    "status": "Available" if avail > 50 else "Low Stock",
+                })
 
         # 5. Reprocessing Stock Records
         reprocess_records = []
@@ -1549,6 +1613,23 @@ class InventoryDashboardView(APIView):
                     "to": end_date.isoformat(),
                 },
                 "availableLots": [
+                    {
+                        "id": str(lt.id),
+                        "takaId": lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}",
+                        "itemId": str(lt.item_id),
+                        "sku": lt.item.sku if lt.item else "",
+                        "name": lt.item.name if lt.item else "",
+                        "quality": lt.item.fabric_quality if lt.item and lt.item.fabric_quality else (lt.item.name if lt.item else "Fabric"),
+                        "design": lt.item.fabric_design if lt.item and lt.item.fabric_design else "Plain",
+                        "shade": lt.item.fabric_color if lt.item and lt.item.fabric_color else "Default",
+                        "uom": lt.uom or (lt.item.uom if lt.item else "m"),
+                        "locationId": str(lt.location_id),
+                        "godown": lt.location.name if lt.location else "Main Godown",
+                        "available": float(lt.available_quantity),
+                        "lotNo": f"{lt.lot_number} / #{lt.taka_number}",
+                    }
+                    for lt in active_takas if float(lt.available_quantity) > 0
+                ] if active_takas else [
                     {
                         "itemId": str(b.item_id),
                         "sku": b.item.sku if b.item else "",
@@ -3050,6 +3131,15 @@ class QCDispositionView(APIView):
                             receipt.purchase_bill, verdict, note=remarks, user=request.user if request.user.is_authenticated else None
                         )
 
+                    # Synchronize QC status with linked Lot / Taka records
+                    lot_qc = "Passed" if verdict == "Approved" else ("Rejected" if verdict == "Rejected" else ("Reprocess" if verdict in ["Rework", "Reprocess"] else "On Hold"))
+                    lot_updates = {"qc_status": lot_qc, "qc_notes": remarks}
+                    if verdict == "Rejected":
+                        lot_updates["available_quantity"] = Decimal("0")
+                    LotTaka.objects.filter(
+                        client_id=client_id, source_document_id=receipt.id
+                    ).update(**lot_updates)
+
                     # Stock posting via append-only StockMovement ledger
                     if not already_approved and first_line and first_line.item_id:
                         loc = receipt.location or Location.objects.filter(client_id=client_id).first()
@@ -3882,8 +3972,12 @@ class LotTakaRegisterView(APIView):
             it = lt.item
             return Response({
                 "id": str(lt.id),
+                "takaId": lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}",
                 "lotNo": lt.lot_number,
                 "takaRoll": lt.taka_number,
+                "tagStatus": lt.tag_status or "Pending",
+                "printCount": lt.print_count or 0,
+                "lastPrintedAt": lt.last_printed_at.strftime("%d-%m-%Y %H:%M") if lt.last_printed_at else None,
                 "itemCode": it.sku if it else "-",
                 "itemName": it.name if it else "Fabric Item",
                 "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "-"),
@@ -4037,8 +4131,12 @@ class LotTakaRegisterView(APIView):
 
             records.append({
                 "id": str(lt.id),
+                "takaId": lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}",
                 "lotNo": lt.lot_number,
                 "takaRoll": lt.taka_number,
+                "tagStatus": lt.tag_status or "Pending",
+                "printCount": lt.print_count or 0,
+                "lastPrintedAt": lt.last_printed_at.strftime("%d-%m-%Y %H:%M") if lt.last_printed_at else None,
                 "itemCode": it.sku if it else "-",
                 "itemName": it.name if it else "Fabric Item",
                 "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "-"),
@@ -4176,6 +4274,23 @@ class LotTakaRegisterView(APIView):
         except Exception:
             return Response({"detail": "Invalid received quantity."}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Validate UOM Master and handle compatible conversions
+        from apps.masters import uom as uom_service
+        input_uom = (data.get("uom") or item.uom or "m").strip()
+        item_uom = (item.uom or "m").strip()
+        book = uom_service.UnitBook(client_id)
+
+        if input_uom and item_uom and not uom_service.same_unit_text(input_uom, item_uom):
+            u_in = book.resolve(input_uom)
+            u_item = book.resolve(item_uom)
+            if u_in and u_item:
+                if not uom_service.compatible(u_in, u_item):
+                    return Response({
+                        "detail": f"UOM '{input_uom}' is incompatible with fabric item base unit '{item_uom}'."
+                    }, status=status.HTTP_400_BAD_REQUEST)
+                received_qty = round4(uom_service.convert(received_qty, u_in, u_item))
+                input_uom = item_uom
+
         location_id = data.get("locationId")
         loc = Location.objects.filter(client_id=client_id, id=location_id).first() or Location.objects.filter(client_id=client_id).first()
         if not loc:
@@ -4201,12 +4316,21 @@ class LotTakaRegisterView(APIView):
         gsm = Decimal(str(data["gsm"])) if data.get("gsm") else None
         remarks = data.get("remarks") or ""
         tags = data.get("tags") or []
-        barcode = data.get("barcode") or f"{lot_no}-{taka_roll}"
         image_url = data.get("imageUrl") or ""
+
+        # Auto-allocate unique Taka ID (e.g. TAK-000125) and encode in barcode
+        client = (
+            request.user.client
+            if (hasattr(request, "user") and request.user.is_authenticated and getattr(request.user, "client", None))
+            else Client.objects.filter(id=client_id).first()
+        )
+        taka_code = allocate_number(client, "TAK")
+        barcode = data.get("barcode") or taka_code
 
         # Create LotTaka
         lot_taka = LotTaka.objects.create(
             client_id=client_id,
+            taka_id=taka_code,
             lot_number=lot_no,
             taka_number=taka_roll,
             item=item,
@@ -4221,6 +4345,8 @@ class LotTakaRegisterView(APIView):
             qc_status="Passed",
             status="Active",
             barcode=barcode,
+            tag_status="Pending",
+            print_count=0,
             roll_weight=roll_weight,
             width=width,
             pieces=pieces,
@@ -4247,6 +4373,7 @@ class LotTakaRegisterView(APIView):
             movement_date=rec_date,
             notes=json.dumps({
                 "takaRoll": taka_roll,
+                "takaId": taka_code,
                 "remarks": remarks,
                 "tags": tags,
                 "sourceDoc": source_doc,
@@ -4260,10 +4387,12 @@ class LotTakaRegisterView(APIView):
 
         return Response({
             "success": True,
-            "message": f"Lot {lot_no} / Taka {taka_roll} ({received_qty} {lot_taka.uom}) created and added to stock ledger successfully.",
+            "message": f"Lot {lot_no} / Taka {taka_roll} ({taka_code}) created and added to stock ledger successfully.",
             "id": str(lot_taka.id),
+            "takaId": lot_taka.taka_id,
             "lotNo": lot_taka.lot_number,
             "takaRoll": lot_taka.taka_number,
+            "barcode": lot_taka.barcode,
         }, status=status.HTTP_201_CREATED)
 
     @transaction.atomic
@@ -4312,6 +4441,456 @@ class LotTakaRegisterView(APIView):
             "success": True,
             "message": f"Lot {lot_taka.lot_number} / Taka {lot_taka.taka_number} updated successfully.",
         })
+
+
+class TakaTagPrintView(APIView):
+    """Endpoints for Taka Tag Print register, summary metrics, filters, and print event recording."""
+    permission_classes = [HasModulePermission]
+    module_name = "inventory"
+
+    def get(self, request):
+        client_id = request.client_id
+
+        # Query filters
+        search_query = (request.query_params.get("search") or "").strip()
+        from_date_str = request.query_params.get("from_date")
+        to_date_str = request.query_params.get("to_date")
+        supplier_filter = request.query_params.get("supplier")
+        item_filter = request.query_params.get("item")
+        quality_filter = request.query_params.get("quality")
+        design_filter = request.query_params.get("design")
+        shade_filter = request.query_params.get("shade")
+        qc_status_filter = request.query_params.get("qc_status")
+        tag_status_filter = request.query_params.get("tag_status")
+
+        # Base queryset
+        base_qs = LotTaka.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related(
+            "item", "supplier", "location", "last_printed_by"
+        )
+
+        # Summary cards from real records
+        total_takas = base_qs.count()
+        tags_printed = base_qs.filter(tag_status__in=["Printed", "Reprinted"]).count()
+        pending_print = base_qs.filter(tag_status="Pending").count()
+        reprints_count = TakaTagPrintLog.objects.filter(client_id=client_id, action_type="REPRINT").count()
+        if reprints_count == 0:
+            reprints_count = base_qs.filter(print_count__gt=1).count()
+
+        summary_cards = {
+            "totalTakas": total_takas,
+            "tagsPrinted": tags_printed,
+            "pendingPrint": pending_print,
+            "reprints": reprints_count,
+        }
+
+        # Filter option lists
+        supplier_names = list(Party.objects.filter(client_id=client_id, type__in=["Vendor", "Both"]).values_list("name", flat=True).order_by("name"))
+        quality_names = list(Item.objects.filter(client_id=client_id, fabric_quality__isnull=False).values_list("fabric_quality", flat=True).distinct().order_by("fabric_quality"))
+        design_names = ["Floral", "Check", "Plain", "Stripe", "Jacquard", "Dobby", "Printed"]
+        shade_names = ["Navy", "Blue", "Maroon", "White", "Black", "Green", "Grey", "Off-White", "Red"]
+        fabric_items = list(Item.objects.filter(client_id=client_id, fabric_quality__isnull=False).values("id", "sku", "name")[:50])
+        if not fabric_items:
+            fabric_items = list(Item.objects.filter(client_id=client_id).values("id", "sku", "name")[:50])
+
+        qs = base_qs
+        if from_date_str:
+            try:
+                from_d = date.fromisoformat(from_date_str)
+                qs = qs.filter(received_date__gte=from_d)
+            except Exception:
+                pass
+
+        if to_date_str:
+            try:
+                to_d = date.fromisoformat(to_date_str)
+                qs = qs.filter(received_date__lte=to_d)
+            except Exception:
+                pass
+
+        if supplier_filter and supplier_filter != "All":
+            qs = qs.filter(supplier__name=supplier_filter)
+
+        if item_filter and item_filter != "All":
+            qs = qs.filter(Q(item__sku__icontains=item_filter) | Q(item__name__icontains=item_filter))
+
+        if quality_filter and quality_filter != "All":
+            qs = qs.filter(item__fabric_quality=quality_filter)
+
+        if design_filter and design_filter != "All":
+            qs = qs.filter(item__fabric_design=design_filter)
+
+        if shade_filter and shade_filter != "All":
+            qs = qs.filter(item__fabric_color=shade_filter)
+
+        if qc_status_filter and qc_status_filter != "All":
+            qs = qs.filter(qc_status=qc_status_filter)
+
+        if tag_status_filter and tag_status_filter != "All":
+            qs = qs.filter(tag_status=tag_status_filter)
+
+        if search_query:
+            qs = qs.filter(
+                Q(taka_id__icontains=search_query)
+                | Q(barcode__icontains=search_query)
+                | Q(lot_number__icontains=search_query)
+                | Q(taka_number__icontains=search_query)
+                | Q(source_document_number__icontains=search_query)
+                | Q(item__sku__icontains=search_query)
+                | Q(item__name__icontains=search_query)
+                | Q(supplier__name__icontains=search_query)
+            )
+
+        records = []
+        for lt in qs:
+            it = lt.item
+            taka_id = lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}"
+            records.append({
+                "id": str(lt.id),
+                "takaId": taka_id,
+                "lotNo": lt.lot_number,
+                "takaRoll": lt.taka_number,
+                "itemCode": it.sku if it else "-",
+                "itemName": it.name if it else "Fabric Item",
+                "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "-"),
+                "design": it.fabric_design if it and it.fabric_design else "Plain",
+                "shade": it.fabric_color if it and it.fabric_color else "Default",
+                "supplier": lt.supplier.name if lt.supplier else (lt.source_document_number or "-"),
+                "supplierId": str(lt.supplier.id) if lt.supplier else "",
+                "receivedQty": float(lt.received_quantity),
+                "availableQty": float(lt.available_quantity),
+                "uom": lt.uom or (it.uom if it else "m"),
+                "qcStatus": lt.qc_status,
+                "tagStatus": lt.tag_status or "Pending",
+                "barcode": lt.barcode or taka_id,
+                "printCount": lt.print_count or 0,
+                "lastPrintedAt": lt.last_printed_at.strftime("%d-%m-%Y %H:%M") if lt.last_printed_at else None,
+                "lastPrintedBy": getattr(lt.last_printed_by, "name", None) or getattr(lt.last_printed_by, "email", None) or None,
+                "location": lt.location.name if lt.location else "Main Godown",
+                "locationId": str(lt.location.id) if lt.location else "",
+                "receivedDate": lt.received_date.strftime("%d-%m-%Y"),
+                "grnNo": lt.source_document_number or "-",
+                "rollWeight": float(lt.roll_weight) if lt.roll_weight else None,
+                "width": float(lt.width) if lt.width else None,
+                "gsm": float(lt.gsm) if lt.gsm else None,
+                "rate": float(lt.rate),
+            })
+
+        return Response({
+            "summaryCards": summary_cards,
+            "filters": {
+                "suppliers": supplier_names,
+                "items": [f"{it['sku']} ({it['name']})" for it in fabric_items],
+                "qualities": quality_names,
+                "designs": design_names,
+                "shades": shade_names,
+                "qcStatuses": ["All", "Passed", "Pending", "On Hold", "Reprocess", "Rejected"],
+                "tagStatuses": ["All", "Pending", "Printed", "Reprinted"],
+            },
+            "records": records,
+        })
+
+    @transaction.atomic
+    def post(self, request):
+        """Record print or reprint event for selected takas (never alters stock)."""
+        client_id = request.client_id
+        data = request.data
+        ids = data.get("ids") or data.get("takaIds") or []
+        if isinstance(ids, str):
+            ids = [ids]
+        action_type = data.get("actionType") or ("REPRINT" if data.get("isReprint") else "PRINT")
+        notes = data.get("notes") or ""
+
+        if not ids:
+            return Response({"detail": "No takas selected for printing."}, status=status.HTTP_400_BAD_REQUEST)
+
+        import uuid
+        uuid_ids = []
+        code_ids = []
+        for val in ids:
+            v_str = str(val).strip()
+            try:
+                uuid.UUID(v_str)
+                uuid_ids.append(v_str)
+            except (ValueError, AttributeError):
+                code_ids.append(v_str)
+
+        q_cond = Q()
+        if uuid_ids:
+            q_cond |= Q(id__in=uuid_ids)
+        if code_ids:
+            q_cond |= Q(taka_id__in=code_ids) | Q(barcode__in=code_ids)
+
+        takas = list(LotTaka.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(q_cond))
+        if not takas:
+            return Response({"detail": "Selected taka records not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        now = timezone.now()
+        user = request.user if request.user.is_authenticated else None
+        user_name = getattr(user, "name", None) or getattr(user, "email", "Admin")
+
+        for lt in takas:
+            old_count = lt.print_count
+            lt.print_count += 1
+            if action_type == "REPRINT" or old_count >= 1:
+                lt.tag_status = "Reprinted"
+                record_action = "REPRINT"
+            else:
+                lt.tag_status = "Printed"
+                record_action = "PRINT" if len(takas) == 1 else "BULK_PRINT"
+
+            lt.last_printed_at = now
+            lt.last_printed_by = user
+            lt.save(update_fields=["print_count", "tag_status", "last_printed_at", "last_printed_by", "updated_at"])
+
+            TakaTagPrintLog.objects.create(
+                client_id=client_id,
+                lot_taka=lt,
+                action_type=record_action,
+                printed_at=now,
+                printed_by=user,
+                printed_by_name=user_name,
+                taka_id=lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}",
+                lot_number=lt.lot_number,
+                taka_number=lt.taka_number,
+                notes=notes,
+            )
+
+        return Response({
+            "success": True,
+            "message": f"Recorded print event for {len(takas)} taka(s).",
+            "count": len(takas),
+        })
+
+
+class TakaTagScanView(APIView):
+    """Fast barcode scanner lookup endpoint for takas (Code 128 / Taka ID)."""
+    permission_classes = [HasModulePermission]
+    module_name = "inventory"
+
+    def get(self, request):
+        client_id = request.client_id
+        code = (request.query_params.get("code") or request.query_params.get("search") or "").strip()
+        if not code:
+            return Response({"detail": "Please provide a barcode or Taka ID to scan."}, status=status.HTTP_400_BAD_REQUEST)
+
+        lt = LotTaka.objects.filter(
+            client_id=client_id, deleted_at__isnull=True
+        ).filter(
+            Q(taka_id__iexact=code)
+            | Q(barcode__iexact=code)
+            | Q(lot_number__iexact=code)
+        ).select_related("item", "supplier", "location", "last_printed_by").first()
+
+        if not lt:
+            return Response({
+                "found": False,
+                "detail": f"No active Taka record found matching barcode/ID '{code}'.",
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        it = lt.item
+        taka_id = lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}"
+
+        taka_dict = {
+            "found": True,
+            "id": str(lt.id),
+            "takaId": taka_id,
+            "lotNo": lt.lot_number,
+            "takaRoll": lt.taka_number,
+            "itemCode": it.sku if it else "-",
+            "itemName": it.name if it else "Fabric Item",
+            "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "-"),
+            "design": it.fabric_design if it and it.fabric_design else "Plain",
+            "shade": it.fabric_color if it and it.fabric_color else "Default",
+            "supplier": lt.supplier.name if lt.supplier else (lt.source_document_number or "-"),
+            "supplierId": str(lt.supplier.id) if lt.supplier else "",
+            "receivedQty": float(lt.received_quantity),
+            "availableQty": float(lt.available_quantity),
+            "uom": lt.uom or (it.uom if it else "m"),
+            "qcStatus": lt.qc_status,
+            "tagStatus": lt.tag_status or "Pending",
+            "barcode": lt.barcode or taka_id,
+            "printCount": lt.print_count or 0,
+            "lastPrintedAt": lt.last_printed_at.strftime("%d-%m-%Y %H:%M") if lt.last_printed_at else None,
+            "location": lt.location.name if lt.location else "Main Godown",
+            "locationId": str(lt.location.id) if lt.location else "",
+            "receivedDate": lt.received_date.strftime("%d-%m-%Y"),
+            "grnNo": lt.source_document_number or "-",
+            "rollWeight": float(lt.roll_weight) if lt.roll_weight else None,
+            "width": float(lt.width) if lt.width else None,
+            "gsm": float(lt.gsm) if lt.gsm else None,
+            "rate": float(lt.rate),
+        }
+        res_payload = dict(taka_dict)
+        res_payload["taka"] = taka_dict
+        return Response(res_payload)
+
+
+class TakaTagHistoryView(APIView):
+    """View print/reprint history audit logs for a specific taka."""
+    permission_classes = [HasModulePermission]
+    module_name = "inventory"
+
+    def get(self, request, pk=None):
+        client_id = request.client_id
+        target = pk or request.query_params.get("takaId") or request.query_params.get("taka_id") or request.query_params.get("id")
+        if not target:
+            return Response({"detail": "Taka ID or UUID required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        import uuid
+        target_str = str(target).strip()
+        is_uuid = False
+        try:
+            uuid.UUID(target_str)
+            is_uuid = True
+        except (ValueError, AttributeError):
+            is_uuid = False
+
+        if is_uuid:
+            lt = LotTaka.objects.filter(client_id=client_id, deleted_at__isnull=True, id=target_str).first()
+        else:
+            lt = LotTaka.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(
+                Q(taka_id__iexact=target_str) | Q(barcode__iexact=target_str) | Q(lot_number__iexact=target_str)
+            ).first()
+
+        if not lt:
+            return Response({"detail": "Taka record not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        logs = TakaTagPrintLog.objects.filter(client_id=client_id, lot_taka=lt).order_by("-printed_at")
+        history = [
+            {
+                "id": str(log.id),
+                "actionType": log.action_type,
+                "printedAt": log.printed_at.strftime("%d-%m-%Y %H:%M:%S"),
+                "printedBy": log.printed_by_name or (log.printed_by.name if log.printed_by else "Admin"),
+                "takaId": log.taka_id,
+                "lotNo": log.lot_number,
+                "takaRoll": log.taka_number,
+                "notes": log.notes or "-",
+            }
+            for log in logs
+        ]
+        return Response({
+            "takaId": lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}",
+            "lotNo": lt.lot_number,
+            "takaRoll": lt.taka_number,
+            "printCount": lt.print_count,
+            "history": history,
+            "logs": history,
+        })
+
+
+class TakaTagPdfView(APIView):
+    """Generate printable PDF labels (60mm x 40mm) with Code 128 barcode using ReportLab."""
+    permission_classes = [HasModulePermission]
+    module_name = "inventory"
+
+    def get(self, request):
+        import io
+        import uuid
+        from reportlab.lib.units import mm
+        from reportlab.pdfgen import canvas
+        from reportlab.graphics.barcode import code128
+
+        client_id = request.client_id
+        ids_str = request.query_params.get("ids") or request.query_params.get("takaIds") or ""
+        ids_str = ids_str.strip()
+        if not ids_str:
+            return Response({"detail": "No taka IDs specified."}, status=status.HTTP_400_BAD_REQUEST)
+
+        ids = [i.strip() for i in ids_str.split(",") if i.strip()]
+        uuid_ids = []
+        code_ids = []
+        for val in ids:
+            v_str = str(val).strip()
+            try:
+                uuid.UUID(v_str)
+                uuid_ids.append(v_str)
+            except (ValueError, AttributeError):
+                code_ids.append(v_str)
+
+        q_cond = Q()
+        if uuid_ids:
+            q_cond |= Q(id__in=uuid_ids)
+        if code_ids:
+            q_cond |= Q(taka_id__in=code_ids) | Q(barcode__in=code_ids)
+
+        takas = list(
+            LotTaka.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(
+                q_cond
+            ).select_related("item", "supplier", "location")
+        )
+        if not takas:
+            return Response({"detail": "No matching takas found."}, status=status.HTTP_404_NOT_FOUND)
+
+        buffer = io.BytesIO()
+        label_size = (60 * mm, 40 * mm)
+        pdf = canvas.Canvas(buffer, pagesize=label_size)
+
+        for lt in takas:
+            it = lt.item
+            taka_id = lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}"
+            item_code = it.sku if it else "-"
+            item_name = it.name if it else "Fabric"
+            quality = it.fabric_quality if it and it.fabric_quality else (it.name if it else "-")
+            design = it.fabric_design if it and it.fabric_design else "Plain"
+            shade = it.fabric_color if it and it.fabric_color else "Default"
+            supplier = lt.supplier.name if lt.supplier else (lt.source_document_number or "-")
+            grn_no = lt.source_document_number or "-"
+            qty_str = f"{float(lt.received_quantity):.2f} {lt.uom or 'm'}"
+            qc_st = lt.qc_status or "Passed"
+
+            # Top Header: OSCAR TEXTILE ERP | QC Status
+            pdf.setFont("Helvetica-Bold", 7.5)
+            pdf.drawString(2.5 * mm, 36.5 * mm, "OSCAR TEXTILE ERP")
+            pdf.setFont("Helvetica-Bold", 6.5)
+            pdf.drawRightString(57.5 * mm, 36.5 * mm, f"QC: {qc_st.upper()}")
+
+            pdf.setStrokeColorRGB(0.7, 0.7, 0.7)
+            pdf.setLineWidth(0.5)
+            pdf.line(2.5 * mm, 35 * mm, 57.5 * mm, 35 * mm)
+
+            # Code 128 Barcode
+            try:
+                bc = code128.Code128(taka_id, barHeight=7.5 * mm, barWidth=0.25 * mm, humanReadable=False)
+                bc.drawOn(pdf, 3.5 * mm, 26 * mm)
+            except Exception:
+                pass
+
+            # Human readable Taka ID
+            pdf.setFont("Helvetica-Bold", 7.5)
+            pdf.drawCentredString(30 * mm, 22.5 * mm, taka_id)
+
+            # Details
+            pdf.setFont("Helvetica-Bold", 5.5)
+            pdf.drawString(2.5 * mm, 18.5 * mm, f"Lot: {lt.lot_number} | Roll: #{lt.taka_number}")
+
+            pdf.setFont("Helvetica", 5.5)
+            item_desc = f"{item_code} - {item_name}"
+            if len(item_desc) > 34:
+                item_desc = item_desc[:32] + "..."
+            pdf.drawString(2.5 * mm, 15 * mm, f"Item: {item_desc}")
+
+            qds = f"{quality} | {design} | {shade}"
+            if len(qds) > 35:
+                qds = qds[:33] + "..."
+            pdf.drawString(2.5 * mm, 11.5 * mm, f"Q/D/S: {qds}")
+
+            supp_line = f"Supp: {supplier[:18]} | GRN: {grn_no[:10]}"
+            pdf.drawString(2.5 * mm, 8 * mm, supp_line)
+
+            # Quantity and UOM
+            pdf.setFont("Helvetica-Bold", 6.5)
+            pdf.drawString(2.5 * mm, 4 * mm, f"Qty: {qty_str}")
+            pdf.setFont("Helvetica", 5)
+            pdf.drawRightString(57.5 * mm, 4 * mm, lt.received_date.strftime("%d/%m/%Y"))
+
+            pdf.showPage()
+
+        pdf.save()
+        buffer.seek(0)
+        response = HttpResponse(buffer.getvalue(), content_type="application/pdf")
+        response["Content-Disposition"] = 'inline; filename="taka_tags.pdf"'
+        return response
 
 
 

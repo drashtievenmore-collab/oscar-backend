@@ -842,10 +842,215 @@ class LocationViewSet(TenantModelViewSet):
     serializer_class = LocationSerializer
     audit_entity_type = "Location"
     audit_label_field = "name"
-    search_fields = ["name", "code"]
+    search_fields = ["name", "code", "manager", "description"]
     ordering = ["name"]
     status_field = None
-    filter_map = {"type": "type", "isActive": "is_active"}
+    filter_map = {"type": "type", "isActive": "is_active", "is_active": "is_active", "parent": "parent"}
+
+    def perform_destroy(self, instance):
+        client_id = self.get_client_id()
+        children_count = Location.objects.filter(
+            client_id=client_id, parent=instance, deleted_at__isnull=True
+        ).count()
+        if children_count > 0:
+            raise Conflict(
+                f"Cannot delete location '{instance.name}' because it has {children_count} child location(s). Reassign or delete child locations first.",
+                code="LOCATION_HAS_CHILDREN",
+                payload={"childCount": children_count},
+            )
+
+        from apps.inventory.models import StockBalance, StockMovement, LotTaka
+        stock_on_hand = StockBalance.objects.filter(
+            client_id=client_id, location=instance, on_hand__gt=0
+        ).aggregate(total=Sum("on_hand"))["total"] or 0
+        if stock_on_hand > 0:
+            raise Conflict(
+                f"Cannot delete location '{instance.name}' because it currently holds {stock_on_hand} units of stock. Transfer stock out before deleting.",
+                code="LOCATION_HAS_STOCK",
+                payload={"onHand": float(stock_on_hand)},
+            )
+
+        has_movements = StockMovement.objects.filter(
+            client_id=client_id, location=instance
+        ).exists()
+        has_takas = LotTaka.objects.filter(
+            client_id=client_id, location=instance, deleted_at__isnull=True
+        ).exists()
+        if has_movements or has_takas:
+            raise Conflict(
+                f"Cannot delete location '{instance.name}' because it has historical inventory transactions or lot/takas. Deactivate the location instead to preserve stock ledger traceability.",
+                code="LOCATION_HAS_HISTORY",
+            )
+        super().perform_destroy(instance)
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        client_id = self.get_client_id()
+        locs = Location.objects.filter(client_id=client_id, deleted_at__isnull=True)
+        active_locs = locs.filter(is_active=True)
+
+        total_warehouses = active_locs.filter(type="Warehouse").count()
+        total_locations = active_locs.count()
+        total_racks = active_locs.filter(type="Rack").count()
+        total_bins = active_locs.filter(type="Bin").count()
+
+        from apps.inventory.models import StockBalance
+        loc_ids_with_stock = set(
+            StockBalance.objects.filter(
+                client_id=client_id, on_hand__gt=0
+            ).values_list("location_id", flat=True).distinct()
+        )
+        locations_with_stock = active_locs.filter(id__in=loc_ids_with_stock).count()
+        empty_locations = max(0, total_locations - locations_with_stock)
+
+        total_capacity = active_locs.aggregate(total=Sum("capacity"))["total"] or Decimal("0")
+        total_used = StockBalance.objects.filter(
+            client_id=client_id, on_hand__gt=0
+        ).aggregate(total=Sum("on_hand"))["total"] or Decimal("0")
+
+        capacity_utilization = round((float(total_used) / float(total_capacity)) * 100, 1) if total_capacity > 0 else 0.0
+
+        return Response({
+            "total_warehouses": total_warehouses,
+            "total_locations": total_locations,
+            "total_racks": total_racks,
+            "total_bins": total_bins,
+            "locations_with_stock": locations_with_stock,
+            "empty_locations": empty_locations,
+            "total_capacity": float(total_capacity),
+            "total_used": float(total_used),
+            "capacity_utilization": capacity_utilization,
+        })
+
+    @action(detail=False, methods=["get"])
+    def hierarchy(self, request):
+        from .serializers import get_location_descendant_ids
+        from apps.inventory.models import StockBalance
+        client_id = self.get_client_id()
+        locs = list(Location.objects.filter(client_id=client_id, deleted_at__isnull=True).order_by("name"))
+
+        tree = []
+        loc_map = {}
+        for loc in locs:
+            all_ids = [loc.id] + list(get_location_descendant_ids(loc))
+            used = StockBalance.objects.filter(
+                client_id=client_id, location_id__in=all_ids, on_hand__gt=0
+            ).aggregate(total=Sum("on_hand"))["total"] or 0
+            cap = float(loc.capacity or 0)
+            util = round((float(used) / cap) * 100, 1) if cap > 0 else 0.0
+
+            loc_data = {
+                "id": str(loc.id),
+                "code": loc.code,
+                "name": loc.name,
+                "type": loc.type,
+                "parent_id": str(loc.parent_id) if loc.parent_id else None,
+                "capacity": cap,
+                "used_quantity": float(used),
+                "utilization_pct": util,
+                "is_active": loc.is_active,
+                "children": [],
+            }
+            loc_map[str(loc.id)] = loc_data
+
+        for loc_id, node in loc_map.items():
+            pid = node["parent_id"]
+            if pid and pid in loc_map:
+                loc_map[pid]["children"].append(node)
+            else:
+                tree.append(node)
+
+        return Response({"tree": tree, "total_nodes": len(locs)})
+
+    @action(detail=True, methods=["get"])
+    def details(self, request, pk=None):
+        from .serializers import get_location_descendant_ids
+        from apps.inventory.models import StockBalance, StockMovement, LotTaka
+        loc = self.get_object()
+        client_id = self.get_client_id()
+        all_ids = [loc.id] + list(get_location_descendant_ids(loc))
+
+        balances = StockBalance.objects.filter(
+            client_id=client_id, location_id__in=all_ids, on_hand__gt=0
+        ).select_related("item", "location")
+
+        item_rows = []
+        for b in balances:
+            lot_count = LotTaka.objects.filter(
+                client_id=client_id, item_id=b.item_id, location_id__in=all_ids, deleted_at__isnull=True, status="Active"
+            ).count()
+            first_taka = LotTaka.objects.filter(
+                client_id=client_id, item_id=b.item_id, location_id__in=all_ids, deleted_at__isnull=True, status="Active"
+            ).first()
+            item_rows.append({
+                "item_id": str(b.item_id),
+                "item_code": b.item.sku or b.item.code or f"ITM-{b.item.id}",
+                "item_name": b.item.name,
+                "fabric_quality": getattr(b.item, "fabric_quality", "") or "",
+                "design": getattr(b.item, "fabric_design", "") or "",
+                "shade": getattr(b.item, "fabric_color", "") or "",
+                "lot_number": first_taka.lot_number if first_taka else "-",
+                "lot_taka_count": lot_count,
+                "quantity": float(b.on_hand),
+                "uom": b.item.uom or "m",
+                "location_code": b.location.code,
+            })
+
+        takas = LotTaka.objects.filter(
+            client_id=client_id, location_id__in=all_ids, deleted_at__isnull=True
+        ).select_related("item", "location").order_by("-received_date", "-created_at")[:50]
+
+        taka_rows = [{
+            "id": str(t.id),
+            "taka_id": t.taka_id or f"TAK-{t.taka_number}",
+            "lot_number": t.lot_number,
+            "taka_number": t.taka_number,
+            "item_code": t.item.sku or t.item.code,
+            "item_name": t.item.name,
+            "quantity": float(t.available_quantity or t.received_quantity),
+            "uom": t.uom or "m",
+            "qc_status": t.qc_status,
+            "barcode": t.barcode or t.taka_id,
+            "tag_status": t.tag_status,
+            "location_code": t.location.code if t.location else loc.code,
+            "received_date": t.received_date.isoformat() if t.received_date else None,
+        } for t in takas]
+
+        movements = StockMovement.objects.filter(
+            client_id=client_id, location_id__in=all_ids
+        ).select_related("item", "created_by").order_by("-movement_date", "-created_at")[:30]
+
+        tx_rows = [{
+            "id": str(m.id),
+            "movement_date": m.movement_date.isoformat() if m.movement_date else None,
+            "type": m.type,
+            "reference_type": m.reference_type,
+            "reference_number": m.reference_number or "-",
+            "item_code": m.item.sku or m.item.code,
+            "item_name": m.item.name,
+            "quantity": float(m.quantity),
+            "user_name": (getattr(m.created_by, "name", None) or m.created_by.get_username()) if m.created_by else "System",
+            "notes": m.notes,
+        } for m in movements]
+
+        used_qty = sum(r["quantity"] for r in item_rows)
+        capacity = float(loc.capacity or 0)
+        avail = max(0.0, capacity - used_qty) if capacity > 0 else 0.0
+        util_pct = round((used_qty / capacity) * 100, 1) if capacity > 0 else 0.0
+
+        serializer = self.get_serializer(loc)
+        return Response({
+            "location": serializer.data,
+            "stock_by_item": item_rows,
+            "lot_takas": taka_rows,
+            "transactions": tx_rows,
+            "utilization": {
+                "capacity": capacity,
+                "used": used_qty,
+                "available": avail,
+                "utilization_pct": util_pct,
+            }
+        })
 
 
 class TextileMasterViewSet(TenantModelViewSet):

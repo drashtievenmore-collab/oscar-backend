@@ -58,5 +58,11 @@ urlpatterns = [
     path("adjustments/", views.StockAdjustmentView.as_view(), name="inventory-adjustments"),
     path("lot-register/", views.LotTakaRegisterView.as_view(), name="inventory-lot-register"),
     path("lot-register/<uuid:pk>/", views.LotTakaRegisterView.as_view(), name="inventory-lot-register-detail"),
+    path("taka-tags/", views.TakaTagPrintView.as_view(), name="inventory-taka-tags"),
+    path("taka-tags/print/", views.TakaTagPrintView.as_view(), name="inventory-taka-tags-print"),
+    path("taka-tags/scan/", views.TakaTagScanView.as_view(), name="inventory-taka-tags-scan"),
+    path("taka-tags/pdf/", views.TakaTagPdfView.as_view(), name="inventory-taka-tags-pdf"),
+    path("taka-tags/history/", views.TakaTagHistoryView.as_view(), name="inventory-taka-tags-history-query"),
+    path("taka-tags/<str:pk>/history/", views.TakaTagHistoryView.as_view(), name="inventory-taka-tags-history"),
     path("", include(router.urls)),
 ]

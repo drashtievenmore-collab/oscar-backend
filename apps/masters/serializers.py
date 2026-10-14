@@ -369,19 +369,157 @@ class UnitSerializer(BaseModelSerializer):
         return attrs
 
 
+def get_location_descendant_ids(location):
+    if not location or not location.id:
+        return set()
+    descendant_ids = set()
+    queue = [location.id]
+    while queue:
+        curr_id = queue.pop(0)
+        children = list(Location.objects.filter(
+            client_id=location.client_id, parent_id=curr_id, deleted_at__isnull=True
+        ).values_list("id", flat=True))
+        for cid in children:
+            if cid not in descendant_ids:
+                descendant_ids.add(cid)
+                queue.append(cid)
+    return descendant_ids
+
+
+def get_location_ancestor_info(location):
+    warehouse = None
+    zone = None
+    curr = location.parent
+    visited = set()
+    while curr and curr.id not in visited:
+        visited.add(curr.id)
+        if curr.type == "Zone" and not zone:
+            zone = curr
+        elif curr.type == "Warehouse" and not warehouse:
+            warehouse = curr
+        curr = curr.parent
+
+    wh_code = warehouse.code if warehouse else (location.code if location.type == "Warehouse" else "-")
+    wh_name = warehouse.name if warehouse else (location.name if location.type == "Warehouse" else "-")
+    zn_code = zone.code if zone else (location.code if location.type == "Zone" else "-")
+    zn_name = zone.name if zone else (location.name if location.type == "Zone" else "-")
+    return wh_code, wh_name, zn_code, zn_name
+
+
 class LocationSerializer(BaseModelSerializer):
+    parent_code = serializers.SerializerMethodField()
+    parent_name = serializers.SerializerMethodField()
+    warehouse_code = serializers.SerializerMethodField()
+    warehouse_name = serializers.SerializerMethodField()
+    zone_code = serializers.SerializerMethodField()
+    zone_name = serializers.SerializerMethodField()
+    used_quantity = serializers.SerializerMethodField()
+    available_capacity = serializers.SerializerMethodField()
+    utilization_pct = serializers.SerializerMethodField()
+    stock_item_count = serializers.SerializerMethodField()
+    lot_taka_count = serializers.SerializerMethodField()
+
     class Meta:
         model = Location
         fields = [
-            "id", "code", "name", "type", "parent", "address", "is_active",
-            "created_at", "updated_at",
+            "id", "code", "name", "type", "parent", "parent_code", "parent_name",
+            "warehouse_code", "warehouse_name", "zone_code", "zone_name",
+            "address", "description", "capacity", "capacity_uom", "manager",
+            "is_active", "used_quantity", "available_capacity", "utilization_pct",
+            "stock_item_count", "lot_taka_count", "created_at", "updated_at",
         ]
         extra_kwargs = {"code": {"required": False, "allow_blank": True}}
 
+    def get_parent_code(self, obj):
+        return obj.parent.code if obj.parent else "-"
+
+    def get_parent_name(self, obj):
+        return obj.parent.name if obj.parent else "-"
+
+    def get_warehouse_code(self, obj):
+        wh_code, _, _, _ = get_location_ancestor_info(obj)
+        return wh_code
+
+    def get_warehouse_name(self, obj):
+        _, wh_name, _, _ = get_location_ancestor_info(obj)
+        return wh_name
+
+    def get_zone_code(self, obj):
+        _, _, zn_code, _ = get_location_ancestor_info(obj)
+        return zn_code
+
+    def get_zone_name(self, obj):
+        _, _, _, zn_name = get_location_ancestor_info(obj)
+        return zn_name
+
+    def get_used_quantity(self, obj):
+        from apps.inventory.models import StockBalance
+        from django.db.models import Sum
+        all_ids = [obj.id] + list(get_location_descendant_ids(obj))
+        val = StockBalance.objects.filter(
+            client_id=obj.client_id, location_id__in=all_ids, on_hand__gt=0
+        ).aggregate(total=Sum("on_hand"))["total"] or 0
+        return float(val)
+
+    def get_available_capacity(self, obj):
+        used = self.get_used_quantity(obj)
+        cap = float(obj.capacity or 0)
+        return max(0.0, round(cap - used, 2)) if cap > 0 else 0.0
+
+    def get_utilization_pct(self, obj):
+        cap = float(obj.capacity or 0)
+        if cap <= 0:
+            return 0.0
+        used = self.get_used_quantity(obj)
+        return round((used / cap) * 100, 1)
+
+    def get_stock_item_count(self, obj):
+        from apps.inventory.models import StockBalance
+        all_ids = [obj.id] + list(get_location_descendant_ids(obj))
+        return StockBalance.objects.filter(
+            client_id=obj.client_id, location_id__in=all_ids, on_hand__gt=0
+        ).values("item_id").distinct().count()
+
+    def get_lot_taka_count(self, obj):
+        from apps.inventory.models import LotTaka
+        all_ids = [obj.id] + list(get_location_descendant_ids(obj))
+        return LotTaka.objects.filter(
+            client_id=obj.client_id, location_id__in=all_ids, deleted_at__isnull=True, status="Active"
+        ).count()
+
     def validate(self, attrs):
         attrs = super().validate(attrs)
+        name = attrs.get("name")
         if not attrs.get("code") and not self.instance:
-            attrs["code"] = slug_code(attrs.get("name"), "LOC")
+            attrs["code"] = slug_code(name, "LOC")
+
+        parent = attrs.get("parent")
+        loc_type = attrs.get("type") or (self.instance.type if self.instance else "Warehouse")
+
+        if self.instance and parent:
+            if parent.id == self.instance.id:
+                raise serializers.ValidationError({"parent": "A location cannot be its own parent."})
+            curr = parent
+            visited = {self.instance.id}
+            while curr:
+                if curr.id in visited:
+                    raise serializers.ValidationError({"parent": "Circular reference detected in location hierarchy."})
+                visited.add(curr.id)
+                curr = curr.parent
+
+        if parent and not parent.is_active:
+            raise serializers.ValidationError({"parent": "Cannot assign an inactive location as parent."})
+
+        # Validate hierarchical relationship if parent specified
+        if loc_type == "Zone" and parent and parent.type not in ("Warehouse", "Zone"):
+            raise serializers.ValidationError({"parent": f"A Zone can only be placed under a Warehouse or another Zone, not a {parent.type}."})
+        elif loc_type == "Godown" and parent and parent.type not in ("Warehouse", "Zone", "Godown"):
+            raise serializers.ValidationError({"parent": f"A Godown can only be placed under a Warehouse, Zone, or Godown, not a {parent.type}."})
+        elif loc_type == "Rack" and parent and parent.type not in ("Warehouse", "Zone", "Godown", "Rack"):
+            raise serializers.ValidationError({"parent": f"A Rack can only be placed under a Godown, Zone, or Warehouse, not a {parent.type}."})
+        elif loc_type == "Bin" and parent and parent.type not in ("Warehouse", "Zone", "Godown", "Rack", "Bin"):
+            raise serializers.ValidationError({"parent": f"A Bin can only be placed under a Rack, Godown, Zone, or Warehouse, not a {parent.type}."})
+
         return attrs
 
 

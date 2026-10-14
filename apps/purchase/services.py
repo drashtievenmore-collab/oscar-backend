@@ -378,6 +378,104 @@ def _post_receipt_stock(bill, lines, location_id, overrides, receipt, *, user=No
                 line.batch_number,
             )
 
+        # Auto-create or link Lot / Taka record for received fabric or batch items
+        _register_lot_taka_on_receipt(bill, line, location_id, receipt, movement, override=override)
+
+
+def _register_lot_taka_on_receipt(bill, line, location_id, receipt, movement, override=None):
+    """Auto-create or link LotTaka records for received fabric or batch items."""
+    from apps.core.numbering import allocate_number
+    from apps.inventory.models import LotTaka
+
+    # Check if LotTaka already exists for this movement / GRN line (prevents duplicates on edit/retry)
+    if movement and LotTaka.objects.filter(
+        client_id=bill.client_id,
+        stock_movement=movement,
+        deleted_at__isnull=True,
+    ).exists():
+        return
+
+    is_fabric = (
+        getattr(line.item, "item_kind", None) == "Fabric"
+        or bool(getattr(line.item, "fabric_quality", None))
+        or (getattr(line.item, "sku", "") or "").startswith("FAB-")
+        or getattr(line.item, "tracking_mode", None) in ("Batch", "Serial")
+    )
+    if not is_fabric and not line.batch_number and not getattr(line.item, "fabric_quality", None):
+        return
+
+    lot_num = line.batch_number or f"LOT-{receipt.grn_number}"
+    received_quantity = uom.to_stock_qty(line.received_qty, line.uom_factor or 1)
+
+    qc_st = (
+        "Passed" if receipt.qc_status == "Approved"
+        else "Rejected" if receipt.qc_status == "Rejected"
+        else "On Hold" if receipt.qc_status == "On Hold"
+        else "Pending"
+    )
+
+    override = override or {}
+    takas_spec = override.get("takas") or override.get("rolls") or []
+
+    if takas_spec:
+        for idx, spec in enumerate(takas_spec):
+            taka_code = allocate_number(bill.client, "TAK")
+            spec_roll = str(spec.get("takaRoll") or spec.get("taka_number") or (idx + 1))
+            spec_qty = Decimal(str(spec.get("qty") or spec.get("quantity") or received_quantity))
+            LotTaka.objects.create(
+                client=bill.client,
+                taka_id=taka_code,
+                lot_number=lot_num,
+                taka_number=spec_roll,
+                item=line.item,
+                supplier=bill.party,
+                source_document_type="GRN",
+                source_document_number=receipt.grn_number,
+                source_document_id=receipt.id,
+                location_id=location_id,
+                received_date=receipt.receipt_date or timezone.localdate(),
+                received_quantity=spec_qty,
+                available_quantity=spec_qty,
+                uom=getattr(line, "stock_uom", None) or getattr(line.item, "uom", None) or getattr(line, "uom", None) or "m",
+                qc_status=qc_st,
+                status="Active",
+                barcode=taka_code,
+                tag_status="Pending",
+                print_count=0,
+                rate=line.landed_unit_cost or line.base_unit_cost or getattr(line, "rate", 0) or 0,
+                stock_movement=movement,
+            )
+    else:
+        existing_count = LotTaka.objects.filter(
+            client_id=bill.client_id, lot_number=lot_num, deleted_at__isnull=True
+        ).count()
+        taka_num = str(existing_count + 1)
+        taka_code = allocate_number(bill.client, "TAK")
+
+        LotTaka.objects.create(
+            client=bill.client,
+            taka_id=taka_code,
+            lot_number=lot_num,
+            taka_number=taka_num,
+            item=line.item,
+            supplier=bill.party,
+            source_document_type="GRN",
+            source_document_number=receipt.grn_number,
+            source_document_id=receipt.id,
+            location_id=location_id,
+            received_date=receipt.receipt_date or timezone.localdate(),
+            received_quantity=received_quantity,
+            available_quantity=received_quantity,
+            uom=getattr(line, "stock_uom", None) or getattr(line.item, "uom", None) or getattr(line, "uom", None) or "m",
+            qc_status=qc_st,
+            status="Active",
+            barcode=taka_code,
+            tag_status="Pending",
+            print_count=0,
+            rate=line.landed_unit_cost or line.base_unit_cost or getattr(line, "rate", 0) or 0,
+            stock_movement=movement,
+        )
+
 
 def _register_serials(client_id, item, serial_numbers, location_id, movement, batch_number):
     from apps.masters.models import ItemSerial
