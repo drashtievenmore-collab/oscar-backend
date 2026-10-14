@@ -5,7 +5,9 @@ Inventory (db.md §7, api.md §7).
 It is **append-only**: no UPDATE, no DELETE. Corrections are new reversing
 movements linked through ``original_movement`` / ``reversal_movement``.
 """
+from django.conf import settings as django_settings
 from django.db import models
+from django.utils import timezone
 
 from apps.core.models import LegacyIdMixin, TenantModel
 
@@ -51,6 +53,9 @@ class StockMovement(TenantModel, LegacyIdMixin):
     )
     type = models.TextField(choices=MOVEMENT_TYPES)
     quantity = models.DecimalField(max_digits=18, decimal_places=4)  # signed: + in, - out
+    #: The item's stock unit at posting time. ``quantity`` is always in this
+    #: unit -- document lines in another unit are converted before posting.
+    uom = models.TextField(null=True, blank=True)
     weighed_qty = models.DecimalField(
         max_digits=18, decimal_places=4, null=True, blank=True
     )
@@ -443,3 +448,106 @@ class StockBalance(TenantModel):
         if self.inward_qty and self.inward_qty > 0:
             return self.inward_value / self.inward_qty
         return None
+
+
+class LotTaka(TenantModel, LegacyIdMixin):
+    """Fabric Lot and Taka/Roll register with movement history."""
+
+    taka_id = models.TextField(null=True, blank=True, db_index=True)
+    lot_number = models.TextField(db_index=True)
+    taka_number = models.TextField(default="1")
+    item = models.ForeignKey(
+        "masters.Item", on_delete=models.PROTECT, related_name="lot_takas"
+    )
+    supplier = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    source_document_type = models.TextField(default="GRN")
+    source_document_number = models.TextField(null=True, blank=True)
+    source_document_id = models.UUIDField(null=True, blank=True)
+    location = models.ForeignKey(
+        "masters.Location", on_delete=models.PROTECT, related_name="+"
+    )
+    received_date = models.DateField(default=timezone.localdate)
+    received_quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    available_quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    uom = models.TextField(null=True, blank=True)
+    qc_status = models.TextField(default="Passed")  # Passed, Pending, On Hold, Reprocess, Rejected
+    qc_notes = models.TextField(null=True, blank=True)
+    status = models.TextField(default="Active")  # Active, Closed
+    barcode = models.TextField(null=True, blank=True, db_index=True)
+    tag_status = models.TextField(default="Pending")  # Pending, Printed, Reprinted
+    print_count = models.IntegerField(default=0)
+    last_printed_at = models.DateTimeField(null=True, blank=True)
+    last_printed_by = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    roll_weight = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    width = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    pieces = models.IntegerField(default=1)
+    gsm = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    rate = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    remarks = models.TextField(null=True, blank=True)
+    tags = models.JSONField(default=list, blank=True)
+    image_url = models.TextField(null=True, blank=True)
+    stock_movement = models.ForeignKey(
+        "inventory.StockMovement", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+
+    class Meta:
+        db_table = "lot_takas"
+        ordering = ["-received_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "lot_number", "taka_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_client_lot_taka",
+            ),
+            models.UniqueConstraint(
+                fields=["client", "taka_id"],
+                condition=models.Q(deleted_at__isnull=True, taka_id__isnull=False),
+                name="uq_client_taka_id",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["client", "taka_id"], name="ix_lot_takas_taka_id"),
+            models.Index(fields=["client", "barcode"], name="ix_lot_takas_barcode"),
+            models.Index(fields=["client", "tag_status"], name="ix_lot_takas_tag_status"),
+        ]
+
+    def __str__(self):
+        return f"{self.taka_id or self.lot_number} - Taka {self.taka_number}"
+
+
+class TakaTagPrintLog(TenantModel):
+    """Audit history of label prints and reprints."""
+
+    lot_taka = models.ForeignKey(
+        LotTaka, on_delete=models.CASCADE, related_name="print_logs"
+    )
+    action_type = models.TextField(default="PRINT")  # PRINT, REPRINT, BULK_PRINT
+    printed_at = models.DateTimeField(default=timezone.now)
+    printed_by = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    printed_by_name = models.TextField(null=True, blank=True)
+    taka_id = models.TextField()
+    lot_number = models.TextField()
+    taka_number = models.TextField()
+    notes = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "taka_tag_print_logs"
+        ordering = ["-printed_at"]
+
+    def __str__(self):
+        return f"{self.action_type} for {self.taka_id} at {self.printed_at}"
+

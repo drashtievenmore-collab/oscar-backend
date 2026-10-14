@@ -227,6 +227,14 @@ class GoodsReceiptLine(TenantModel):
         PurchaseBillLine, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     item = models.ForeignKey("masters.Item", on_delete=models.PROTECT, related_name="+")
+    #: The purchase unit, as ordered -- ``ordered_qty`` / ``received_qty`` /
+    #: ``rejected_qty`` are in this unit.
+    uom = models.TextField(null=True, blank=True)
+    #: Stock units per purchase unit, copied from the bill line, plus the
+    #: converted quantity that was posted -- the conversion is on record.
+    uom_factor = models.DecimalField(max_digits=18, decimal_places=6, default=1)
+    stock_uom = models.TextField(null=True, blank=True)
+    stock_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     ordered_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     received_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     #: Wins over received_qty for weight items -- calculateItemStock already

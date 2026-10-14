@@ -115,6 +115,10 @@ class DocumentLine(TenantModel):
     description = models.TextField(null=True, blank=True)
     hsn_code = models.TextField(null=True, blank=True)
     uom = models.TextField(null=True, blank=True)
+    #: Stock units per one line unit, frozen when the line is written (a line
+    #: in CM for an item stocked in Meter carries 0.01). Stock postings use
+    #: ``qty * uom_factor`` so a later UOM-master edit never rewrites history.
+    uom_factor = models.DecimalField(max_digits=18, decimal_places=6, default=1)
 
     qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     rate = models.DecimalField(max_digits=18, decimal_places=4, default=0)
@@ -153,6 +157,9 @@ class DocumentLine(TenantModel):
         self.item_name = item.name
         self.hsn_code = self.hsn_code or item.hsn_code
         self.uom = self.uom or item.uom
+        from apps.masters.uom import line_factor
+
+        self.uom_factor = line_factor(self.client_id, item, self.uom)
         if not self.description:
             self.description = item.description
 

@@ -282,6 +282,10 @@ class VPIProgressEntry(TenantModel):
     produced_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     entered_by = models.TextField(null=True, blank=True)
     remarks = models.TextField(null=True, blank=True)
+    #: Production proof photo (uploaded through /files/ first).
+    photo_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
 
     class Meta:
         db_table = "jobwork_pi_entries"

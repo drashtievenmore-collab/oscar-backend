@@ -24,12 +24,12 @@ from apps.core.pagination import envelope
 from apps.core.printing import PdfNotAvailable, print_payload, send_payload
 from apps.core.viewsets import TenantModelViewSet
 from apps.inventory import services as stock
+from apps.masters import uom
 
 from . import services
 from .models import (
     DeliveryChallan,
     DeliveryChallanLine,
-    Estimate,
     PaymentAllocation,
     PaymentIn,
     ProformaInvoice,
@@ -49,7 +49,6 @@ from .serializers import (
     AllocateSerializer,
     ConvertLinesSerializer,
     DeliveryChallanSerializer,
-    EstimateSerializer,
     InvoiceOutstandingSerializer,
     PaymentInSerializer,
     ProformaInvoiceSerializer,
@@ -124,67 +123,63 @@ class SalesDocumentViewSet(TenantModelViewSet):
 
     @action(detail=True, methods=["post"])
     def send(self, request, pk=None):
+        from apps.crm import services as crm_services
+
         document = self.get_object()
-        return Response(
-            send_payload(
+        channel = request.data.get("channel", "email")
+        attachments = []
+        if (channel or "").lower() == "email":
+            attachments = self._send_attachments(document, request)
+        payload = send_payload(
+            document,
+            channel=channel,
+            recipients=request.data.get("recipients") or [],
+            subject=request.data.get("subject"),
+            message=request.data.get("message"),
+            actor=request.user,
+            attachments=attachments,
+        )
+        # A sent quotation advances its deal out of Draft.
+        if (
+            document.__class__.__name__ == "Quotation"
+            and (channel or "").lower() == "email"
+            and payload.get("sent")
+        ):
+            crm_services.advance_deal_for_quotation(
+                document, "Sent", actor=request.user,
+                description=(
+                    f"Quotation {document.quotation_number} sent to customer."
+                ),
+            )
+        return Response(payload)
+
+    def _send_attachments(self, document, request):
+        """The quotation PDF rides on the customer email (api.md §5.3).
+
+        A PDF that fails to render must not block the send — the link-only
+        email still goes out, and the failure is logged for the backend
+        console instead of surfacing as a 500 to the sender.
+        """
+        import logging
+
+        from apps.core.printing import company_payload
+        from apps.core.quotation_pdf import build_quotation_pdf
+
+        logger = logging.getLogger(__name__)
+        if document.__class__.__name__ != "Quotation":
+            return []
+        try:
+            pdf = build_quotation_pdf(
+                document, company_payload(document.client_id, request)
+            )
+        except Exception:
+            logger.exception(
+                "Quotation PDF render failed for %s; sending link-only email",
                 document,
-                channel=request.data.get("channel", "email"),
-                recipients=request.data.get("recipients") or [],
-                subject=request.data.get("subject"),
-                message=request.data.get("message"),
             )
-        )
-
-
-# ---------------------------------------------------------------------------
-# Estimates (api.md §5.2)
-# ---------------------------------------------------------------------------
-class EstimateViewSet(SalesDocumentViewSet):
-    queryset = Estimate.objects.all()
-    serializer_class = EstimateSerializer
-    audit_entity_type = "Estimate"
-    audit_label_field = "estimate_number"
-    status_field = "status"
-    print_title = "Estimate"
-    permission_map = {"read": ["view_sales"], "write": ["view_sales"]}
-
-    def perform_create(self, serializer):
-        # An estimate is numbered on creation: it is a quoting artefact, not a
-        # posted financial document, so there is no draft-then-post step.
-        serializer.validated_data["estimate_number"] = allocate_number(
-            self.request.user.client, "EST", serializer.validated_data.get("doc_date")
-        )
-        return super().perform_create(serializer)
-
-    @action(detail=True, methods=["post"], url_path="convert-to-quotation")
-    @transaction.atomic
-    def convert_to_quotation(self, request, pk=None):
-        estimate = self.get_object()
-        if estimate.status == "Converted":
-            raise Conflict(
-                "This estimate has already been converted.", code=Codes.ALREADY_DONE
-            )
-
-        quotation = _clone_document(
-            estimate,
-            Quotation,
-            {"estimate": estimate, "status": "Draft"},
-            number_field="quotation_number",
-            series="QT",
-            line_model_name="QuotationLine",
-            line_fk="quotation",
-        )
-
-        estimate.status = "Converted"
-        estimate.converted_quotation = quotation
-        estimate.save(update_fields=["status", "converted_quotation", "updated_at"])
-        self.write_audit(
-            "convert", estimate, description=f"Converted to {quotation.quotation_number}"
-        )
-        return Response(
-            QuotationSerializer(quotation, context=self.get_serializer_context()).data,
-            status=status.HTTP_201_CREATED,
-        )
+            return []
+        filename = f"{document.quotation_number or 'quotation'}.pdf"
+        return [(filename, pdf, "application/pdf")]
 
 
 def _clone_document(source, target_model, overrides, *, number_field, series,
@@ -220,7 +215,7 @@ def _clone_document(source, target_model, overrides, *, number_field, series,
 
     line_fields = [
         "client_id", "line_no", "item_id", "sku", "item_name", "description",
-        "hsn_code", "uom", "qty", "rate", "discount_pct", "tax_pct",
+        "hsn_code", "uom", "uom_factor", "qty", "rate", "discount_pct", "tax_pct",
         "is_bom_generated", "bom_source_item_id", "is_user_modified", "parent_sku",
     ]
     for line in source_lines:
@@ -254,6 +249,41 @@ class QuotationViewSet(SalesDocumentViewSet):
         )
         return super().perform_create(serializer)
 
+    @action(detail=True, methods=["get"])
+    def pdf(self, request, pk=None):
+        """Download the rendered quotation PDF (api.md §5.3, §12.1).
+
+        The base viewset answers 501 for documents with no renderer; the
+        quotation renderer lives in ``apps/core/quotation_pdf.py``, so this
+        endpoint streams the same file the customer email attaches — the
+        sender downloads it here and attaches it to the WhatsApp chat
+        manually, since ``wa.me`` links can only prefill text.
+        """
+        import logging
+        from io import BytesIO
+
+        from django.http import FileResponse
+
+        from apps.core.printing import PdfNotAvailable, company_payload
+        from apps.core.quotation_pdf import build_quotation_pdf
+
+        document = self.get_object()
+        try:
+            pdf = build_quotation_pdf(
+                document, company_payload(document.client_id, request)
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Quotation PDF render failed for %s", document
+            )
+            raise PdfNotAvailable(detail="The quotation PDF could not be rendered.")
+        filename = f"{document.quotation_number or 'quotation'}.pdf"
+        return FileResponse(
+            BytesIO(pdf),
+            content_type="application/pdf",
+            filename=filename,
+        )
+
     @action(detail=True, methods=["post"], url_path="convert-to-order")
     @transaction.atomic
     def convert_to_order(self, request, pk=None):
@@ -261,6 +291,12 @@ class QuotationViewSet(SalesDocumentViewSet):
         if quotation.status in ("Converted", "Cancelled"):
             raise Conflict(
                 f"This quotation is {quotation.status}.", code=Codes.ALREADY_DONE
+            )
+        if quotation.party_id is None:
+            raise Conflict(
+                "This quotation has no customer account yet. Approve it first -- "
+                "the lead is converted to a customer on approval.",
+                code="CUSTOMER_REQUIRED",
             )
 
         order = _clone_document(
@@ -304,6 +340,102 @@ class QuotationViewSet(SalesDocumentViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    @action(detail=True, methods=["post"], url_path="approve")
+    @transaction.atomic
+    def approve(self, request, pk=None):
+        """Customer approval: Accepted + automatic Lead -> Customer conversion.
+
+        Transactional: if customer creation/linking fails, the approval rolls
+        back too. Idempotent: re-approving an Accepted quotation links (never
+        duplicates) and returns the same customer. Never creates a Sales Order.
+        """
+        from apps.crm import services as crm_services
+
+        quotation = Quotation.objects.select_for_update().get(
+            pk=self.get_object().pk
+        )
+        if quotation.status in ("Rejected", "Cancelled", "Expired"):
+            raise Conflict(
+                f"This quotation is {quotation.status} and cannot be approved.",
+                code=Codes.ALREADY_DONE,
+            )
+
+        conversion = {"party": None, "created": False, "lead": None}
+        if quotation.status not in ("Accepted", "Converted", "Invoiced"):
+            quotation.status = "Accepted"
+            quotation.save(update_fields=["status", "updated_at"])
+            QuotationActivity.objects.create(
+                quotation=quotation,
+                event="accepted",
+                actor_label=getattr(request.user, "name", None) or "staff",
+                comment=request.data.get("reason"),
+            )
+            self.write_audit(
+                "approve", quotation,
+                description=f"Approved ({quotation.quotation_number})",
+            )
+
+        if quotation.crm_lead_id is not None:
+            conversion = crm_services.convert_lead_to_customer(
+                quotation.crm_lead,
+                user=request.user,
+                source="Quotation Approval",
+                reference=quotation.quotation_number,
+            )
+            quotation.crm_lead = conversion["lead"]
+
+        party = conversion["party"]
+        # The approved quotation stays linked to the customer: point it at the
+        # converted (or matched) party so the follow-up Sales Order is raised
+        # on the right customer. The frozen address snapshot is only filled
+        # where the quotation has none, preserving what was agreed.
+        if party is not None and quotation.party_id != party.id:
+            quotation.party = party
+            quotation.freeze_party_snapshot(party)
+            quotation.save()
+        # An approval wins the linked deal: same transaction, so a failed
+        # deal move rolls the approval back too.
+        crm_services.advance_deal_for_quotation(
+            quotation, "Won", actor=request.user,
+            description=(
+                f"Deal won by approval of quotation "
+                f"{quotation.quotation_number}."
+            ),
+        )
+        quotation.refresh_from_db()
+
+        lead_payload = None
+        if conversion["lead"] is not None:
+            from apps.crm.serializers import LeadSerializer
+
+            lead_payload = LeadSerializer(conversion["lead"]).data
+
+        return Response(
+            {
+                "quotation": QuotationSerializer(
+                    quotation, context=self.get_serializer_context()
+                ).data,
+                "customer": (
+                    {"id": str(party.id), "name": party.name, "code": party.code}
+                    if party is not None
+                    else None
+                ),
+                "customerCreated": conversion["created"],
+                "lead": lead_payload,
+                "message": (
+                    "Quotation approved. Lead has been converted to Customer "
+                    "successfully." if party is not None
+                    else "Quotation approved."
+                ),
+            }
+        )
+
+    @action(detail=True, methods=["post"], url_path="accept")
+    @transaction.atomic
+    def accept(self, request, pk=None):
+        """Alias of approve: staff-side acceptance (Approved/Accepted)."""
+        return self.approve(request, pk=pk)
+
     @action(detail=True, methods=["post", "delete"], url_path="share")
     def share(self, request, pk=None):
         """Opaque, hashed, single-quotation, expiring, revocable (api.md §5.3).
@@ -342,6 +474,15 @@ class QuotationViewSet(SalesDocumentViewSet):
         if quotation.status == "Draft":
             quotation.status = "Sent"
             quotation.save(update_fields=["status", "updated_at"])
+        # Sharing is sending: the linked deal leaves Draft with the link.
+        from apps.crm import services as crm_services
+
+        crm_services.advance_deal_for_quotation(
+            quotation, "Sent", actor=request.user,
+            description=(
+                f"Quotation {quotation.quotation_number} shared with customer."
+            ),
+        )
 
         # The token is returned once and never stored in the clear.
         return Response(
@@ -556,6 +697,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 description=source.description,
                 hsn_code=source.hsn_code,
                 uom=source.uom,
+                uom_factor=source.uom_factor,
                 qty=qty,
                 rate=source.rate,
                 discount_pct=source.discount_pct,
@@ -756,6 +898,7 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
                 description=line.description,
                 hsn_code=line.hsn_code,
                 uom=line.uom,
+                uom_factor=line.uom_factor,
                 qty=line.qty,
                 rate=line.rate,
                 discount_pct=line.discount_pct,
@@ -1111,7 +1254,8 @@ class SalesReturnViewSet(SalesDocumentViewSet):
                     item=line.item_id,
                     location=location_id,
                     type="SALES_RETURN",
-                    quantity=D(line.returned_qty),
+                    # returned_qty is counted in the invoice line's unit.
+                    quantity=uom.to_stock_qty(line.returned_qty, invoice_line.uom_factor),
                     unit_cost=line.item.cost_price,
                     reference_type="SalesReturn",
                     reference_id=sales_return.id,

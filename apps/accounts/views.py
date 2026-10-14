@@ -375,7 +375,9 @@ class SessionDetailView(APIView):
 # api.md §3.1 -- Users
 # ---------------------------------------------------------------------------
 class UserViewSet(TenantModelViewSet):
-    queryset = User.objects.select_related("role", "reporting_manager", "employee").all()
+    queryset = User.objects.select_related(
+        "role", "reporting_manager", "employee", "employee__designation", "employee__department"
+    ).all()
     serializer_class = UserSerializer
     audit_entity_type = "User"
     audit_label_field = "email"

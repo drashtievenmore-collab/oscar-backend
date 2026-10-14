@@ -129,6 +129,13 @@ class UserSerializer(BaseModelSerializer):
         source="role", queryset=Role.objects.all(), allow_null=True, required=False
     )
     employeeId = serializers.SerializerMethodField()
+    #: HRMS is the source of truth for a staff member's job, so the employee
+    #: row is joined into the admin user row read-only. Administration is the
+    #: main staff list; these are what make an HR-sourced account readable
+    #: there without a second lookup (api.md §3.1).
+    isFromHrms = serializers.SerializerMethodField()
+    designation = serializers.SerializerMethodField()
+    employeeStatus = serializers.SerializerMethodField()
     reportingManager = serializers.SerializerMethodField()
     reportingManagerId = serializers.PrimaryKeyRelatedField(
         source="reporting_manager",
@@ -146,7 +153,8 @@ class UserSerializer(BaseModelSerializer):
         model = User
         fields = [
             "id", "name", "email", "phone", "role", "roleId", "department", "status",
-            "joinedDate", "lastLogin", "employeeId", "location", "reportingManager",
+            "joinedDate", "lastLogin", "employeeId", "isFromHrms", "designation",
+            "employeeStatus", "location", "reportingManager",
             "reportingManagerId", "avatar", "permissions", "crm_roles", "password",
             "created_at", "updated_at",
         ]
@@ -157,6 +165,34 @@ class UserSerializer(BaseModelSerializer):
 
     def get_employeeId(self, user):
         return user.employee.employee_code if user.employee_id else None
+
+    def get_isFromHrms(self, user):
+        return user.employee_id is not None
+
+    def get_designation(self, user):
+        employee = user.employee
+        if employee is None or employee.designation_id is None:
+            return None
+        return employee.designation.name
+
+    def get_employeeStatus(self, user):
+        """The HR record's status, which is what drives the linked account."""
+        return user.employee.status if user.employee_id else None
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # An HR-sourced account inherits the employee photo and joining date
+        # when nobody set them on the user itself -- the user row is a login
+        # identity, the employee row is the person.
+        employee = instance.employee
+        if employee is not None:
+            if not data.get("avatar") and employee.avatar_url:
+                data["avatar"] = employee.avatar_url
+            if not data.get("joinedDate") and employee.joining_date:
+                data["joinedDate"] = employee.joining_date.isoformat()
+            if not data.get("department") and employee.department_id:
+                data["department"] = employee.department.name
+        return data
 
     def get_reportingManager(self, user):
         return user.reporting_manager.name if user.reporting_manager_id else None

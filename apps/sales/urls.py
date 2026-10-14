@@ -5,7 +5,6 @@ from rest_framework.routers import DefaultRouter
 from . import views
 
 router = DefaultRouter(trailing_slash=True)
-router.register("estimates", views.EstimateViewSet, basename="sales-estimates")
 router.register("quotations", views.QuotationViewSet, basename="sales-quotations")
 router.register("orders", views.SalesOrderViewSet, basename="sales-orders")
 router.register(

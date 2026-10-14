@@ -3,7 +3,12 @@ Sales (db.md §5, api.md §5).
 
 The pipeline, walkable both ways through nullable upstream FKs:
 
-    Estimate -> Quotation -> Sales Order -> [Proforma] -> Challan -> Invoice -> Payment In
+    Quotation -> Sales Order -> [Proforma] -> Challan -> Invoice -> Payment In
+                                                |                       |
+                                          Warranty Card           Sales Return
+
+Estimates were removed product-wide: no Estimate/EstimateLine tables, no
+/sales/estimates/ endpoints, no EST number series.
                                                 |                       |
                                           Warranty Card           Sales Return
 
@@ -22,7 +27,6 @@ from apps.core.documents import (
 from apps.core.models import LegacyIdMixin, TenantModel
 
 # --- api.md Appendix A -------------------------------------------------------
-ESTIMATE_STATUSES = ["Draft", "Sent", "Accepted", "Rejected", "Converted", "Expired"]
 QUOTATION_STATUSES = [
     "Draft", "Sent", "Viewed", "Accepted", "Rejected", "Expired",
     "Confirmed", "Converted", "Invoiced", "Cancelled",
@@ -50,51 +54,21 @@ def choices(values):
 
 
 # ---------------------------------------------------------------------------
-# Estimates (api.md §5.2)
-# ---------------------------------------------------------------------------
-class Estimate(DocumentHeader):
-    estimate_number = models.TextField(null=True, blank=True)
-    status = models.TextField(choices=choices(ESTIMATE_STATUSES), default="Draft")
-    valid_until = models.DateField(null=True, blank=True)
-    converted_quotation = models.ForeignKey(
-        "Quotation", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
-    )
-    crm_lead = models.ForeignKey(
-        "crm.Lead", null=True, blank=True, on_delete=models.SET_NULL, related_name="estimates"
-    )
-
-    class Meta:
-        db_table = "estimates"
-        ordering = ["-doc_date", "-created_at"]
-        constraints = [
-            number_unique_constraint("estimates", "estimate_number"),
-            total_check_constraint("estimates"),
-        ]
-
-    def __str__(self):
-        return self.estimate_number or f"Estimate {self.id}"
-
-
-class EstimateLine(DocumentLine):
-    estimate = models.ForeignKey(Estimate, on_delete=models.CASCADE, related_name="line_items")
-
-    class Meta(DocumentLine.Meta):
-        db_table = "estimate_lines"
-        constraints = [
-            models.UniqueConstraint(fields=["estimate", "line_no"], name="uq_estimate_line_no")
-        ]
-
-
-# ---------------------------------------------------------------------------
 # Quotations (api.md §5.3)
 # ---------------------------------------------------------------------------
 class Quotation(DocumentHeader):
+    #: A quotation can be raised against a lead that has no Customer/Party row
+    #: yet (api.md §5.3) -- it is priced and sent first and only becomes a
+    #: billable document when the customer accepts it. ``QuotationViewSet
+    #: .approve`` is what links (or creates) the party at that point, so
+    #: ``party`` is the one header relation this document may leave empty.
+    party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.PROTECT, related_name="+"
+    )
+
     quotation_number = models.TextField(null=True, blank=True)
     status = models.TextField(choices=choices(QUOTATION_STATUSES), default="Draft")
     valid_until = models.DateField(null=True, blank=True)
-    estimate = models.ForeignKey(
-        Estimate, null=True, blank=True, on_delete=models.SET_NULL, related_name="quotations"
-    )
     crm_deal = models.ForeignKey(
         "crm.Deal", null=True, blank=True, on_delete=models.SET_NULL, related_name="quotations"
     )
@@ -113,6 +87,33 @@ class Quotation(DocumentHeader):
 
     def __str__(self):
         return self.quotation_number or f"Quotation {self.id}"
+
+    def freeze_party_snapshot(self, party=None):
+        """db.md §3.1 -- freeze the party onto the document.
+
+        With no party yet (a quotation raised against a lead), the lead's own
+        identity is frozen instead so the quotation still prints a customer
+        name, place of supply and address. Approval re-freezes from the
+        converted party, which wins because it is a real Customer row.
+        """
+        super().freeze_party_snapshot(party)
+        if self.party_id is not None:
+            return
+        lead = self.crm_lead
+        if lead is None:
+            return
+        self.party_name = self.party_name or (lead.company or lead.name)
+        self.place_of_supply = self.place_of_supply or lead.state
+        address = {
+            key: value
+            for key, value in (
+                ("city", lead.city), ("state", lead.state), ("country", lead.country),
+            )
+            if value
+        }
+        if address and not self.billing_address:
+            self.billing_address = address
+            self.shipping_address = self.shipping_address or dict(address)
 
 
 class QuotationLine(DocumentLine):

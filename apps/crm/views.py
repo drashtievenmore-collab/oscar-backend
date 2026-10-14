@@ -1,8 +1,9 @@
 """CRM endpoints (api.md §9)."""
+from datetime import timedelta
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, DecimalField, Q, Sum, Value
+from django.db.models import Count, DecimalField, Max, Q, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import status
@@ -10,6 +11,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.core.audit import notify
 from apps.core.exceptions import Codes, Conflict, NotFound, ValidationFailed
 from apps.core.money import ZERO, round2
 from apps.core.numbering import allocate_number
@@ -23,11 +25,12 @@ from .models import (
     CrmProject,
     Deal,
     DealActivity,
+    DealDocument,
+    DealLine,
     DealStage,
     Form,
     Industry,
     Lead,
-    LeadCall,
     LeadEmail,
     LeadFile,
     LeadNote,
@@ -52,11 +55,12 @@ from .serializers import (
     ContractSerializer,
     CrmProjectSerializer,
     DealActivitySerializer,
+    DealDocumentSerializer,
+    DealLineSerializer,
     DealSerializer,
     DealStageSerializer,
     FormSerializer,
     IndustrySerializer,
-    LeadCallSerializer,
     LeadEmailSerializer,
     LeadFileSerializer,
     LeadNoteSerializer,
@@ -114,6 +118,8 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         "partial_update": ["edit_lead"],
         "destroy": ["delete_lead"],
         "bulk_delete": ["delete_lead"],
+        "mark_lost": ["edit_lead"],
+        "bulk_mark_lost": ["edit_lead"],
     }
 
     def filter_queryset(self, queryset):
@@ -218,6 +224,148 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         lead.save(update_fields=["is_pinned", "updated_at"])
         return Response({"isPinned": False})
 
+    def _resolve_lost_stage(self):
+        stage = (
+            Stage.objects.filter(
+                client_id=self.get_client_id(),
+                is_lost=True,
+                is_active=True,
+                deleted_at__isnull=True,
+            )
+            .order_by("sequence")
+            .first()
+        )
+        if stage is None:
+            stage = Stage.objects.filter(
+                client_id=self.get_client_id(),
+                name__iexact="Lost",
+                deleted_at__isnull=True,
+            ).first()
+        if stage is None:
+            stage = Stage.objects.filter(
+                client_id=self.get_client_id(),
+                name__iexact="Closed",
+                deleted_at__isnull=True,
+            ).first()
+        if stage is None:
+            stages = Stage.objects.filter(
+                client_id=self.get_client_id(), deleted_at__isnull=True
+            )
+            last_sequence = stages.aggregate(value=Max("sequence"))["value"] or 0
+            stage, _ = stages.get_or_create(
+                name="Lost",
+                defaults={
+                    "client_id": self.get_client_id(),
+                    "sequence": last_sequence + 1,
+                    "is_lost": True,
+                    "is_active": True,
+                    "created_by": self.request.user,
+                },
+            )
+        return stage
+
+    def _resolve_lost_reason(self, data):
+        reason_id = data.get("lostReasonId") or data.get("lost_reason")
+        if reason_id:
+            reason = LostReason.objects.filter(
+                client_id=self.get_client_id(), pk=reason_id, deleted_at__isnull=True
+            ).first()
+            if reason is None:
+                raise ValidationFailed(
+                    "The selected lost reason is no longer available.",
+                    field_errors={"lostReasonId": ["Select a valid lost reason."]},
+                )
+            return reason
+        name = data.get("lostReason") or data.get("reason")
+        name = str(name or "").strip()
+        if not name:
+            return None
+        reason = LostReason.objects.filter(
+            client_id=self.get_client_id(), name__iexact=name, deleted_at__isnull=True
+        ).first()
+        if reason is None:
+            reason = LostReason.objects.create(
+                client_id=self.get_client_id(),
+                name=name,
+                created_by=self.request.user,
+            )
+        return reason
+
+    @transaction.atomic
+    def _mark_lead_lost(self, lead, reason, note):
+        lost_stage = self._resolve_lost_stage()
+        previous_stage = lead.stage.name if lead.stage_id else ""
+        lead.stage = lost_stage
+        lead.lost_reason = reason
+        lead.save(update_fields=["stage", "lost_reason", "updated_at"])
+        moved_deals = []
+        open_deals = lead.deals.filter(deleted_at__isnull=True).exclude(stage__in=["Won", "Lost"])
+        for deal in open_deals:
+            deal.stage = "Lost"
+            if deal.closed_at is None:
+                deal.closed_at = timezone.now()
+            if reason is not None:
+                deal.lost_reason = reason
+            deal.save(update_fields=["stage", "closed_at", "lost_reason", "updated_at"])
+            DealActivity.objects.create(
+                deal=deal,
+                type="stage_change",
+                description=(
+                    f"Lead {lead.lead_number} marked as lost"
+                    + (f" ({reason.name})" if reason else "")
+                    + (f" — {note}" if note else "")
+                ),
+                actor=self.request.user if getattr(self.request.user, "is_authenticated", False) else None,
+            )
+            moved_deals.append(str(deal.id))
+        services.annotate_lead_counters(self.get_client_id(), [lead])
+        description = f"Marked as lost (moved from {previous_stage})" if previous_stage else "Marked as lost"
+        if reason:
+            description += f" — {reason.name}"
+        if note:
+            description += f" — {note}"
+        self.write_audit("mark_lost", lead, description=description)
+        return lost_stage, moved_deals
+
+    @action(detail=True, methods=["post"], url_path="mark-lost")
+    @transaction.atomic
+    def mark_lost(self, request, pk=None):
+        """Move one lead to the Lost stage and move its open deals to Lost."""
+        lead = self.get_object()
+        reason = self._resolve_lost_reason(request.data or {})
+        note = str((request.data or {}).get("note") or "").strip()
+        _, moved_deals = self._mark_lead_lost(lead, reason, note)
+        lead.refresh_from_db()
+        services.annotate_lead_counters(request.client_id, [lead])
+        return Response(
+            {
+                "lead": LeadSerializer(lead).data,
+                "movedDeals": moved_deals,
+                "dealsMoved": len(moved_deals),
+            }
+        )
+
+    @action(detail=False, methods=["post"], url_path="bulk-mark-lost")
+    @transaction.atomic
+    def bulk_mark_lost(self, request):
+        """Move several leads to the Lost stage together with their open deals."""
+        ids = (request.data or {}).get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            raise ValidationFailed(
+                "Select at least one lead to mark as lost.",
+                field_errors={"ids": ["Provide a non-empty list of ids."]},
+            )
+        reason = self._resolve_lost_reason(request.data or {})
+        note = str((request.data or {}).get("note") or "").strip()
+        leads = list(self.get_queryset().filter(pk__in=ids))
+        total_moved = 0
+        marked = []
+        for lead in leads:
+            _, moved_deals = self._mark_lead_lost(lead, reason, note)
+            total_moved += len(moved_deals)
+            marked.append(str(lead.id))
+        return Response({"marked": marked, "markedCount": len(marked), "dealsMoved": total_moved})
+
     @action(detail=False, methods=["get"])
     def stats(self, request):
         """``GET /crm/leads/stats/`` -- tab counts and KPI tiles."""
@@ -274,9 +422,11 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
     @action(detail=True, methods=["post"])
     @transaction.atomic
     def convert(self, request, pk=None):
-        """Lead -> Deal (+ optional customer) (api.md §9.1)."""
-        from apps.masters.models import Party
+        """Lead -> Deal (+ optional customer) (api.md §9.1).
 
+        The customer half reuses the quotation-approval conversion service so
+        manual and automatic conversion link/dedupe identically.
+        """
         lead = self.get_object()
         if lead.converted_deal_id:
             raise Conflict(
@@ -284,34 +434,17 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             )
 
         party = lead.party
+        created_customer = False
         if party is None and request.data.get("createCustomer", True):
-            # Link, don't duplicate: an identical live party (same tenant, same
-            # name) wins over a new row. Leads converted before this endpoint
-            # existed already have a customer on file, and re-running the UI's
-            # convert must never mint a second CUST- code for the same name.
-            party_name = lead.company or lead.name
-            party = (
-                Party.objects.filter(
-                    client_id=request.client_id,
-                    type__in=["Customer", "Both"],
-                    name__iexact=party_name,
-                    deleted_at__isnull=True,
-                )
-                .order_by("created_at")
-                .first()
+            result = services.convert_lead_to_customer(
+                lead,
+                user=request.user,
+                source="Manual Conversion",
+                reference=None,
             )
-            if party is None:
-                party = Party.objects.create(
-                    client_id=request.client_id,
-                    code=allocate_number(request.user.client, "CUST"),
-                    type="Customer",
-                    name=party_name,
-                    phone=lead.phone,
-                    email=lead.email,
-                    place_of_supply=lead.state,
-                    created_by=request.user,
-                )
-            lead.party = party
+            lead = result["lead"]
+            party = result["party"]
+            created_customer = result["created"]
 
         deal = Deal.objects.create(
             client_id=request.client_id,
@@ -353,11 +486,6 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             rows.append({"type": "note", "id": str(note.id), "at": note.created_at,
                          "title": "Note added", "body": note.body,
                          "actor": note.author.name if note.author_id else None})
-        for call in lead.calls.filter(deleted_at__isnull=True):
-            rows.append({"type": "call", "id": str(call.id), "at": call.called_at,
-                         "title": f"Call ({call.outcome or call.direction})",
-                         "body": call.notes,
-                         "actor": call.called_by.name if call.called_by_id else None})
         for email in lead.emails.filter(deleted_at__isnull=True):
             rows.append({"type": "email", "id": str(email.id),
                          "at": email.sent_at or email.created_at,
@@ -379,21 +507,11 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
 
     @action(detail=True, methods=["get"])
     def documents(self, request, pk=None):
-        """Related estimates / quotations / invoices (api.md §9.2)."""
-        from apps.sales.models import Estimate, Quotation
+        """Related quotations / invoices (api.md §9.2)."""
+        from apps.sales.models import Quotation
 
         lead = self.get_object()
         rows = [
-            {
-                "documentType": "Estimate",
-                "id": str(row.id),
-                "number": row.estimate_number,
-                "date": row.doc_date,
-                "status": row.status,
-                "total": round2(row.total),
-            }
-            for row in Estimate.objects.filter(crm_lead=lead, deleted_at__isnull=True)
-        ] + [
             {
                 "documentType": "Quotation",
                 "id": str(row.id),
@@ -434,27 +552,168 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
     def lead_users(self, request, pk=None):
         return self._sub_resource(request, "lead_users", LeadUserSerializer)
 
+    @action(detail=True, methods=["delete"], url_path=r"users/(?P<user_id>[^/.]+)")
+    def lead_user_detail(self, request, pk=None, user_id=None):
+        """Unassign one user from a lead (the Users & Requirements tab)."""
+        lead = self.get_object()
+        row = lead.lead_users.filter(pk=user_id, deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound("That assignment no longer exists.")
+        row.soft_delete(request.user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     @action(detail=True, methods=["get", "post"], url_path="products")
     def products(self, request, pk=None):
         return self._sub_resource(request, "products", LeadProductSerializer)
 
+    @action(
+        detail=True,
+        methods=["patch", "delete"],
+        url_path=r"products/(?P<product_id>[^/.]+)",
+    )
+    def product_detail(self, request, pk=None, product_id=None):
+        """Edit / remove one fabric requirement line (the Users &
+        Requirements tab)."""
+        lead = self.get_object()
+        row = lead.products.filter(pk=product_id, deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound("That requirement no longer exists.")
+        if request.method == "DELETE":
+            row.soft_delete(request.user)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = LeadProductSerializer(
+            row,
+            data=request.data,
+            partial=True,
+            context=self.get_serializer_context(),
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(
+            LeadProductSerializer(row, context=self.get_serializer_context()).data
+        )
+
     @action(detail=True, methods=["get", "post"], url_path="sources")
     def sources(self, request, pk=None):
+        if request.method == "POST":
+            raw = request.data.dict() if hasattr(request.data, "dict") else dict(request.data)
+            data = dict(raw)
+            # The drawer posts a channel label (`source`/`name`/`campaign`);
+            # resolve it to a real `crm.Source` so GET returns `name`.
+            source_name = (
+                data.get("sourceName") or data.get("source_name")
+                or data.get("source") or data.get("name")
+                or data.get("campaign")
+            )
+            if not data.get("sourceId") and not data.get("source_id") and source_name:
+                label = str(source_name).strip()
+                if label:
+                    # Exact match first so iexact get_or_create never duplicates case variants.
+                    source_obj = Source.objects.filter(
+                        client_id=request.client_id, name__iexact=label, deleted_at__isnull=True
+                    ).first()
+                    if source_obj is None:
+                        source_obj = Source.objects.create(
+                            client_id=request.client_id, name=label,
+                            created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+                        )
+                    data["sourceId"] = str(source_obj.id)
+            lead = self.get_object()
+            serializer = LeadSourceSerializer(
+                data=data, context=self.get_serializer_context()
+            )
+            serializer.is_valid(raise_exception=True)
+            row = serializer.save(
+                client_id=request.client_id, lead=lead,
+                created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+            )
+            return Response(
+                LeadSourceSerializer(row, context=self.get_serializer_context()).data,
+                status=status.HTTP_201_CREATED,
+            )
         return self._sub_resource(request, "source_entries", LeadSourceSerializer)
 
     @action(detail=True, methods=["get", "post"], url_path="notes")
     def notes(self, request, pk=None):
         return self._sub_resource(request, "notes", LeadNoteSerializer, author=request.user)
 
-    @action(detail=True, methods=["get", "post"], url_path="calls")
-    def calls(self, request, pk=None):
-        return self._sub_resource(
-            request, "calls", LeadCallSerializer, called_by=request.user
-        )
-
     @action(detail=True, methods=["get", "post"], url_path="emails")
     def emails(self, request, pk=None):
+        if request.method == "POST":
+            raw = request.data.dict() if hasattr(request.data, "dict") else dict(request.data)
+            data = dict(raw)
+            # A drawer "Send Email" is sent, not a draft.
+            if not data.get("sent_at") and not data.get("sentAt"):
+                data["sent_at"] = timezone.now().isoformat()
+            lead = self.get_object()
+            serializer = LeadEmailSerializer(
+                data=data, context=self.get_serializer_context()
+            )
+            serializer.is_valid(raise_exception=True)
+            row = serializer.save(
+                client_id=request.client_id, lead=lead,
+                created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+            )
+            return Response(
+                LeadEmailSerializer(row, context=self.get_serializer_context()).data,
+                status=status.HTTP_201_CREATED,
+            )
         return self._sub_resource(request, "emails", LeadEmailSerializer)
+
+    def _delete_sub_resource(self, request, pk, row_id, related_name):
+        """Soft-delete one lead sub-resource row (sources, emails, …)."""
+        lead = self.get_object()
+        row = getattr(lead, related_name).filter(pk=row_id, deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound("That record no longer exists.")
+        row.soft_delete(request.user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["patch", "delete"], url_path=r"sources/(?P<row_id>[^/.]+)")
+    def source_detail(self, request, pk=None, row_id=None):
+        lead = self.get_object()
+        row = lead.source_entries.filter(pk=row_id, deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound("That record no longer exists.")
+        if request.method == "DELETE":
+            return self._delete_sub_resource(request, pk, row_id, "source_entries")
+        raw = request.data.dict() if hasattr(request.data, "dict") else dict(request.data)
+        data = dict(raw)
+        # Same label -> Source resolution as POST so an edit can change the
+        # channel ("Website", "Referral", …) without knowing the Source PK.
+        source_name = (
+            data.get("sourceName") or data.get("source_name")
+            or data.get("source") or data.get("name")
+            or (data.get("campaign") if not data.get("sourceId") and not data.get("source_id") else None)
+        )
+        if not data.get("sourceId") and not data.get("source_id") and source_name:
+            label = str(source_name).strip()
+            if label:
+                source_obj = Source.objects.filter(
+                    client_id=request.client_id, name__iexact=label, deleted_at__isnull=True
+                ).first()
+                if source_obj is None:
+                    source_obj = Source.objects.create(
+                        client_id=request.client_id, name=label,
+                        created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+                    )
+                data["sourceId"] = str(source_obj.id)
+        serializer = LeadSourceSerializer(
+            row, data=data, partial=True, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(
+            LeadSourceSerializer(row, context=self.get_serializer_context()).data
+        )
+
+    @action(detail=True, methods=["delete"], url_path=r"emails/(?P<row_id>[^/.]+)")
+    def email_detail(self, request, pk=None, row_id=None):
+        return self._delete_sub_resource(request, pk, row_id, "emails")
+
+    @action(detail=True, methods=["delete"], url_path=r"notes/(?P<row_id>[^/.]+)")
+    def note_detail(self, request, pk=None, row_id=None):
+        return self._delete_sub_resource(request, pk, row_id, "notes")
 
     @action(detail=True, methods=["get", "post"], url_path="files")
     def files(self, request, pk=None):
@@ -634,11 +893,51 @@ class TaskViewSet(TenantModelViewSet):
             self.request.user.client, "TSK"
         )
         serializer.validated_data.setdefault("source", "Manual")
-        return super().perform_create(serializer)
+        task = super().perform_create(serializer)
+        if task.assignee_id:
+            lead_name = task.lead.name if task.lead_id and task.lead else ""
+            notify(
+                client=task.client_id,
+                recipients=[task.assignee_id],
+                type="crm.task_assigned",
+                category="crm",
+                title=f"New task: {task.title}",
+                body=f"{lead_name} task assigned to you." if lead_name else "A lead task was assigned to you.",
+                entity_type="CrmTask",
+                entity_id=task.id,
+                actor=self.request.user,
+            )
+        return task
+
+    def perform_update(self, serializer):
+        previous_assignee = serializer.instance.assignee_id if serializer.instance else None
+        task = super().perform_update(serializer)
+        if task.assignee_id and task.assignee_id != previous_assignee:
+            lead_name = task.lead.name if task.lead_id and task.lead else ""
+            notify(
+                client=task.client_id,
+                recipients=[task.assignee_id],
+                type="crm.task_assigned",
+                category="crm",
+                title=f"New task: {task.title}",
+                body=f"{lead_name} task assigned to you." if lead_name else "A lead task was assigned to you.",
+                entity_type="CrmTask",
+                entity_id=task.id,
+                actor=self.request.user,
+            )
+        return task
+
+    @action(detail=True, methods=["post"])
+    def start(self, request, pk=None):
+        task = self.get_object()
+        task.status = "In Progress"
+        if not task.started_at:
+            task.started_at = timezone.now()
+        task.save(update_fields=["status", "started_at", "updated_at"])
+        return Response(TaskSerializer(task).data)
 
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
-        """``{ outcome, nextAction, note, completedBy }`` (api.md §9.3)."""
         serializer = CompleteTaskSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -649,6 +948,11 @@ class TaskViewSet(TenantModelViewSet):
             next_action=data.get("nextAction"),
             note=data.get("note"),
             user=request.user,
+            next_follow_up_at=data.get("nextFollowUpAt"),
+            target_stage_id=data.get("targetStageId") or None,
+            started_at=data.get("startedAt"),
+            ended_at=data.get("endedAt"),
+            duration_seconds=data.get("durationSeconds"),
         )
         return Response(
             {
@@ -660,6 +964,8 @@ class TaskViewSet(TenantModelViewSet):
                 ),
                 "createdTasks": TaskSerializer(result["createdTasks"], many=True).data,
                 "stageChanged": result["stageChanged"],
+                "lead": LeadSerializer(result["lead"]).data if result.get("lead") is not None else None,
+                "leadId": str(result["lead"].id) if result.get("lead") is not None else None,
             }
         )
 
@@ -759,6 +1065,29 @@ class DealViewSet(TenantModelViewSet):
         )
 
     def perform_create(self, serializer):
+        # Double-submit guard: an identical deal (same title, customer, owner,
+        # value and stage) created moments ago is the same user action echoing,
+        # not a second deal. Answer 409 with the existing row so the UI keeps
+        # one card. Checked BEFORE number allocation so a refusal never burns
+        # a DEAL number.
+        data = serializer.validated_data
+        recent = Deal.objects.filter(
+            client_id=self.get_client_id(),
+            deleted_at__isnull=True,
+            title=data.get("title"),
+            stage=data.get("stage") or "Draft",
+            value=data.get("value") or 0,
+            party=data.get("party"),
+            owner=data.get("owner"),
+            created_at__gte=timezone.now() - timedelta(minutes=5),
+        ).order_by("-created_at").first()
+        if recent is not None:
+            raise Conflict(
+                f"'{recent.title}' was just created as {recent.deal_number}.",
+                code=Codes.ALREADY_DONE,
+                detail="This looks like the same deal submitted twice.",
+                payload={"dealId": str(recent.id), "dealNumber": recent.deal_number},
+            )
         serializer.validated_data["deal_number"] = allocate_number(
             self.request.user.client, "DEAL"
         )
@@ -794,6 +1123,75 @@ class DealViewSet(TenantModelViewSet):
         serializer.is_valid(raise_exception=True)
         row = serializer.save(deal=deal, actor=request.user)
         return Response(DealActivitySerializer(row).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get", "post"], url_path="lines")
+    def deal_lines(self, request, pk=None):
+        """Priced deliverable lines (the deal workspace Products tab)."""
+        deal = self.get_object()
+        if request.method == "GET":
+            rows = deal.lines.filter(deleted_at__isnull=True)
+            return Response(envelope(DealLineSerializer(rows, many=True).data))
+        serializer = DealLineSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        row = serializer.save(client_id=request.client_id, deal=deal)
+        return Response(
+            DealLineSerializer(row, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(
+        detail=True,
+        methods=["patch", "delete"],
+        url_path=r"lines/(?P<line_id>[^/.]+)",
+    )
+    def deal_line_detail(self, request, pk=None, line_id=None):
+        deal = self.get_object()
+        row = deal.lines.filter(pk=line_id, deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound("That deal line no longer exists.")
+        if request.method == "DELETE":
+            row.soft_delete(request.user)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = DealLineSerializer(
+            row, data=request.data, partial=True, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(
+            DealLineSerializer(row, context=self.get_serializer_context()).data
+        )
+
+    @action(detail=True, methods=["get", "post"], url_path="documents")
+    def deal_documents(self, request, pk=None):
+        """Files pinned to a deal (bytes live in ``core.File``)."""
+        deal = self.get_object()
+        if request.method == "GET":
+            rows = deal.documents.filter(deleted_at__isnull=True)
+            return Response(envelope(DealDocumentSerializer(rows, many=True).data))
+        serializer = DealDocumentSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        row = serializer.save(client_id=request.client_id, deal=deal)
+        return Response(
+            DealDocumentSerializer(row, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(
+        detail=True,
+        methods=["delete"],
+        url_path=r"documents/(?P<document_id>[^/.]+)",
+    )
+    def deal_document_detail(self, request, pk=None, document_id=None):
+        deal = self.get_object()
+        row = deal.documents.filter(pk=document_id, deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound("That document no longer exists.")
+        row.soft_delete(request.user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["get", "post"])
     def tasks(self, request, pk=None):

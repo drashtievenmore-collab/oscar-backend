@@ -207,6 +207,15 @@ class ItemCategory(TenantModel, LegacyIdMixin):
     #: api.md §4.2 -- the HSN default for this family, resolved on item create.
     default_hsn_code = models.TextField(null=True, blank=True)
 
+    parent = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="children"
+    )
+    is_active = models.BooleanField(default=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
+
     class Meta:
         db_table = "item_categories"
         ordering = ["name"]
@@ -253,8 +262,31 @@ class CategoryCustomField(TenantModel):
 
 
 class Unit(TenantModel):
+    UOM_TYPES = [
+        ("Length", "Length"),
+        ("Weight", "Weight"),
+        ("Roll", "Roll"),
+        ("Piece", "Piece"),
+        ("Area", "Area"),
+        ("Volume", "Volume"),
+        ("Other", "Other"),
+    ]
+
     code = models.TextField()
+    #: The UOM name ("Meter") -- kept as ``label`` because every unit
+    #: dropdown in the app already reads it.
     label = models.TextField()
+    uom_type = models.TextField(choices=UOM_TYPES, default="Length")
+    is_base_unit = models.BooleanField(default=False)
+    decimal_places = models.PositiveSmallIntegerField(default=2)
+    #: How many base units one of this unit is worth (1 CM = 0.01 Meter).
+    conversion_factor = models.DecimalField(max_digits=18, decimal_places=6, default=1)
+    description = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "units"
@@ -278,6 +310,9 @@ class Location(TenantModel, LegacyIdMixin):
     TYPES = [
         ("Warehouse", "Warehouse"),
         ("Zone", "Zone"),
+        ("Godown", "Godown"),
+        ("Rack", "Rack"),
+        ("Bin", "Bin"),
         ("Transit", "Transit"),
         ("Scrap", "Scrap"),
     ]
@@ -289,6 +324,10 @@ class Location(TenantModel, LegacyIdMixin):
         "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="children"
     )
     address = models.JSONField(null=True, blank=True)
+    description = models.TextField(null=True, blank=True)
+    capacity = models.DecimalField(max_digits=18, decimal_places=4, default=0, null=True, blank=True)
+    capacity_uom = models.TextField(default="Meter (m)", null=True, blank=True)
+    manager = models.TextField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
 
     class Meta:
@@ -341,6 +380,168 @@ class Fabric(TenantModel):
 
     def __str__(self):
         return self.name
+
+
+# ---------------------------------------------------------------------------
+# Textile masters (er-diagram.md -- FABRIC_QUALITY, DESIGN, SHADE)
+# ---------------------------------------------------------------------------
+class TextileMaster(TenantModel):
+    """A code + name master row. ``code`` is unique per tenant while live."""
+
+    code = models.TextField()
+    name = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        abstract = True
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_%(class)s_code",
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class FabricType(TextileMaster):
+    """Fabric type / classification (Grey, Finished, Knitted, Woven, ...)."""
+
+    PROCESS_STAGES = [
+        ("Grey", "Grey"),
+        ("Dyed", "Dyed"),
+        ("Printed", "Printed"),
+        ("Finished", "Finished"),
+    ]
+
+    #: The fabric condition this type describes -- drives the stage badge.
+    process_stage = models.TextField(choices=PROCESS_STAGES, default="Grey")
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
+
+    class Meta(TextileMaster.Meta):
+        db_table = "fabric_types"
+
+
+class FabricQuality(TextileMaster):
+    """A tradeable grey quality: the spec a lot is bought and sold against."""
+
+    fabric = models.ForeignKey(
+        Fabric, null=True, blank=True, on_delete=models.SET_NULL, related_name="qualities"
+    )
+    fabric_type = models.ForeignKey(
+        FabricType, null=True, blank=True, on_delete=models.SET_NULL, related_name="qualities"
+    )
+    composition = models.TextField(null=True, blank=True)
+    uom = models.ForeignKey(
+        "masters.Unit", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_qualities"
+    )
+    #: Width in inches, the way grey fabric is traded.
+    width = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    gsm = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    reed = models.IntegerField(null=True, blank=True)
+    pick = models.IntegerField(null=True, blank=True)
+    warp_count = models.TextField(null=True, blank=True)
+    weft_count = models.TextField(null=True, blank=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
+
+    class Meta(TextileMaster.Meta):
+        db_table = "fabric_qualities"
+
+
+class Design(TextileMaster):
+    PATTERN_TYPES = [
+        ("Printed", "Printed"),
+        ("Yarn Dyed", "Yarn Dyed"),
+        ("Jacquard", "Jacquard"),
+        ("Dobby", "Dobby"),
+        ("Solid", "Solid"),
+        ("Embroidered", "Embroidered"),
+        ("Other", "Other"),
+    ]
+
+    pattern_type = models.TextField(choices=PATTERN_TYPES, null=True, blank=True)
+    #: Season or collection the design belongs to (Summer 2025, Regular, ...).
+    season = models.TextField(null=True, blank=True)
+    #: Buyer / mill reference number for the design.
+    reference = models.TextField(null=True, blank=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+
+    class Meta(TextileMaster.Meta):
+        db_table = "designs"
+
+
+class Shade(TextileMaster):
+    COLOUR_TYPES = [
+        ("Solid", "Solid"),
+        ("Melange", "Melange"),
+        ("Heather", "Heather"),
+        ("Printed", "Printed"),
+        ("Yarn Dyed", "Yarn Dyed"),
+        ("Other", "Other"),
+    ]
+
+    colour_type = models.TextField(choices=COLOUR_TYPES, default="Solid", null=True, blank=True)
+    pantone_reference = models.TextField(null=True, blank=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
+    #: ``#RRGGBB`` swatch shown next to the shade name.
+    hex_color = models.TextField(null=True, blank=True)
+
+    class Meta(TextileMaster.Meta):
+        db_table = "shades"
+
+
+class FabricVariant(TextileMaster):
+    """A sellable fabric item: one quality in one design and one shade.
+
+    Design and shade are optional -- plain grey stock is a quality alone.
+    Width and GSM are read from the quality, never copied, so a corrected
+    quality spec reaches every variant.
+    """
+
+    quality = models.ForeignKey(FabricQuality, on_delete=models.PROTECT, related_name="variants")
+    design = models.ForeignKey(
+        Design, null=True, blank=True, on_delete=models.PROTECT, related_name="variants"
+    )
+    shade = models.ForeignKey(
+        Shade, null=True, blank=True, on_delete=models.PROTECT, related_name="variants"
+    )
+    uom = models.ForeignKey(
+        "masters.Unit", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_variants"
+    )
+    hsn_code = models.TextField(null=True, blank=True)
+    fabric_type = models.TextField(null=True, blank=True)
+    construction = models.TextField(null=True, blank=True)
+    image_url = models.TextField(null=True, blank=True)
+    #: Standard selling rate per UOM.
+    rate = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+
+    class Meta(TextileMaster.Meta):
+        db_table = "fabric_variants"
+        constraints = TextileMaster.Meta.constraints + [
+            models.UniqueConstraint(
+                fields=["client", "quality", "design", "shade"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_fabricvariant_combo",
+            ),
+        ]
 
 
 class Item(TenantModel, LegacyIdMixin):

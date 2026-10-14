@@ -160,34 +160,184 @@ class EmployeeViewSet(TenantModelViewSet):
             exited=Count("id", filter=Q(status__in=["Resigned", "Terminated"])),
         )
 
+    @staticmethod
+    def _normalize_employee_payload(raw, client_id, user):
+        """Accept the drawer's flat labels, not just FK ids.
+
+        The directory posts `department`/`designation`/`location` names and
+        `joiningDate`; the serializer's writable keys are the `…Id` FKs plus
+        `joining`. Without this the names are ignored (read-only) and the
+        create 400s on a missing `joining`.
+        """
+        data = dict(raw)
+        by_user = user if getattr(user, "is_authenticated", False) else None
+
+        def resolve(model, name, extra=None):
+            label = str(name or "").strip()
+            if not label:
+                return None
+            row = model.objects.filter(
+                client_id=client_id, name__iexact=label, deleted_at__isnull=True
+            ).first()
+            if row is None:
+                row = model.objects.create(
+                    client_id=client_id, name=label, created_by=by_user,
+                    **(extra or {}),
+                )
+            return str(row.id)
+
+        if not data.get("departmentId") and not data.get("department_id"):
+            name = data.get("department") or data.get("dept")
+            resolved = resolve(Department, name)
+            if resolved:
+                data["departmentId"] = resolved
+        if not data.get("designationId") and not data.get("designation_id"):
+            name = data.get("designation") or data.get("role")
+            resolved = resolve(Designation, name)
+            if resolved:
+                data["designationId"] = resolved
+        if not data.get("locationId") and not data.get("location_id"):
+            resolved = resolve(Location, data.get("location"))
+            if resolved:
+                data["locationId"] = resolved
+        if not data.get("joining") and data.get("joiningDate") is None and data.get("joining_date") is None:
+            # A display string (`Mar 15, 2022`) or nothing — serializer
+            # defaults to today; drop unparsable text instead of 400ing.
+            text = data.get("doj") or data.get("date")
+            if text:
+                data["joining"] = text
+        # Read-only display keys must not reach validation as unknowns.
+        for key in ("dept", "role", "doj", "date", "img", "empId", "id"):
+            data.pop(key, None)
+        return data
+
+    def create(self, request, *args, **kwargs):
+        raw = request.data.dict() if hasattr(request.data, "dict") else dict(request.data)
+        data = self._normalize_employee_payload(raw, self.get_client_id(), request.user)
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        instance = self.get_object()
+        raw = request.data.dict() if hasattr(request.data, "dict") else dict(request.data)
+        data = self._normalize_employee_payload(raw, self.get_client_id(), request.user)
+        serializer = self.get_serializer(instance, data=data, partial=partial or request.method == "PATCH")
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return Response(serializer.data)
+
     def perform_create(self, serializer):
         serializer.validated_data["employee_code"] = allocate_number(
             self.request.user.client, "EMP"
         )
         employee = super().perform_create(serializer)
+        self._ensure_user_for_employee(
+            employee, self.get_client_id(), actor=self.request.user
+        )
+        return employee
 
-        # api.md §11.1 -- "also provisions a user account when asked".
-        if self.request.data.get("createUserAccount") and employee.email:
+    @staticmethod
+    def _ensure_user_for_employee(employee, client_id, actor=None):
+        """Keep the Administration -> Users row in step with the employee row.
+
+        The employee record is the source of truth for who someone is and what
+        they do; the user row is the login that goes with it. So a create
+        *and* an edit both land here: existing accounts are re-pointed at the
+        employee and have their identity fields refreshed, and an employee with
+        no account yet gets one. Matching is by email, which is what makes the
+        create path idempotent -- re-saving an employee never makes a second
+        login.
+        """
+        if not employee or not employee.email:
+            return None
+        from apps.accounts.models import User
+
+        email = str(employee.email).lower().strip()
+        if not email:
+            return None
+        department = employee.department.name if employee.department_id else None
+        existing = User.objects.filter(
+            client_id=client_id, email=email, deleted_at__isnull=True
+        ).first()
+        if existing is not None:
+            updates = []
+            if existing.employee_id is None:
+                existing.employee = employee
+                updates.append("employee")
+            # An admin editing the login row must not freeze the person's name
+            # in place of the HR record -- the next employee edit carries the
+            # truth back. A blank user field always yields to the employee.
+            for field, value in (
+                ("name", employee.name),
+                ("phone", employee.phone),
+                ("department", department),
+                ("avatar_url", employee.avatar_url),
+                ("joined_date", employee.joining_date),
+            ):
+                if value and getattr(existing, field) != value:
+                    setattr(existing, field, value)
+                    updates.append(field)
+            if existing.status != "Active" or not existing.is_active:
+                existing.status = "Active"
+                existing.is_active = True
+                updates.extend(["status", "is_active"])
+            if updates:
+                updates.append("updated_at")
+                existing.save(update_fields=list(dict.fromkeys(updates)))
+            return existing
+        user = User.objects.create_user(
+            email=email,
+            client_id=client_id,
+            name=employee.name,
+            phone=employee.phone,
+            employee=employee,
+            department=department,
+            avatar_url=employee.avatar_url,
+            joined_date=employee.joining_date,
+            status="Active",
+        )
+        return user
+
+    def perform_update(self, serializer):
+        employee = super().perform_update(serializer)
+        self._ensure_user_for_employee(
+            employee, self.get_client_id(), actor=self.request.user
+        )
+        return employee
+
+    @action(detail=False, methods=["post"], url_path="backfill-users")
+    @transaction.atomic
+    def backfill_users(self, request):
+        rows = Employee.objects.filter(
+            client_id=request.client_id, deleted_at__isnull=True
+        ).select_related("department")
+        created = linked = skipped = 0
+        for employee in rows:
+            if not employee.email:
+                skipped += 1
+                continue
             from apps.accounts.models import User
 
-            if not User.objects.filter(
-                client_id=self.get_client_id(), email=employee.email.lower(),
-                deleted_at__isnull=True,
-            ).exists():
-                user = User.objects.create_user(
-                    email=employee.email,
-                    client_id=self.get_client_id(),
-                    name=employee.name,
-                    phone=employee.phone,
-                    employee=employee,
-                    department=employee.department.name if employee.department_id else None,
-                    status="Invited",
+            email = str(employee.email).lower().strip()
+            existing = User.objects.filter(
+                client_id=request.client_id, email=email, deleted_at__isnull=True
+            ).first()
+            if existing is None:
+                self._ensure_user_for_employee(
+                    employee, request.client_id, actor=request.user
                 )
-                self.write_audit(
-                    "provision_user", employee,
-                    description=f"User account created for {user.email}",
+                created += 1
+            else:
+                before = (existing.employee_id, existing.status)
+                self._ensure_user_for_employee(
+                    employee, request.client_id, actor=request.user
                 )
-        return employee
+                linked += 1 if before[0] is None or before[1] != "Active" else 0
+        return Response({"created": created, "linked": linked, "skipped": skipped})
 
     @action(detail=True, methods=["post"])
     @transaction.atomic
@@ -998,7 +1148,9 @@ class OnboardingViewSet(TenantModelViewSet):
         candidate.employee = employee
         candidate.stage = "Hired"
         candidate.save(update_fields=["employee", "stage", "updated_at"])
-
+        EmployeeViewSet._ensure_user_for_employee(
+            employee, request.client_id, actor=request.user
+        )
         record_audit(
             client=request.client_id,
             actor=request.user,

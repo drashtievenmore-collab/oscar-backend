@@ -153,7 +153,9 @@ DATABASES = {
         "PASSWORD": env("DB_PASSWORD", "postgres"),
         "HOST": env("DB_HOST", "localhost"),
         "PORT": env("DB_PORT", "5432"),
-        "CONN_MAX_AGE": 60,
+        # The development server creates short-lived request threads; keeping
+        # their connections open can exhaust PostgreSQL's connection limit.
+        "CONN_MAX_AGE": int(env("DB_CONN_MAX_AGE", "0" if DEBUG else "60")),
     }
 }
 
@@ -269,6 +271,24 @@ FILE_DOWNLOAD_TTL_SECONDS = int(env("FILE_DOWNLOAD_TTL_SECONDS", str(7 * 24 * 36
 PUBLIC_SHARE_DEFAULT_EXPIRY_DAYS = 14
 EXCHANGE_RATE_URL = env("EXCHANGE_RATE_URL", "https://open.er-api.com/v6/latest/USD")
 EXCHANGE_RATE_CACHE_SECONDS = 24 * 60 * 60
+
+# --------------------------------------------------------------------------
+# Outbound email (document `/send/` delivery).
+# Unset EMAIL_HOST means email is not configured: `/send/` with
+# channel=email then fails with a clear EMAIL_NOT_CONFIGURED error instead
+# of pretending the message was delivered.
+# --------------------------------------------------------------------------
+EMAIL_BACKEND = env(
+    "EMAIL_BACKEND", "django.core.mail.backends.smtp.EmailBackend"
+)
+EMAIL_HOST = env("EMAIL_HOST", "")
+EMAIL_PORT = int(env("EMAIL_PORT", "587"))
+EMAIL_HOST_USER = env("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", "")
+EMAIL_USE_TLS = env("EMAIL_USE_TLS", "True").strip().lower() in ("1", "true", "yes", "on")
+EMAIL_USE_SSL = env("EMAIL_USE_SSL", "False").strip().lower() in ("1", "true", "yes", "on")
+DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", "")
+EMAIL_TIMEOUT = int(env("EMAIL_TIMEOUT", "20"))
 
 CACHES = {
     "default": {

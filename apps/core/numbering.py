@@ -18,7 +18,6 @@ from .exceptions import Codes, EvenmoreAPIError
 #: (prefix, reset_policy, pad_width, separator)
 SERIES_DEFAULTS = {
     # Sales
-    "EST": ("EST", "fy", 4, "-"),
     "QT": ("QT", "fy", 4, "-"),
     "SO": ("SO", "fy", 4, "-"),
     "PI": ("PI", "fy", 4, "-"),
@@ -40,6 +39,7 @@ SERIES_DEFAULTS = {
     "REQ": ("REQ", "never", 4, "-"),
     "TKT": ("TKT", "never", 4, "-"),
     "AUD": ("AUD", "fy", 4, "-"),
+    "TAK": ("TAK", "never", 6, "-"),
     # Accounts
     "JE": ("JE", "fy", 3, "-"),
     # PMS -- calendar year, three digits: PRJ-2026-001

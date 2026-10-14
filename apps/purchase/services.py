@@ -27,6 +27,7 @@ from apps.core.exceptions import (
 from apps.core.money import ZERO, D, ROUNDING_TOLERANCE, round2, round4
 from apps.core.numbering import allocate_number
 from apps.inventory import services as stock
+from apps.masters import uom
 from apps.sales.services import (
     allocated_to,
     assert_no_dependents,
@@ -319,6 +320,10 @@ def _create_goods_receipt(bill, lines, location_id, qc_status, *, user=None):
                 purchase_order_line=line.purchase_order_line,
                 purchase_bill_line=line,
                 item=line.item,
+                uom=line.uom,
+                uom_factor=line.uom_factor or 1,
+                stock_uom=line.item.uom,
+                stock_qty=round4(uom.to_stock_qty(line.received_qty, line.uom_factor)),
                 ordered_qty=line.qty,
                 received_qty=line.received_qty,
                 weighed_qty=line.received_weight,
@@ -338,18 +343,22 @@ def _post_receipt_stock(bill, lines, location_id, overrides, receipt, *, user=No
     for line in lines:
         if line.item_id is None or not line.item.holds_stock:
             continue
-        quantity = D(line.received_qty)
+        # received_qty is in the purchase unit; stock is kept in the item's unit.
+        factor = D(line.uom_factor or 1)
+        quantity = uom.to_stock_qty(line.received_qty, factor)
         if quantity <= ZERO:
             continue
 
         movement = stock.post_movement(
             client_id=bill.client_id,
-            item=line.item_id,
+            item=line.item,
             location=location_id,
             type="PURCHASE",
             quantity=quantity,
             weighed_qty=line.received_weight if line.is_weight_item else None,
-            unit_cost=line.landed_unit_cost,
+            unit_cost=(
+                D(line.landed_unit_cost) / factor if line.landed_unit_cost is not None else None
+            ),
             reference_type="PurchaseBill",
             reference_id=bill.id,
             reference_number=bill.bill_number,
@@ -368,6 +377,104 @@ def _post_receipt_stock(bill, lines, location_id, overrides, receipt, *, user=No
                 bill.client_id, line.item, serial_numbers, location_id, movement,
                 line.batch_number,
             )
+
+        # Auto-create or link Lot / Taka record for received fabric or batch items
+        _register_lot_taka_on_receipt(bill, line, location_id, receipt, movement, override=override)
+
+
+def _register_lot_taka_on_receipt(bill, line, location_id, receipt, movement, override=None):
+    """Auto-create or link LotTaka records for received fabric or batch items."""
+    from apps.core.numbering import allocate_number
+    from apps.inventory.models import LotTaka
+
+    # Check if LotTaka already exists for this movement / GRN line (prevents duplicates on edit/retry)
+    if movement and LotTaka.objects.filter(
+        client_id=bill.client_id,
+        stock_movement=movement,
+        deleted_at__isnull=True,
+    ).exists():
+        return
+
+    is_fabric = (
+        getattr(line.item, "item_kind", None) == "Fabric"
+        or bool(getattr(line.item, "fabric_quality", None))
+        or (getattr(line.item, "sku", "") or "").startswith("FAB-")
+        or getattr(line.item, "tracking_mode", None) in ("Batch", "Serial")
+    )
+    if not is_fabric and not line.batch_number and not getattr(line.item, "fabric_quality", None):
+        return
+
+    lot_num = line.batch_number or f"LOT-{receipt.grn_number}"
+    received_quantity = uom.to_stock_qty(line.received_qty, line.uom_factor or 1)
+
+    qc_st = (
+        "Passed" if receipt.qc_status == "Approved"
+        else "Rejected" if receipt.qc_status == "Rejected"
+        else "On Hold" if receipt.qc_status == "On Hold"
+        else "Pending"
+    )
+
+    override = override or {}
+    takas_spec = override.get("takas") or override.get("rolls") or []
+
+    if takas_spec:
+        for idx, spec in enumerate(takas_spec):
+            taka_code = allocate_number(bill.client, "TAK")
+            spec_roll = str(spec.get("takaRoll") or spec.get("taka_number") or (idx + 1))
+            spec_qty = Decimal(str(spec.get("qty") or spec.get("quantity") or received_quantity))
+            LotTaka.objects.create(
+                client=bill.client,
+                taka_id=taka_code,
+                lot_number=lot_num,
+                taka_number=spec_roll,
+                item=line.item,
+                supplier=bill.party,
+                source_document_type="GRN",
+                source_document_number=receipt.grn_number,
+                source_document_id=receipt.id,
+                location_id=location_id,
+                received_date=receipt.receipt_date or timezone.localdate(),
+                received_quantity=spec_qty,
+                available_quantity=spec_qty,
+                uom=getattr(line, "stock_uom", None) or getattr(line.item, "uom", None) or getattr(line, "uom", None) or "m",
+                qc_status=qc_st,
+                status="Active",
+                barcode=taka_code,
+                tag_status="Pending",
+                print_count=0,
+                rate=line.landed_unit_cost or line.base_unit_cost or getattr(line, "rate", 0) or 0,
+                stock_movement=movement,
+            )
+    else:
+        existing_count = LotTaka.objects.filter(
+            client_id=bill.client_id, lot_number=lot_num, deleted_at__isnull=True
+        ).count()
+        taka_num = str(existing_count + 1)
+        taka_code = allocate_number(bill.client, "TAK")
+
+        LotTaka.objects.create(
+            client=bill.client,
+            taka_id=taka_code,
+            lot_number=lot_num,
+            taka_number=taka_num,
+            item=line.item,
+            supplier=bill.party,
+            source_document_type="GRN",
+            source_document_number=receipt.grn_number,
+            source_document_id=receipt.id,
+            location_id=location_id,
+            received_date=receipt.receipt_date or timezone.localdate(),
+            received_quantity=received_quantity,
+            available_quantity=received_quantity,
+            uom=getattr(line, "stock_uom", None) or getattr(line.item, "uom", None) or getattr(line, "uom", None) or "m",
+            qc_status=qc_st,
+            status="Active",
+            barcode=taka_code,
+            tag_status="Pending",
+            print_count=0,
+            rate=line.landed_unit_cost or line.base_unit_cost or getattr(line, "rate", 0) or 0,
+            stock_movement=movement,
+        )
 
 
 def _register_serials(client_id, item, serial_numbers, location_id, movement, batch_number):
@@ -410,8 +517,13 @@ def _bump_po_received(lines):
         po_line = PurchaseOrderLine.objects.select_for_update().get(
             pk=line.purchase_order_line_id
         )
-        po_line.received_qty = round4(D(po_line.received_qty) + D(line.received_qty))
-        po_line.billed_qty = round4(D(po_line.billed_qty) + D(line.qty))
+        # The bill may be in another (compatible) unit than the order.
+        po_line.received_qty = round4(
+            D(po_line.received_qty) + uom.between_lines(line.received_qty, line, po_line)
+        )
+        po_line.billed_qty = round4(
+            D(po_line.billed_qty) + uom.between_lines(line.qty, line, po_line)
+        )
         po_line.save(update_fields=["received_qty", "billed_qty", "updated_at"])
 
 

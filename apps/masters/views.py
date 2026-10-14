@@ -14,10 +14,15 @@ from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
 from apps.core.viewsets import TenantModelViewSet
 from apps.inventory import services as stock
+from apps.masters import uom
 
 from .models import (
     CategoryPart,
+    Design,
     Fabric,
+    FabricQuality,
+    FabricType,
+    FabricVariant,
     Item,
     ItemCategory,
     ItemPart,
@@ -25,11 +30,16 @@ from .models import (
     Location,
     Party,
     PartyContact,
+    Shade,
     Unit,
 )
 from .serializers import (
     CategoryPartSerializer,
+    DesignSerializer,
+    FabricQualitySerializer,
     FabricSerializer,
+    FabricTypeSerializer,
+    FabricVariantSerializer,
     ImportRowsSerializer,
     ItemCategorySerializer,
     ItemPartSerializer,
@@ -38,6 +48,7 @@ from .serializers import (
     LocationSerializer,
     PartyContactSerializer,
     PartySerializer,
+    ShadeSerializer,
     UnitSerializer,
 )
 
@@ -95,10 +106,20 @@ class PartyViewSet(TenantModelViewSet):
 
     @action(detail=False, methods=["get"])
     def customers(self, request):
-        """``type in (Customer, Both)``."""
-        queryset = self.filter_queryset(self.get_queryset()).filter(
-            type__in=["Customer", "Both"]
-        )
+        """``type in (Customer, Both)`` -- the one customer list.
+
+        Also what Administration -> Clients reads, so the admin screen and the
+        Parties module can never disagree about who the customers are. The
+        ``lead_count`` annotation says which of these arrived through a lead
+        conversion (db.md §4.1: a converted lead creates the Customer row).
+        """
+        queryset = self.filter_queryset(
+            self.get_queryset().annotate(
+                lead_count=Count(
+                    "leads", filter=Q(leads__deleted_at__isnull=True), distinct=True
+                )
+            )
+        ).filter(type__in=["Customer", "Both"])
         page = self.paginate_queryset(queryset)
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
 
@@ -729,14 +750,19 @@ def _import_rows(request, rows, dry_run, serializer_class, model, required=()):
 # Categories, units, locations (api.md §4.3)
 # ---------------------------------------------------------------------------
 class ItemCategoryViewSet(TenantModelViewSet):
-    queryset = ItemCategory.objects.prefetch_related("custom_fields")
+    queryset = ItemCategory.objects.select_related("parent", "created_by", "updated_by", "image_file").prefetch_related("custom_fields")
     serializer_class = ItemCategorySerializer
     audit_entity_type = "ItemCategory"
     audit_label_field = "name"
-    search_fields = ["name", "code", "description"]
-    ordering = ["name"]
+    search_fields = ["name", "code", "description", "parent__name", "parent__code"]
+    ordering = ["code", "name"]
     status_field = None
-    filter_map = {"kind": "kind"}
+    filter_map = {
+        "kind": "kind",
+        "isActive": "is_active",
+        "is_active": "is_active",
+        "parentId": "parent_id",
+    }
 
     def get_queryset(self):
         return super().get_queryset().annotate(
@@ -778,13 +804,37 @@ class ItemCategoryViewSet(TenantModelViewSet):
 
 
 class UnitViewSet(TenantModelViewSet):
-    queryset = Unit.objects.all()
+    queryset = Unit.objects.select_related("image_file")
     serializer_class = UnitSerializer
     audit_entity_type = "Unit"
     audit_label_field = "code"
-    search_fields = ["code", "label"]
+    search_fields = ["code", "label", "uom_type", "description"]
     ordering = ["code"]
     status_field = None
+    filter_map = {
+        "isActive": "is_active",
+        "is_active": "is_active",
+        "uomType": "uom_type",
+        "isBaseUnit": "is_base_unit",
+    }
+
+    def check_delete_allowed(self, unit):
+        client_id = self.get_client_id()
+        count = (
+            FabricQuality.objects.filter(client_id=client_id, uom=unit, deleted_at__isnull=True).count()
+            + FabricVariant.objects.filter(client_id=client_id, uom=unit, deleted_at__isnull=True).count()
+        )
+        usage = uom.item_unit_usage(client_id, unit)
+        total = count + usage["items"] + usage["documentLines"]
+        if total:
+            # History keeps the unit by its code -- deleting it would orphan
+            # those records. Inactivating hides it from new entries instead.
+            raise Conflict(
+                f"{unit.code} is used by {count} fabric master(s), {usage['items']} item(s) "
+                f"and {usage['documentLines']} document line(s). Mark it Inactive instead.",
+                code="UNIT_IN_USE",
+                payload={"usageCount": total, "fabricMasters": count, **usage},
+            )
 
 
 class LocationViewSet(TenantModelViewSet):
@@ -792,10 +842,326 @@ class LocationViewSet(TenantModelViewSet):
     serializer_class = LocationSerializer
     audit_entity_type = "Location"
     audit_label_field = "name"
-    search_fields = ["name", "code"]
+    search_fields = ["name", "code", "manager", "description"]
     ordering = ["name"]
     status_field = None
-    filter_map = {"type": "type", "isActive": "is_active"}
+    filter_map = {"type": "type", "isActive": "is_active", "is_active": "is_active", "parent": "parent"}
+
+    def perform_destroy(self, instance):
+        client_id = self.get_client_id()
+        children_count = Location.objects.filter(
+            client_id=client_id, parent=instance, deleted_at__isnull=True
+        ).count()
+        if children_count > 0:
+            raise Conflict(
+                f"Cannot delete location '{instance.name}' because it has {children_count} child location(s). Reassign or delete child locations first.",
+                code="LOCATION_HAS_CHILDREN",
+                payload={"childCount": children_count},
+            )
+
+        from apps.inventory.models import StockBalance, StockMovement, LotTaka
+        stock_on_hand = StockBalance.objects.filter(
+            client_id=client_id, location=instance, on_hand__gt=0
+        ).aggregate(total=Sum("on_hand"))["total"] or 0
+        if stock_on_hand > 0:
+            raise Conflict(
+                f"Cannot delete location '{instance.name}' because it currently holds {stock_on_hand} units of stock. Transfer stock out before deleting.",
+                code="LOCATION_HAS_STOCK",
+                payload={"onHand": float(stock_on_hand)},
+            )
+
+        has_movements = StockMovement.objects.filter(
+            client_id=client_id, location=instance
+        ).exists()
+        has_takas = LotTaka.objects.filter(
+            client_id=client_id, location=instance, deleted_at__isnull=True
+        ).exists()
+        if has_movements or has_takas:
+            raise Conflict(
+                f"Cannot delete location '{instance.name}' because it has historical inventory transactions or lot/takas. Deactivate the location instead to preserve stock ledger traceability.",
+                code="LOCATION_HAS_HISTORY",
+            )
+        super().perform_destroy(instance)
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        client_id = self.get_client_id()
+        locs = Location.objects.filter(client_id=client_id, deleted_at__isnull=True)
+        active_locs = locs.filter(is_active=True)
+
+        total_warehouses = active_locs.filter(type="Warehouse").count()
+        total_locations = active_locs.count()
+        total_racks = active_locs.filter(type="Rack").count()
+        total_bins = active_locs.filter(type="Bin").count()
+
+        from apps.inventory.models import StockBalance
+        loc_ids_with_stock = set(
+            StockBalance.objects.filter(
+                client_id=client_id, on_hand__gt=0
+            ).values_list("location_id", flat=True).distinct()
+        )
+        locations_with_stock = active_locs.filter(id__in=loc_ids_with_stock).count()
+        empty_locations = max(0, total_locations - locations_with_stock)
+
+        total_capacity = active_locs.aggregate(total=Sum("capacity"))["total"] or Decimal("0")
+        total_used = StockBalance.objects.filter(
+            client_id=client_id, on_hand__gt=0
+        ).aggregate(total=Sum("on_hand"))["total"] or Decimal("0")
+
+        capacity_utilization = round((float(total_used) / float(total_capacity)) * 100, 1) if total_capacity > 0 else 0.0
+
+        return Response({
+            "total_warehouses": total_warehouses,
+            "total_locations": total_locations,
+            "total_racks": total_racks,
+            "total_bins": total_bins,
+            "locations_with_stock": locations_with_stock,
+            "empty_locations": empty_locations,
+            "total_capacity": float(total_capacity),
+            "total_used": float(total_used),
+            "capacity_utilization": capacity_utilization,
+        })
+
+    @action(detail=False, methods=["get"])
+    def hierarchy(self, request):
+        from .serializers import get_location_descendant_ids
+        from apps.inventory.models import StockBalance
+        client_id = self.get_client_id()
+        locs = list(Location.objects.filter(client_id=client_id, deleted_at__isnull=True).order_by("name"))
+
+        tree = []
+        loc_map = {}
+        for loc in locs:
+            all_ids = [loc.id] + list(get_location_descendant_ids(loc))
+            used = StockBalance.objects.filter(
+                client_id=client_id, location_id__in=all_ids, on_hand__gt=0
+            ).aggregate(total=Sum("on_hand"))["total"] or 0
+            cap = float(loc.capacity or 0)
+            util = round((float(used) / cap) * 100, 1) if cap > 0 else 0.0
+
+            loc_data = {
+                "id": str(loc.id),
+                "code": loc.code,
+                "name": loc.name,
+                "type": loc.type,
+                "parent_id": str(loc.parent_id) if loc.parent_id else None,
+                "capacity": cap,
+                "used_quantity": float(used),
+                "utilization_pct": util,
+                "is_active": loc.is_active,
+                "children": [],
+            }
+            loc_map[str(loc.id)] = loc_data
+
+        for loc_id, node in loc_map.items():
+            pid = node["parent_id"]
+            if pid and pid in loc_map:
+                loc_map[pid]["children"].append(node)
+            else:
+                tree.append(node)
+
+        return Response({"tree": tree, "total_nodes": len(locs)})
+
+    @action(detail=True, methods=["get"])
+    def details(self, request, pk=None):
+        from .serializers import get_location_descendant_ids
+        from apps.inventory.models import StockBalance, StockMovement, LotTaka
+        loc = self.get_object()
+        client_id = self.get_client_id()
+        all_ids = [loc.id] + list(get_location_descendant_ids(loc))
+
+        balances = StockBalance.objects.filter(
+            client_id=client_id, location_id__in=all_ids, on_hand__gt=0
+        ).select_related("item", "location")
+
+        item_rows = []
+        for b in balances:
+            lot_count = LotTaka.objects.filter(
+                client_id=client_id, item_id=b.item_id, location_id__in=all_ids, deleted_at__isnull=True, status="Active"
+            ).count()
+            first_taka = LotTaka.objects.filter(
+                client_id=client_id, item_id=b.item_id, location_id__in=all_ids, deleted_at__isnull=True, status="Active"
+            ).first()
+            item_rows.append({
+                "item_id": str(b.item_id),
+                "item_code": b.item.sku or b.item.code or f"ITM-{b.item.id}",
+                "item_name": b.item.name,
+                "fabric_quality": getattr(b.item, "fabric_quality", "") or "",
+                "design": getattr(b.item, "fabric_design", "") or "",
+                "shade": getattr(b.item, "fabric_color", "") or "",
+                "lot_number": first_taka.lot_number if first_taka else "-",
+                "lot_taka_count": lot_count,
+                "quantity": float(b.on_hand),
+                "uom": b.item.uom or "m",
+                "location_code": b.location.code,
+            })
+
+        takas = LotTaka.objects.filter(
+            client_id=client_id, location_id__in=all_ids, deleted_at__isnull=True
+        ).select_related("item", "location").order_by("-received_date", "-created_at")[:50]
+
+        taka_rows = [{
+            "id": str(t.id),
+            "taka_id": t.taka_id or f"TAK-{t.taka_number}",
+            "lot_number": t.lot_number,
+            "taka_number": t.taka_number,
+            "item_code": t.item.sku or t.item.code,
+            "item_name": t.item.name,
+            "quantity": float(t.available_quantity or t.received_quantity),
+            "uom": t.uom or "m",
+            "qc_status": t.qc_status,
+            "barcode": t.barcode or t.taka_id,
+            "tag_status": t.tag_status,
+            "location_code": t.location.code if t.location else loc.code,
+            "received_date": t.received_date.isoformat() if t.received_date else None,
+        } for t in takas]
+
+        movements = StockMovement.objects.filter(
+            client_id=client_id, location_id__in=all_ids
+        ).select_related("item", "created_by").order_by("-movement_date", "-created_at")[:30]
+
+        tx_rows = [{
+            "id": str(m.id),
+            "movement_date": m.movement_date.isoformat() if m.movement_date else None,
+            "type": m.type,
+            "reference_type": m.reference_type,
+            "reference_number": m.reference_number or "-",
+            "item_code": m.item.sku or m.item.code,
+            "item_name": m.item.name,
+            "quantity": float(m.quantity),
+            "user_name": (getattr(m.created_by, "name", None) or m.created_by.get_username()) if m.created_by else "System",
+            "notes": m.notes,
+        } for m in movements]
+
+        used_qty = sum(r["quantity"] for r in item_rows)
+        capacity = float(loc.capacity or 0)
+        avail = max(0.0, capacity - used_qty) if capacity > 0 else 0.0
+        util_pct = round((used_qty / capacity) * 100, 1) if capacity > 0 else 0.0
+
+        serializer = self.get_serializer(loc)
+        return Response({
+            "location": serializer.data,
+            "stock_by_item": item_rows,
+            "lot_takas": taka_rows,
+            "transactions": tx_rows,
+            "utilization": {
+                "capacity": capacity,
+                "used": used_qty,
+                "available": avail,
+                "utilization_pct": util_pct,
+            }
+        })
+
+
+class TextileMasterViewSet(TenantModelViewSet):
+    """CRUD for the code + name textile masters."""
+
+    audit_label_field = "name"
+    search_fields = ["name", "code", "description"]
+    ordering = ["name"]
+    status_field = None
+    filter_map = {"isActive": "is_active", "is_active": "is_active"}
+
+
+class VariantPartViewSet(TextileMasterViewSet):
+    """A master that fabric items point at: archiving it while a live fabric
+    item still uses it would leave that item describing nothing."""
+
+    variant_field = None
+
+    def check_delete_allowed(self, part):
+        count = FabricVariant.objects.filter(
+            client_id=self.get_client_id(), deleted_at__isnull=True, **{self.variant_field: part}
+        ).count()
+        if count:
+            raise Conflict(
+                f"{part.name} is used by {count} fabric item(s).",
+                code=f"{self.audit_entity_type.upper()}_IN_USE",
+                payload={"variantCount": count},
+            )
+
+
+class FabricTypeViewSet(TextileMasterViewSet):
+    queryset = FabricType.objects.select_related("image_file")
+    serializer_class = FabricTypeSerializer
+    audit_entity_type = "FabricType"
+    search_fields = TextileMasterViewSet.search_fields + ["process_stage"]
+    ordering = ["code"]
+    filter_map = {
+        **TextileMasterViewSet.filter_map,
+        "processStage": "process_stage",
+    }
+
+    def check_delete_allowed(self, fabric_type):
+        count = FabricQuality.objects.filter(
+            client_id=self.get_client_id(), fabric_type=fabric_type, deleted_at__isnull=True
+        ).count()
+        if count:
+            raise Conflict(
+                f"{fabric_type.name} is used by {count} quality record(s).",
+                code="FABRIC_TYPE_IN_USE",
+                payload={"qualityCount": count},
+            )
+
+
+class FabricQualityViewSet(VariantPartViewSet):
+    variant_field = "quality"
+    queryset = FabricQuality.objects.select_related("fabric", "fabric_type", "uom")
+    serializer_class = FabricQualitySerializer
+    audit_entity_type = "FabricQuality"
+    search_fields = ["name", "code", "description", "composition"]
+    filter_map = {
+        **TextileMasterViewSet.filter_map,
+        "fabricId": "fabric_id",
+        "fabricTypeId": "fabric_type_id",
+        "uomId": "uom_id",
+    }
+
+
+class DesignViewSet(VariantPartViewSet):
+    variant_field = "design"
+    queryset = Design.objects.select_related("image_file")
+    serializer_class = DesignSerializer
+    audit_entity_type = "Design"
+    search_fields = TextileMasterViewSet.search_fields + ["pattern_type", "season", "reference"]
+    filter_map = {
+        **TextileMasterViewSet.filter_map,
+        "patternType": "pattern_type",
+        "season": "season",
+    }
+
+
+class ShadeViewSet(VariantPartViewSet):
+    variant_field = "shade"
+    queryset = Shade.objects.select_related("image_file")
+    serializer_class = ShadeSerializer
+    audit_entity_type = "Shade"
+    search_fields = TextileMasterViewSet.search_fields + ["colour_type", "pantone_reference"]
+    filter_map = {
+        **TextileMasterViewSet.filter_map,
+        "colourType": "colour_type",
+    }
+
+
+class FabricVariantViewSet(TextileMasterViewSet):
+    """Fabric item / variant master -- ``/inventory/fabric-variants/``."""
+
+    queryset = FabricVariant.objects.select_related(
+        "quality", "quality__uom", "design", "shade", "uom", "image_file"
+    )
+    serializer_class = FabricVariantSerializer
+    search_fields = TextileMasterViewSet.search_fields + [
+        "hsn_code", "quality__name", "quality__code", "design__name", "design__code",
+        "shade__name", "shade__code", "fabric_type", "construction",
+    ]
+    filter_map = {
+        **TextileMasterViewSet.filter_map,
+        "qualityId": "quality_id",
+        "designId": "design_id",
+        "shadeId": "shade_id",
+        "fabricType": "fabric_type",
+        "construction": "construction",
+    }
 
 
 class FabricViewSet(TenantModelViewSet):

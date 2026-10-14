@@ -185,7 +185,8 @@ class GoodsReceiptLineSerializer(BaseModelSerializer):
     class Meta:
         model = GoodsReceiptLine
         fields = [
-            "id", "itemId", "sku", "itemName", "ordered_qty", "received_qty",
+            "id", "itemId", "sku", "itemName", "uom", "uom_factor", "stock_uom", "stock_qty",
+            "ordered_qty", "received_qty",
             "weighed_qty", "rejected_qty", "batch_number", "unit_cost",
             "variation_pct",
         ]
