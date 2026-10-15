@@ -155,12 +155,13 @@ def receive_bill_goods(bill, *, lines_payload, qc_status=None, user=None, locati
             if variation is not None and abs(variation) > tolerance:
                 variance_breach = True
 
-    # api.md §6.3: a breach overrides whatever qcStatus the user submitted.
-    final_qc = qc_status or "Approved"
+    # Phase 1.4: received goods wait at QC Hold until QC passes them, so the
+    # default is "Pending Approval", never an implicit "Approved".
+    # api.md §6.3: a weight-variance breach overrides whatever was submitted.
+    final_qc = qc_status or "Pending Approval"
     if variance_breach:
         final_qc = "Pending Approval"
-    if final_qc not in [value for value, _ in [(s, s) for s in
-                        ("Approved", "Pending Approval", "Rejected", "Rework")]]:
+    if final_qc not in ("Approved", "Pending Approval", "Rejected", "Rework"):
         raise ValidationFailed(
             "Unknown QC status.",
             field_errors={"qcStatus": ["Expected Approved, Pending Approval, Rejected or Rework."]},
@@ -209,10 +210,19 @@ def receive_bill_goods(bill, *, lines_payload, qc_status=None, user=None, locati
     _bump_po_received(lines)
     ledger.recalculate_party_balance(bill.client_id, bill.party_id)
 
+    # Stock was posted to QC Hold above. A verdict given at receipt time is a
+    # QC decision like any other: it moves the goods out with real movements.
+    if final_qc != "Pending Approval":
+        from apps.inventory import qc as qc_service
+
+        qc_service.dispose_all(receipt, final_qc, user=user, note=None)
+        receipt.refresh_from_db()
+        bill.refresh_from_db()
+
     return {
         "bill": bill,
         "receipt": receipt,
-        "qcStatus": final_qc,
+        "qcStatus": bill.qc_status,
         "varianceBreach": variance_breach,
     }
 
@@ -308,8 +318,10 @@ def _create_goods_receipt(bill, lines, location_id, qc_status, *, user=None):
         purchase_bill=bill,
         party=bill.party,
         receipt_date=timezone.localdate(),
+        # The intended godown; the goods themselves sit at QC Hold until the
+        # QC disposition releases them here.
         location_id=location_id,
-        qc_status="Approved" if qc_status == "Approved" else "Pending",
+        qc_status="Pending",
         created_by=user if getattr(user, "is_authenticated", False) else None,
     )
     GoodsReceiptLine.objects.bulk_create(
@@ -339,142 +351,205 @@ def _create_goods_receipt(bill, lines, location_id, qc_status, *, user=None):
 
 
 def _post_receipt_stock(bill, lines, location_id, overrides, receipt, *, user=None):
-    """Posts ``PURCHASE`` movements carrying ``weighedQty`` for weight items."""
+    """Posts ``PURCHASE`` movements into the **QC Hold** location.
+
+    Received goods are never available until QC passes them (Phase 1.4); the
+    QC disposition moves them to ``location_id`` (the receipt's godown).
+    Lot/taka items get one movement per taka, so every taka's
+    ``available_quantity`` is maintained by the ledger itself.
+    """
+    qc_hold_location_id = stock.system_location(bill.client_id, "QC_HOLD").id
+
     for line in lines:
         if line.item_id is None or not line.item.holds_stock:
             continue
         # received_qty is in the purchase unit; stock is kept in the item's unit.
         factor = D(line.uom_factor or 1)
-        quantity = uom.to_stock_qty(line.received_qty, factor)
+        quantity = round4(uom.to_stock_qty(line.received_qty, factor))
         if quantity <= ZERO:
             continue
 
-        movement = stock.post_movement(
+        override = overrides.get(line.id, {})
+        unit_cost = D(line.landed_unit_cost) / factor if line.landed_unit_cost is not None else None
+        common = dict(
             client_id=bill.client_id,
             item=line.item,
-            location=location_id,
+            location=qc_hold_location_id,
             type="PURCHASE",
-            quantity=quantity,
-            weighed_qty=line.received_weight if line.is_weight_item else None,
-            unit_cost=(
-                D(line.landed_unit_cost) / factor if line.landed_unit_cost is not None else None
-            ),
+            unit_cost=unit_cost,
             reference_type="PurchaseBill",
             reference_id=bill.id,
             reference_number=bill.bill_number,
             source_document_type="GoodsReceipt",
             source_document_id=receipt.id,
-            batch_number=line.batch_number,
             movement_date=timezone.localdate(),
             user=user,
         )
 
+        takas = _register_lot_taka_on_receipt(
+            bill, line, qc_hold_location_id, receipt, quantity, override=override
+        )
+        first_movement = None
+        if takas:
+            weight_total = (
+                D(line.received_weight) if line.is_weight_item and line.received_weight else None
+            )
+            weight_left = weight_total
+            for index, (taka, taka_qty) in enumerate(takas):
+                weighed = None
+                if weight_total is not None:
+                    if index == len(takas) - 1:
+                        weighed = weight_left
+                    else:
+                        weighed = round4(weight_total * taka_qty / quantity)
+                        weight_left -= weighed
+                movement = stock.post_movement(
+                    quantity=taka_qty,
+                    weighed_qty=weighed,
+                    lot_taka=taka,
+                    batch_number=taka.lot_number,
+                    **common,
+                )
+                taka.stock_movement = movement
+                taka.save(update_fields=["stock_movement", "updated_at"])
+                first_movement = first_movement or movement
+
+                # Auto-post Grey purchase cost to lot cost ledger (PDF §09)
+                try:
+                    from apps.inventory import costing_services
+                    taka_rate = unit_cost or (D(line.rate) if line.rate else (D(line.base_unit_cost) if line.base_unit_cost else ZERO))
+                    cost_amount = round2(D(taka_qty) * D(taka_rate))
+                    if cost_amount > ZERO:
+                        costing_services.post_lot_cost(
+                            client_id=bill.client_id,
+                            lot_number=taka.lot_number,
+                            cost_type="Grey purchase",
+                            amount=cost_amount,
+                            quantity=taka_qty,
+                            source_document_type="PurchaseBill",
+                            source_document_number=bill.bill_number,
+                            lot_taka=taka,
+                            user=user,
+                            is_approved=True,
+                            remarks=f"GRN against purchase bill {bill.bill_number}",
+                        )
+                except Exception:
+                    pass
+        else:
+            first_movement = stock.post_movement(
+                quantity=quantity,
+                weighed_qty=line.received_weight if line.is_weight_item else None,
+                batch_number=line.batch_number,
+                **common,
+            )
+
         # Serial-tracked lines add their serials to the item's pool on receipt.
-        override = overrides.get(line.id, {})
         serial_numbers = override.get("serials") or []
         if serial_numbers and line.item.tracking_mode == "Serial":
             _register_serials(
-                bill.client_id, line.item, serial_numbers, location_id, movement,
+                bill.client_id, line.item, serial_numbers, qc_hold_location_id, first_movement,
                 line.batch_number,
             )
 
-        # Auto-create or link Lot / Taka record for received fabric or batch items
-        _register_lot_taka_on_receipt(bill, line, location_id, receipt, movement, override=override)
 
+def _register_lot_taka_on_receipt(bill, line, location_id, receipt, received_quantity, override=None):
+    """Create the LotTaka rows for a received line; returns ``[(taka, qty)]``.
 
-def _register_lot_taka_on_receipt(bill, line, location_id, receipt, movement, override=None):
-    """Auto-create or link LotTaka records for received fabric or batch items."""
+    The takas start with ``available_quantity = 0`` -- the PURCHASE movement
+    posted per taka is what fills them. Returns ``[]`` for items that are not
+    held on lots/takas.
+    """
     from apps.core.numbering import allocate_number
     from apps.inventory.models import LotTaka
 
-    # Check if LotTaka already exists for this movement / GRN line (prevents duplicates on edit/retry)
-    if movement and LotTaka.objects.filter(
-        client_id=bill.client_id,
-        stock_movement=movement,
-        deleted_at__isnull=True,
-    ).exists():
-        return
-
+    item = line.item
+    tracked = getattr(item, "tracking_type", "NONE") in ("LOT", "TAKA")
     is_fabric = (
-        getattr(line.item, "item_kind", None) == "Fabric"
-        or bool(getattr(line.item, "fabric_quality", None))
-        or (getattr(line.item, "sku", "") or "").startswith("FAB-")
-        or getattr(line.item, "tracking_mode", None) in ("Batch", "Serial")
+        tracked
+        or getattr(item, "item_kind", None) == "Fabric"
+        or bool(getattr(item, "fabric_quality", None))
+        or getattr(item, "tracking_mode", None) == "Batch"
     )
-    if not is_fabric and not line.batch_number and not getattr(line.item, "fabric_quality", None):
-        return
-
-    lot_num = line.batch_number or f"LOT-{receipt.grn_number}"
-    received_quantity = uom.to_stock_qty(line.received_qty, line.uom_factor or 1)
-
-    qc_st = (
-        "Passed" if receipt.qc_status == "Approved"
-        else "Rejected" if receipt.qc_status == "Rejected"
-        else "On Hold" if receipt.qc_status == "On Hold"
-        else "Pending"
-    )
-
     override = override or {}
     takas_spec = override.get("takas") or override.get("rolls") or []
+    if not is_fabric and not line.batch_number and not takas_spec:
+        return []
+
+    lot_num = line.batch_number or allocate_number(bill.client, "LOT")
+    if not line.batch_number:
+        line.batch_number = lot_num
+        line.save(update_fields=["batch_number", "updated_at"])
+        receipt.lines.filter(purchase_bill_line=line).update(batch_number=lot_num)
+    stock_uom = getattr(item, "uom", None) or line.uom
+    rate = line.landed_unit_cost or line.base_unit_cost or getattr(line, "rate", 0) or 0
+    grn_line = receipt.lines.filter(purchase_bill_line=line).first()
 
     if takas_spec:
+        specs = []
         for idx, spec in enumerate(takas_spec):
-            taka_code = allocate_number(bill.client, "TAK")
-            spec_roll = str(spec.get("takaRoll") or spec.get("taka_number") or (idx + 1))
-            spec_qty = Decimal(str(spec.get("qty") or spec.get("quantity") or received_quantity))
+            raw_qty = spec.get("qty", spec.get("quantity"))
+            if raw_qty in (None, ""):
+                raise ValidationFailed(
+                    "Every taka needs its quantity.",
+                    field_errors={"takas": [f"Taka {idx + 1}: quantity is required."]},
+                )
+            specs.append((idx, spec, round4(D(raw_qty))))
+        spec_total = round4(sum((qty for _, _, qty in specs), ZERO))
+        if abs(spec_total - received_quantity) > Decimal("0.001"):
+            raise ValidationFailed(
+                f"Taka quantities ({spec_total}) must add up to the received quantity "
+                f"of {line.item_name} ({received_quantity}).",
+                field_errors={"takas": ["Taka total does not match the received quantity."]},
+            )
+    else:
+        specs = [(0, {}, received_quantity)]
+
+    created = []
+    for idx, spec, spec_qty in specs:
+        if spec_qty <= ZERO:
+            raise ValidationFailed(
+                "Taka quantity must be greater than zero.",
+                field_errors={"takas": [f"Taka {idx + 1}: quantity must be > 0."]},
+            )
+        base_number = str(
+            spec.get("takaRoll") or spec.get("taka_number")
+            or LotTaka.objects.filter(
+                client_id=bill.client_id, lot_number=lot_num, deleted_at__isnull=True
+            ).count() + 1
+        )
+        taka_code = allocate_number(bill.client, "TAK")
+        roll_weight = spec.get("rollWeight") or spec.get("weight")
+        width = spec.get("width")
+        created.append((
             LotTaka.objects.create(
                 client=bill.client,
                 taka_id=taka_code,
                 lot_number=lot_num,
-                taka_number=spec_roll,
-                item=line.item,
+                taka_number=stock._unique_taka_number(bill.client_id, lot_num, base_number),
+                item=item,
                 supplier=bill.party,
                 source_document_type="GRN",
                 source_document_number=receipt.grn_number,
                 source_document_id=receipt.id,
+                source_line_id=grn_line.id if grn_line else None,
                 location_id=location_id,
                 received_date=receipt.receipt_date or timezone.localdate(),
                 received_quantity=spec_qty,
-                available_quantity=spec_qty,
-                uom=getattr(line, "stock_uom", None) or getattr(line.item, "uom", None) or getattr(line, "uom", None) or "m",
-                qc_status=qc_st,
+                available_quantity=ZERO,
+                uom=stock_uom,
+                qc_status="Pending",
                 status="Active",
                 barcode=taka_code,
                 tag_status="Pending",
                 print_count=0,
-                rate=line.landed_unit_cost or line.base_unit_cost or getattr(line, "rate", 0) or 0,
-                stock_movement=movement,
-            )
-    else:
-        existing_count = LotTaka.objects.filter(
-            client_id=bill.client_id, lot_number=lot_num, deleted_at__isnull=True
-        ).count()
-        taka_num = str(existing_count + 1)
-        taka_code = allocate_number(bill.client, "TAK")
-
-        LotTaka.objects.create(
-            client=bill.client,
-            taka_id=taka_code,
-            lot_number=lot_num,
-            taka_number=taka_num,
-            item=line.item,
-            supplier=bill.party,
-            source_document_type="GRN",
-            source_document_number=receipt.grn_number,
-            source_document_id=receipt.id,
-            location_id=location_id,
-            received_date=receipt.receipt_date or timezone.localdate(),
-            received_quantity=received_quantity,
-            available_quantity=received_quantity,
-            uom=getattr(line, "stock_uom", None) or getattr(line.item, "uom", None) or getattr(line, "uom", None) or "m",
-            qc_status=qc_st,
-            status="Active",
-            barcode=taka_code,
-            tag_status="Pending",
-            print_count=0,
-            rate=line.landed_unit_cost or line.base_unit_cost or getattr(line, "rate", 0) or 0,
-            stock_movement=movement,
-        )
+                # kg is only ever stored as roll_weight -- never in a meter field.
+                roll_weight=round4(D(roll_weight)) if roll_weight not in (None, "") else None,
+                width=D(str(width)) if width not in (None, "") else None,
+                rate=rate,
+            ),
+            spec_qty,
+        ))
+    return created
 
 
 def _register_serials(client_id, item, serial_numbers, location_id, movement, batch_number):
@@ -532,25 +607,33 @@ def _bump_po_received(lines):
 # ---------------------------------------------------------------------------
 @transaction.atomic
 def update_qc_status(bill, status, *, note=None, user=None):
-    """Only ``Approved`` releases stock for sale or dispatch."""
+    """Bill-level QC verdict (api.md §6.4) -- applied to every receipt of the bill.
+
+    Whatever is still at QC Hold moves with real movements: Approved releases
+    it to the receipt's godown, Rejected sends it to the Reject location,
+    Rework to Reprocess; Pending Approval keeps it held (GRN On Hold).
+    Item-level splits (good + reject + ...) go through the QC disposition
+    screen (``apps.inventory.qc.dispose_receipt``) instead.
+    """
+    from apps.inventory import qc as qc_service
+
     if status not in ("Approved", "Pending Approval", "Rejected", "Rework"):
         raise ValidationFailed(
             "Unknown QC status.",
             field_errors={"status": ["Expected Approved, Pending Approval, Rejected or Rework."]},
         )
 
-    bill.qc_status = status
-    bill.qc_note = note
-    bill.save(update_fields=["qc_status", "qc_note", "updated_at"])
-
-    GoodsReceipt.objects.filter(purchase_bill=bill, deleted_at__isnull=True).update(
-        qc_status="Approved" if status == "Approved" else (
-            "Rejected" if status == "Rejected" else "On Hold"
-        ),
-        qc_note=note,
-        qc_by=user if getattr(user, "is_authenticated", False) else None,
-        qc_at=timezone.now(),
+    receipts = list(
+        GoodsReceipt.objects.filter(purchase_bill=bill, deleted_at__isnull=True)
     )
+    for receipt in receipts:
+        qc_service.dispose_all(receipt, status, user=user, note=note)
+
+    bill.refresh_from_db()
+    bill.qc_note = note
+    if not receipts:
+        bill.qc_status = status
+    bill.save(update_fields=["qc_status", "qc_note", "updated_at"])
     return bill
 
 
@@ -1136,3 +1219,379 @@ def compute_vendor_bill_matching(client_id, bill):
     if grn is None:
         result["note"] = "No GRN found for this purchase order."
     return result
+
+
+# ---------------------------------------------------------------------------
+# Standalone GRN & Supplier Reconciliation (Phase 2.2)
+# ---------------------------------------------------------------------------
+@transaction.atomic
+def create_standalone_grn(
+    client,
+    *,
+    party_id=None,
+    party=None,
+    location_id=None,
+    receipt_date=None,
+    supplier_challan_no=None,
+    supplier_challan_date=None,
+    purchase_order_id=None,
+    purchase_order=None,
+    lines_payload=None,
+    lines_data=None,
+    user=None,
+):
+    """Create a standalone Goods Receipt Note (GRN) against a PO or directly from a vendor.
+
+    Captures taka/roll entries per line, calculates shortage/excess vs PO,
+    posts stock movement into QC Hold, and provisions LotTaka entries.
+    """
+    party_id = party_id or (getattr(party, "id", party) if party else None)
+    purchase_order_id = purchase_order_id or (getattr(purchase_order, "id", purchase_order) if purchase_order else None)
+    lines_payload = lines_payload if lines_payload is not None else lines_data
+    from apps.core.numbering import allocate_number
+    from apps.inventory.models import LotTaka
+    from apps.masters.models import Item, Location, Party
+
+    party = Party.objects.filter(pk=party_id, client_id=client.id, deleted_at__isnull=True).first()
+    if not party:
+        raise ValidationFailed("Party not found.", field_errors={"party": ["Valid party is required."]})
+
+    if not location_id:
+        loc = Location.objects.filter(client_id=client.id, is_active=True, deleted_at__isnull=True).first()
+        location_id = loc.id if loc else None
+    if not location_id:
+        raise ValidationFailed("Location not found.", field_errors={"location": ["Location is required."]})
+
+    po = None
+    if purchase_order_id:
+        po = PurchaseOrder.objects.filter(pk=purchase_order_id, client_id=client.id, deleted_at__isnull=True).first()
+
+    receipt_date = receipt_date or timezone.localdate()
+    grn_number = allocate_number(client, "GRN", receipt_date)
+
+    receipt = GoodsReceipt.objects.create(
+        client=client,
+        grn_number=grn_number,
+        purchase_order=po,
+        purchase_bill=None,
+        party=party,
+        receipt_date=receipt_date,
+        supplier_challan_no=supplier_challan_no,
+        supplier_challan_date=supplier_challan_date,
+        location_id=location_id,
+        qc_status="Pending",
+        created_by=user if getattr(user, "is_authenticated", False) else None,
+    )
+
+    qc_hold_location_id = stock.system_location(client.id, "QC_HOLD").id
+
+    if not lines_payload:
+        raise ValidationFailed("At least one line is required.", field_errors={"lines": ["Lines cannot be empty."]})
+
+    for idx, line_data in enumerate(lines_payload):
+        item_id = line_data.get("item") or line_data.get("itemId") or line_data.get("item_id")
+        po_line_id = (
+            line_data.get("purchase_order_line")
+            or line_data.get("purchase_order_line_id")
+            or line_data.get("poLineId")
+            or line_data.get("po_line_id")
+            or line_data.get("poLine")
+        )
+        po_line = None
+        if po_line_id:
+            po_line = PurchaseOrderLine.objects.filter(pk=po_line_id, deleted_at__isnull=True).first()
+            if po_line and not item_id:
+                item_id = po_line.item_id
+
+        item = Item.objects.filter(pk=item_id, client_id=client.id, deleted_at__isnull=True).first()
+        if not item:
+            raise ValidationFailed(
+                f"Line {idx + 1}: Valid item is required.",
+                field_errors={"lines": [f"Line {idx + 1}: item not found."]},
+            )
+
+        ordered_qty = round4(D(line_data.get("ordered_qty") or line_data.get("orderedQty") or (po_line.qty if po_line else 0)))
+        received_qty = round4(D(line_data.get("received_qty") or line_data.get("receivedQty") or 0))
+        if received_qty <= ZERO:
+            raise ValidationFailed(
+                f"Line {idx + 1}: Received quantity must be greater than zero.",
+                field_errors={"lines": [f"Line {idx + 1}: received_qty must be > 0."]},
+            )
+
+        unit_cost = round4(D(line_data.get("unit_cost") or line_data.get("unitCost") or line_data.get("rate") or (po_line.rate if po_line else item.cost_price) or 0))
+        fabric_width = line_data.get("fabric_width") or line_data.get("fabricWidth")
+        remarks = line_data.get("remarks")
+        batch_number = line_data.get("batch_number") or line_data.get("batchNumber") or allocate_number(client, "LOT", receipt_date)
+
+        takas_spec = line_data.get("takas") or line_data.get("rolls") or []
+        if takas_spec:
+            spec_total = round4(sum(D(t.get("qty") or t.get("actual_meter") or t.get("quantity") or 0) for t in takas_spec))
+            if abs(spec_total - received_qty) > Decimal("0.001"):
+                raise ValidationFailed(
+                    f"Line {idx + 1}: Sum of taka meters ({spec_total}) does not match line received quantity ({received_qty}).",
+                    field_errors={"takas": [f"Line {idx + 1}: sum of takas ({spec_total}) != received_qty ({received_qty})."]},
+                )
+        else:
+            takas_spec = [{
+                "taka_number": "1",
+                "qty": received_qty,
+                "weight": line_data.get("weight_kg") or line_data.get("weightKg"),
+                "width": fabric_width,
+                "remarks": remarks,
+            }]
+
+        shortage_qty = round4(max(ZERO, ordered_qty - received_qty)) if ordered_qty > ZERO else ZERO
+        excess_qty = round4(max(ZERO, received_qty - ordered_qty)) if ordered_qty > ZERO else ZERO
+
+        total_weight_kg = None
+        weights = [D(t.get("weight") or t.get("roll_weight") or t.get("weight_kg") or 0) for t in takas_spec if t.get("weight") or t.get("roll_weight") or t.get("weight_kg")]
+        if weights:
+            total_weight_kg = round4(sum(weights))
+        elif line_data.get("weight_kg") or line_data.get("weightKg"):
+            total_weight_kg = round4(D(line_data.get("weight_kg") or line_data.get("weightKg")))
+
+        grn_line = GoodsReceiptLine.objects.create(
+            client=client,
+            goods_receipt=receipt,
+            purchase_order_line=po_line,
+            purchase_bill_line=None,
+            item=item,
+            uom=line_data.get("uom") or (po_line.uom if po_line else item.uom),
+            uom_factor=D(line_data.get("uom_factor") or (po_line.uom_factor if po_line else 1)),
+            stock_uom=item.uom,
+            stock_qty=round4(uom.to_stock_qty(received_qty, line_data.get("uom_factor") or (po_line.uom_factor if po_line else 1))),
+            ordered_qty=ordered_qty,
+            received_qty=received_qty,
+            shortage_qty=shortage_qty,
+            excess_qty=excess_qty,
+            roll_count=len(takas_spec),
+            weight_kg=total_weight_kg,
+            fabric_width=D(str(fabric_width)) if fabric_width not in (None, "") else None,
+            remarks=remarks,
+            batch_number=batch_number,
+            unit_cost=unit_cost,
+        )
+
+        if po_line:
+            po_line.received_qty = round4(D(po_line.received_qty) + received_qty)
+            po_line.save(update_fields=["received_qty", "updated_at"])
+
+        common_movement = dict(
+            client_id=client.id,
+            item=item,
+            location=qc_hold_location_id,
+            type="PURCHASE",
+            unit_cost=unit_cost,
+            reference_type="GoodsReceipt",
+            reference_id=receipt.id,
+            reference_number=receipt.grn_number,
+            source_document_type="GoodsReceipt",
+            source_document_id=receipt.id,
+            movement_date=receipt.receipt_date,
+            user=user,
+        )
+
+        from apps.masters.models import FabricQuality, Design, Shade
+
+        resolved_quality = getattr(item, "fabric_quality", None)
+        if isinstance(resolved_quality, str):
+            resolved_quality = FabricQuality.objects.filter(
+                client_id=client.id, name=resolved_quality, deleted_at__isnull=True
+            ).first() or FabricQuality.objects.filter(
+                client_id=client.id, code=resolved_quality, deleted_at__isnull=True
+            ).first()
+
+        resolved_design = getattr(item, "design", None) or getattr(item, "fabric_design", None)
+        if isinstance(resolved_design, str):
+            resolved_design = Design.objects.filter(
+                client_id=client.id, name=resolved_design, deleted_at__isnull=True
+            ).first() or Design.objects.filter(
+                client_id=client.id, code=resolved_design, deleted_at__isnull=True
+            ).first()
+
+        resolved_shade = getattr(item, "shade", None) or getattr(item, "fabric_color", None)
+        if isinstance(resolved_shade, str):
+            resolved_shade = Shade.objects.filter(
+                client_id=client.id, name=resolved_shade, deleted_at__isnull=True
+            ).first() or Shade.objects.filter(
+                client_id=client.id, code=resolved_shade, deleted_at__isnull=True
+            ).first()
+
+        for t_idx, t_spec in enumerate(takas_spec):
+            taka_qty = round4(D(t_spec.get("qty") or t_spec.get("actual_meter") or t_spec.get("quantity") or 0))
+            if taka_qty <= ZERO:
+                continue
+            base_number = str(t_spec.get("taka_number") or t_spec.get("takaRoll") or (t_idx + 1))
+            taka_code = allocate_number(client, "TAK")
+            roll_weight = t_spec.get("weight") or t_spec.get("roll_weight") or t_spec.get("weight_kg")
+            t_width = t_spec.get("width") or fabric_width
+            t_remarks = t_spec.get("remarks") or remarks
+
+            taka_obj = LotTaka.objects.create(
+                client=client,
+                taka_id=taka_code,
+                lot_number=batch_number,
+                taka_number=stock._unique_taka_number(client.id, batch_number, base_number),
+                item=item,
+                fabric_quality=resolved_quality if isinstance(resolved_quality, FabricQuality) else None,
+                design=resolved_design if isinstance(resolved_design, Design) else None,
+                shade=resolved_shade if isinstance(resolved_shade, Shade) else None,
+                supplier=party,
+                source_document_type="GRN",
+                source_document_number=receipt.grn_number,
+                source_document_id=receipt.id,
+                source_line_id=grn_line.id,
+                location_id=qc_hold_location_id,
+                received_date=receipt.receipt_date,
+                received_quantity=taka_qty,
+                available_quantity=ZERO,
+                uom=item.uom,
+                qc_status="Pending",
+                status="Active",
+                barcode=taka_code,
+                tag_status="Pending",
+                print_count=0,
+                roll_weight=round4(D(roll_weight)) if roll_weight not in (None, "") else None,
+                width=D(str(t_width)) if t_width not in (None, "") else None,
+                rate=unit_cost,
+                remarks=t_remarks,
+            )
+
+            movement = stock.post_movement(
+                quantity=taka_qty,
+                weighed_qty=round4(D(roll_weight)) if roll_weight not in (None, "") else None,
+                lot_taka=taka_obj,
+                batch_number=batch_number,
+                **common_movement,
+            )
+            taka_obj.stock_movement = movement
+            taka_obj.save(update_fields=["stock_movement", "updated_at"])
+
+    return receipt
+
+
+def supplier_reconciliation(client_id, *, vendor_id=None, date_from=None, date_to=None):
+    """Supplier reconciliation: PO ordered qty vs GRN received vs Billed vs Returned."""
+    from apps.purchase.models import PurchaseBillLine, PurchaseOrderLine, GoodsReceiptLine
+
+    po_lines = PurchaseOrderLine.objects.filter(
+        purchase_order__client_id=client_id,
+        purchase_order__deleted_at__isnull=True,
+    ).exclude(
+        purchase_order__status="Cancelled"
+    ).select_related("purchase_order", "purchase_order__party", "item")
+
+    if vendor_id:
+        po_lines = po_lines.filter(purchase_order__party_id=vendor_id)
+    if date_from:
+        po_lines = po_lines.filter(purchase_order__doc_date__gte=date_from)
+    if date_to:
+        po_lines = po_lines.filter(purchase_order__doc_date__lte=date_to)
+
+    rows = []
+    total_ordered = ZERO
+    total_received = ZERO
+    total_billed = ZERO
+    total_returned = ZERO
+
+    for line in po_lines:
+        ordered = round4(D(line.qty))
+        grn_received = GoodsReceiptLine.objects.filter(
+            purchase_order_line=line,
+            goods_receipt__deleted_at__isnull=True,
+        ).aggregate(
+            tot=Coalesce(
+                Sum("received_qty"),
+                Value(Decimal("0.0000")),
+                output_field=DecimalField(max_digits=18, decimal_places=4),
+            )
+        )["tot"]
+        received = round4(max(D(line.received_qty), D(grn_received)))
+
+        billed = round4(D(line.billed_qty))
+        returned = PurchaseBillLine.objects.filter(
+            purchase_order_line=line,
+            deleted_at__isnull=True,
+        ).aggregate(
+            tot=Coalesce(
+                Sum("returned_qty"),
+                Value(Decimal("0.0000")),
+                output_field=DecimalField(max_digits=18, decimal_places=4),
+            )
+        )["tot"]
+        returned = round4(D(returned))
+
+        pending_receipt = round4(max(ZERO, ordered - received))
+        pending_bill = round4(max(ZERO, received - billed))
+
+        if received == ordered and billed == ordered and returned == ZERO:
+            status = "Fully Reconciled"
+        elif received < ordered:
+            status = "Short Intake"
+        elif received > ordered:
+            status = "Excess Intake"
+        elif billed < received:
+            status = "Pending Invoice"
+        elif billed > received:
+            status = "Over Invoiced"
+        elif returned > ZERO:
+            status = "Has Returns"
+        else:
+            status = "In Progress"
+
+        total_ordered += ordered
+        total_received += received
+        total_billed += billed
+        total_returned += returned
+
+        rows.append({
+            "id": str(line.id),
+            "poId": str(line.purchase_order_id),
+            "poNumber": line.purchase_order.po_number,
+            "poDate": str(line.purchase_order.doc_date) if line.purchase_order.doc_date else None,
+            "vendorId": str(line.purchase_order.party_id),
+            "vendorName": line.purchase_order.party.name if line.purchase_order.party else "—",
+            "itemId": str(line.item_id) if line.item_id else None,
+            "itemName": line.item_name or (line.item.name if line.item else "—"),
+            "sku": line.sku or (line.item.sku if line.item else ""),
+            "uom": line.uom or (line.item.uom if line.item else "MTR"),
+            "orderedQty": float(ordered),
+            "receivedQty": float(received),
+            "billedQty": float(billed),
+            "returnedQty": float(returned),
+            "pendingReceiptQty": float(pending_receipt),
+            "pendingBillQty": float(pending_bill),
+            "status": status,
+        })
+
+    summary = {
+        "totalOrders": len(set(r["poId"] for r in rows)),
+        "totalOrderedQty": float(total_ordered),
+        "totalReceivedQty": float(total_received),
+        "totalBilledQty": float(total_billed),
+        "totalReturnedQty": float(total_returned),
+        "discrepancies": sum(1 for r in rows if r["status"] not in ("Fully Reconciled", "In Progress")),
+    }
+    return {"rows": rows, "summary": summary}
+
+
+def supplier_ledger(client_id, vendor_id, *, date_from=None, date_to=None):
+    """Fetch chronological ledger entries for a supplier with running balance."""
+    from apps.accounting.services import party_ledger
+    from apps.masters.models import Party
+
+    vendor = Party.objects.filter(pk=vendor_id, client_id=client_id, deleted_at__isnull=True).first()
+    if not vendor:
+        raise ValidationFailed("Vendor not found.", field_errors={"vendorId": ["Invalid vendor ID."]})
+
+    data = party_ledger(client_id, vendor_id, date_from=date_from, date_to=date_to)
+    data["vendor"] = {
+        "id": str(vendor.id),
+        "name": vendor.name,
+        "code": vendor.code,
+        "phone": vendor.phone,
+        "gstin": vendor.gstin,
+        "currentBalance": float(vendor.balance or 0),
+    }
+    return data
+

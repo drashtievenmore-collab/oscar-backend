@@ -10,14 +10,19 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from django.http import HttpResponse
+
 from apps.core.exceptions import Codes, Conflict, NotFound, ValidationFailed
 from apps.core.money import ZERO, D, round2
 from apps.core.pagination import envelope
 from apps.core.permissions import HasModulePermission
 from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
 
-from . import reports, services
-from .models import Account, BankAccount, BankTransfer, Budget, ExpenseCategory, JournalEntry, JournalLine
+from . import note_services, reports, services, tally_export
+from .models import (
+    Account, BankAccount, BankTransfer, Budget, ExpenseCategory, JournalEntry,
+    JournalLine, StandaloneNote,
+)
 from .serializers import (
     AccountSerializer,
     BankAccountSerializer,
@@ -25,6 +30,7 @@ from .serializers import (
     BudgetSerializer,
     ExpenseCategorySerializer,
     JournalEntrySerializer,
+    StandaloneNoteSerializer,
 )
 
 MONEY = DecimalField(max_digits=18, decimal_places=2)
@@ -276,8 +282,63 @@ class ExpenseCategoryViewSet(TenantModelViewSet):
     ordering = ["name"]
 
 
+class StandaloneNoteViewSet(TenantModelViewSet):
+    queryset = StandaloneNote.objects.select_related("party", "return_reason", "journal_entry")
+    serializer_class = StandaloneNoteSerializer
+    audit_entity_type = "StandaloneNote"
+    audit_label_field = "note_number"
+    required_permissions = ["view_ledger"]
+    status_field = "status"
+    ordering = ["-note_date", "-created_at"]
+    filter_map = {
+        "noteType": "note_type",
+        "partyId": "party_id",
+        "status": "status",
+        "againstDocumentType": "against_document_type",
+    }
+    search_fields = ["note_number", "party__name", "against_document_number", "reason_notes"]
+
+    def perform_create(self, serializer):
+        data = serializer.validated_data
+        note = note_services.create_standalone_note(
+            client=self.request.user.client,
+            party=data["party"],
+            note_type=data.get("note_type", "CREDIT_NOTE"),
+            taxable_amount=data.get("taxable_amount", 0),
+            cgst=data.get("cgst", 0),
+            sgst=data.get("sgst", 0),
+            igst=data.get("igst", 0),
+            against_document_type=data.get("against_document_type", "INVOICE"),
+            against_document_id=data.get("against_document_id"),
+            against_document_number=data.get("against_document_number"),
+            return_reason=data.get("return_reason"),
+            reason_notes=data.get("reason_notes"),
+            notes=data.get("notes"),
+            user=self.request.user,
+            status=data.get("status", "Draft"),
+        )
+        serializer.instance = note
+        return note
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        note = note_services.approve_standalone_note(self.get_object(), user=request.user)
+        return Response(self.get_serializer(note).data)
+
+    @action(detail=True, methods=["post"])
+    def post(self, request, pk=None):
+        note = note_services.post_standalone_note(self.get_object(), user=request.user)
+        return Response(self.get_serializer(note).data)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        reason = request.data.get("reason")
+        note = note_services.cancel_standalone_note(self.get_object(), user=request.user, reason=reason)
+        return Response(self.get_serializer(note).data)
+
+
 # ---------------------------------------------------------------------------
-# Reports (api.md §8)
+# Reports (api.md §8, PDF §14)
 # ---------------------------------------------------------------------------
 class FinancialReportView(APIView):
     """``GET /accounts/reports/{key}/``."""
@@ -292,6 +353,9 @@ class FinancialReportView(APIView):
         "trial-balance": "trial_balance",
         "gst-summary": "gst_summary",
         "ageing": "ageing",
+        "day-book": "day_book",
+        "overdue-summary": "overdue_summary",
+        "sub-ledgers": "sub_ledgers",
     }
 
     def get(self, request, report_key):
@@ -300,8 +364,8 @@ class FinancialReportView(APIView):
             raise NotFound(f"Unknown report '{report_key}'.")
 
         params = request.query_params
-        date_from = params.get("date_from")
-        date_to = params.get("date_to")
+        date_from = params.get("date_from") or params.get("dateFrom")
+        date_to = params.get("date_to") or params.get("dateTo")
         as_of = params.get("asOf") or params.get("as_of")
 
         if report_key == "profit-and-loss":
@@ -323,8 +387,59 @@ class FinancialReportView(APIView):
             )
         if report_key == "gst-summary":
             return Response(reports.gst_summary(request.client_id, date_from, date_to))
+        if report_key == "day-book":
+            return Response(reports.day_book(request.client_id, as_of_date=params.get("date") or as_of))
+        if report_key == "overdue-summary":
+            return Response(reports.salesperson_broker_overdue_view(request.client_id, as_of=as_of))
+        if report_key == "sub-ledgers":
+            return Response(reports.sub_ledger_summary(request.client_id, ledger_type=params.get("type", "jobwork"), as_of=as_of))
+
         return Response(
             reports.ageing(
                 request.client_id, params.get("type") or "receivable", as_of
             )
         )
+
+
+class TallyExportView(APIView):
+    """``GET /accounts/export/tally/`` -- Tally XML export (PDF §14)."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_financial_reports"]
+
+    def get(self, request):
+        export_type = request.query_params.get("type", "vouchers")
+        date_from = request.query_params.get("dateFrom") or request.query_params.get("date_from")
+        date_to = request.query_params.get("dateTo") or request.query_params.get("date_to")
+        company = getattr(request.user.client, "name", "Oscar ERP")
+
+        if export_type == "masters":
+            xml_data = tally_export.export_tally_masters_xml(request.client_id, company_name=company)
+            filename = f"tally_masters_{timezone.localdate()}.xml"
+        else:
+            xml_data = tally_export.export_tally_vouchers_xml(
+                request.client_id, date_from=date_from, date_to=date_to, company_name=company
+            )
+            filename = f"tally_vouchers_{timezone.localdate()}.xml"
+
+        response = HttpResponse(xml_data, content_type="application/xml")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+
+
+class ExcelExportView(APIView):
+    """``GET /accounts/export/excel/`` -- CSV / Excel export for registers (PDF §14)."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_financial_reports"]
+
+    def get(self, request):
+        register_type = request.query_params.get("register", "sales")
+        date_from = request.query_params.get("dateFrom") or request.query_params.get("date_from")
+        date_to = request.query_params.get("dateTo") or request.query_params.get("date_to")
+        csv_data = tally_export.export_register_csv(
+            request.client_id, register_type=register_type, date_from=date_from, date_to=date_to
+        )
+        response = HttpResponse(csv_data, content_type="text/csv")
+        response["Content-Disposition"] = f'attachment; filename="{register_type}_register_{timezone.localdate()}.csv"'
+        return response

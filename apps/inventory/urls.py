@@ -9,6 +9,9 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from apps.masters.views import (
+    AgencyViewSet,
+    BrokerViewSet,
+    DefectMasterViewSet,
     DesignViewSet,
     FabricQualityViewSet,
     FabricTypeViewSet,
@@ -16,7 +19,11 @@ from apps.masters.views import (
     FabricViewSet,
     ItemCategoryViewSet,
     ItemViewSet,
+    JobWorkRateMasterViewSet,
     LocationViewSet,
+    LossReasonMasterViewSet,
+    ProcessMasterViewSet,
+    ReturnReasonMasterViewSet,
     ShadeViewSet,
     UnitViewSet,
 )
@@ -34,6 +41,13 @@ router.register("fabric-types", FabricTypeViewSet, basename="inventory-fabric-ty
 router.register("designs", DesignViewSet, basename="inventory-designs")
 router.register("shades", ShadeViewSet, basename="inventory-shades")
 router.register("fabric-variants", FabricVariantViewSet, basename="inventory-fabric-variants")
+router.register("agencies", AgencyViewSet, basename="inventory-agencies")
+router.register("brokers", BrokerViewSet, basename="inventory-brokers")
+router.register("processes", ProcessMasterViewSet, basename="inventory-processes")
+router.register("jobwork-rates", JobWorkRateMasterViewSet, basename="inventory-jobwork-rates")
+router.register("defects", DefectMasterViewSet, basename="inventory-defects")
+router.register("loss-reasons", LossReasonMasterViewSet, basename="inventory-loss-reasons")
+router.register("return-reasons", ReturnReasonMasterViewSet, basename="inventory-return-reasons")
 router.register("movements", views.StockMovementViewSet, basename="inventory-movements")
 router.register("transfers", views.StockTransferViewSet, basename="inventory-transfers")
 router.register("faulty-parts", views.FaultyPartViewSet, basename="inventory-faulty-parts")
@@ -41,9 +55,17 @@ router.register("service-usage", views.ServiceUsageViewSet, basename="inventory-
 router.register("zone-requests", views.ZoneRequestViewSet, basename="inventory-zone-requests")
 router.register("item-parts", views.ItemPartViewSet, basename="inventory-item-parts")
 router.register("audits", views.StockAuditViewSet, basename="inventory-audits")
+router.register("qc-inspections", views.QCInspectionViewSet, basename="inventory-qc-inspections")
+router.register("lot-cost-entries", views.LotCostEntryViewSet, basename="inventory-lot-cost-entries")
+router.register("samples", views.SampleViewSet, basename="inventory-samples")
+router.register("trips", views.TripViewSet, basename="inventory-trips")
 
 urlpatterns = [
     path("dashboard/", views.InventoryDashboardView.as_view(), name="inventory-dashboard"),
+    path("traceability/", views.LotTraceabilityView.as_view(), name="inventory-traceability"),
+    path("lots/<str:lot_id>/traceability/", views.LotTraceabilityView.as_view(), name="inventory-lot-traceability"),
+    path("stock/ageing/", views.StockAgeingView.as_view(), name="inventory-stock-ageing"),
+    path("stock/slow-moving/", views.SlowMovingStockView.as_view(), name="inventory-slow-moving"),
     path("qc/dashboard/", views.QCDashboardView.as_view(), name="inventory-qc-dashboard"),
     path("qc/pending/", views.QCPendingInspectionsView.as_view(), name="inventory-qc-pending"),
     path("qc/pending/bulk-assign/", views.QCBulkAssignView.as_view(), name="inventory-qc-bulk-assign"),

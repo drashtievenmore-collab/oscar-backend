@@ -8,7 +8,10 @@ from apps.core.serializers import (
     TenantPrimaryKeyRelatedField,
 )
 
-from .models import Account, BankAccount, BankTransfer, Budget, ExpenseCategory, JournalEntry, JournalLine
+from .models import (
+    Account, BankAccount, BankTransfer, Budget, ExpenseCategory, JournalEntry,
+    JournalLine, StandaloneNote,
+)
 
 
 class AccountSerializer(BaseModelSerializer):
@@ -160,3 +163,26 @@ class LedgerEntrySerializer(BaseSerializer):
     debit = MoneyField()
     credit = MoneyField()
     balance = MoneyField()
+
+
+class StandaloneNoteSerializer(BaseModelSerializer):
+    partyId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
+    partyName = serializers.CharField(source="party.name", read_only=True)
+    returnReasonId = TenantPrimaryKeyRelatedField(
+        source="return_reason", model="masters.ReturnReasonMaster", required=False, allow_null=True
+    )
+    returnReasonName = serializers.CharField(source="return_reason.name", read_only=True)
+
+    class Meta:
+        model = StandaloneNote
+        fields = [
+            "id", "note_type", "note_number", "note_date", "partyId", "partyName",
+            "against_document_type", "against_document_id", "against_document_number",
+            "returnReasonId", "returnReasonName", "reason_notes", "taxable_amount",
+            "cgst", "sgst", "igst", "total_amount", "status", "approved_by",
+            "approved_at", "journal_entry", "notes", "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "id", "note_number", "total_amount", "status", "approved_by",
+            "approved_at", "journal_entry", "created_at", "updated_at",
+        ]

@@ -15,5 +15,7 @@ router.register("invoices", views.SalesInvoiceViewSet, basename="sales-invoices"
 router.register("payments", views.PaymentInViewSet, basename="sales-payments")
 router.register("returns", views.SalesReturnViewSet, basename="sales-returns")
 router.register("warranties", views.WarrantyCardViewSet, basename="sales-warranties")
+router.register("broker-commissions", views.BrokerCommissionViewSet, basename="sales-broker-commissions")
+router.register("party-discounts", views.PartyDiscountViewSet, basename="sales-party-discounts")
 
 urlpatterns = [path("", include(router.urls))]

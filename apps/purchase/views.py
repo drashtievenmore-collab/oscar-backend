@@ -306,68 +306,134 @@ class PurchaseBillViewSet(SalesDocumentViewSet):
         return Response(self.get_serializer(bill).data)
 
 
-class GoodsReceiptViewSet(ReadOnlyTenantViewSet):
-    """``GET /purchase/receipts/`` -- the worklist (api.md §6.3).
+class GoodsReceiptViewSet(TenantModelViewSet):
+    """``GET /purchase/receipts/`` and ``POST /purchase/receipts/`` (api.md §6.3, Phase 2.2).
 
-    "Bills where ``goodsReceived = false``, plus receipts held at a
-    non-``Approved`` QC verdict."
+    Supports standalone GRN creation against POs or suppliers, worklist filtering,
+    reconciliation report, and supplier ledger.
     """
 
-    queryset = GoodsReceipt.objects.select_related("party", "purchase_bill", "location")
+    queryset = GoodsReceipt.objects.select_related("party", "purchase_bill", "purchase_order", "location").prefetch_related("lines", "lines__item")
     serializer_class = GoodsReceiptSerializer
     required_permissions = ["view_purchase"]
+    permission_map = {"read": ["view_purchase"], "write": ["receive_goods"]}
     status_field = "qc_status"
     default_date_field = "receipt_date"
-    ordering = ["-receipt_date"]
+    ordering = ["-receipt_date", "-created_at"]
+    filter_map = {
+        "partyId": "party_id",
+        "vendorId": "party_id",
+        "purchaseOrderId": "purchase_order_id",
+        "qcStatus": "qc_status",
+    }
 
     def list(self, request, *args, **kwargs):
-        pending_bills = PurchaseBill.objects.filter(
-            client_id=request.client_id, deleted_at__isnull=True, goods_received=False
-        ).exclude(status="Cancelled").select_related("party")
+        if request.query_params.get("worklist") == "true":
+            pending_bills = PurchaseBill.objects.filter(
+                client_id=request.client_id, deleted_at__isnull=True, goods_received=False
+            ).exclude(status="Cancelled").select_related("party")
 
-        held_receipts = self.filter_queryset(self.get_queryset()).exclude(
-            qc_status="Approved"
-        )
-
-        rows = [
-            {
-                "kind": "bill",
-                "id": str(bill.id),
-                "billId": str(bill.id),
-                "billNumber": bill.bill_number,
-                "vendorName": bill.party_name or bill.party.name,
-                "date": bill.doc_date,
-                "total": round2(bill.total),
-                "qcStatus": bill.qc_status,
-                "goodsReceived": False,
-            }
-            for bill in pending_bills
-        ] + [
-            {
-                "kind": "receipt",
-                "id": str(receipt.id),
-                "billId": str(receipt.purchase_bill_id) if receipt.purchase_bill_id else None,
-                "billNumber": (
-                    receipt.purchase_bill.bill_number if receipt.purchase_bill_id else None
-                ),
-                "grnNumber": receipt.grn_number,
-                "vendorName": receipt.party.name,
-                "date": receipt.receipt_date,
-                "qcStatus": receipt.qc_status,
-                "goodsReceived": True,
-            }
-            for receipt in held_receipts
-        ]
-
-        return Response(
-            envelope(
-                rows,
-                aggregates={
-                    "awaitingReceipt": pending_bills.count(),
-                    "heldAtQc": held_receipts.count(),
-                },
+            held_receipts = self.filter_queryset(self.get_queryset()).exclude(
+                qc_status="Approved"
             )
+
+            rows = [
+                {
+                    "kind": "bill",
+                    "id": str(bill.id),
+                    "billId": str(bill.id),
+                    "billNumber": bill.bill_number,
+                    "vendorName": bill.party_name or bill.party.name,
+                    "date": bill.doc_date,
+                    "total": round2(bill.total),
+                    "qcStatus": bill.qc_status,
+                    "goodsReceived": False,
+                }
+                for bill in pending_bills
+            ] + [
+                {
+                    "kind": "receipt",
+                    "id": str(receipt.id),
+                    "billId": str(receipt.purchase_bill_id) if receipt.purchase_bill_id else None,
+                    "billNumber": (
+                        receipt.purchase_bill.bill_number if receipt.purchase_bill_id else None
+                    ),
+                    "grnNumber": receipt.grn_number,
+                    "vendorName": receipt.party.name,
+                    "date": receipt.receipt_date,
+                    "qcStatus": receipt.qc_status,
+                    "goodsReceived": True,
+                }
+                for receipt in held_receipts
+            ]
+
+            return Response(
+                envelope(
+                    rows,
+                    aggregates={
+                        "awaitingReceipt": pending_bills.count(),
+                        "heldAtQc": held_receipts.count(),
+                    },
+                )
+            )
+        return super().list(request, *args, **kwargs)
+
+    def create(self, request, *args, **kwargs):
+        from apps.core.permissions import require_permission
+
+        require_permission(request.user, "receive_goods")
+
+        data = request.data
+        party_id = data.get("party") or data.get("partyId") or data.get("vendorId")
+        location_id = data.get("location") or data.get("locationId")
+        receipt_date = data.get("receipt_date") or data.get("receiptDate") or data.get("date")
+        supplier_challan_no = data.get("supplier_challan_no") or data.get("supplierChallanNo")
+        supplier_challan_date = data.get("supplier_challan_date") or data.get("supplierChallanDate")
+        purchase_order_id = data.get("purchase_order") or data.get("purchaseOrderId") or data.get("poId")
+        lines = data.get("lines") or []
+
+        receipt = services.create_standalone_grn(
+            request.user.client,
+            party_id=party_id,
+            location_id=location_id,
+            receipt_date=receipt_date,
+            supplier_challan_no=supplier_challan_no,
+            supplier_challan_date=supplier_challan_date,
+            purchase_order_id=purchase_order_id,
+            lines_payload=lines,
+            user=request.user,
         )
+        self.write_audit("create", receipt, description=f"Standalone GRN created: {receipt.grn_number}")
+        serializer = self.get_serializer(receipt)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["get"], url_path="reconciliation")
+    def reconciliation(self, request):
+        vendor_id = request.query_params.get("vendorId") or request.query_params.get("vendor_id")
+        date_from = request.query_params.get("dateFrom") or request.query_params.get("date_from")
+        date_to = request.query_params.get("dateTo") or request.query_params.get("date_to")
+        data = services.supplier_reconciliation(
+            request.client_id,
+            vendor_id=vendor_id,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        return Response(data)
+
+    @action(detail=False, methods=["get"], url_path="supplier-ledger")
+    def supplier_ledger(self, request):
+        vendor_id = request.query_params.get("vendorId") or request.query_params.get("vendor_id")
+        if not vendor_id:
+            raise ValidationFailed("vendorId query parameter is required.", field_errors={"vendorId": ["Required."]})
+        date_from = request.query_params.get("dateFrom") or request.query_params.get("date_from")
+        date_to = request.query_params.get("dateTo") or request.query_params.get("date_to")
+        data = services.supplier_ledger(
+            request.client_id,
+            vendor_id=vendor_id,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        return Response(data)
 
     @action(detail=True, methods=["post"])
     def qc(self, request, pk=None):
@@ -380,29 +446,17 @@ class GoodsReceiptViewSet(ReadOnlyTenantViewSet):
         serializer = QcSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        verdict = serializer.validated_data["status"]
-        receipt.qc_status = (
-            "Approved" if verdict == "Approved"
-            else "Rejected" if verdict == "Rejected"
-            else "On Hold"
+        # The verdict moves the goods out of QC Hold with real movements and
+        # updates receipt, bill and taka statuses together (Phase 1.4).
+        from apps.inventory import qc as qc_service
+
+        qc_service.dispose_all(
+            receipt,
+            serializer.validated_data["status"],
+            user=request.user,
+            note=serializer.validated_data.get("note"),
         )
-        receipt.qc_note = serializer.validated_data.get("note")
-        receipt.qc_by = request.user
-        receipt.qc_at = timezone.now()
-        receipt.save(update_fields=["qc_status", "qc_note", "qc_by", "qc_at", "updated_at"])
-
-        if receipt.purchase_bill_id:
-            services.update_qc_status(
-                receipt.purchase_bill, verdict,
-                note=receipt.qc_note, user=request.user,
-            )
-
-        # Synchronize QC status with Lot / Taka Register
-        from apps.inventory.models import LotTaka
-        lot_qc = "Passed" if verdict == "Approved" else ("Rejected" if verdict == "Rejected" else "On Hold")
-        LotTaka.objects.filter(
-            client_id=receipt.client_id, source_document_id=receipt.id
-        ).update(qc_status=lot_qc, qc_notes=receipt.qc_note)
+        receipt.refresh_from_db()
 
         return Response(self.get_serializer(receipt).data)
 
@@ -551,6 +605,32 @@ class PurchaseReturnViewSet(SalesDocumentViewSet):
             purchase_return.journal_entry = entry
             purchase_return.save(update_fields=["journal_entry", "updated_at"])
         services.refresh_bill_payment_status(bill)
+
+        # Handle lot/taka selection on return (Phase 2.2)
+        taka_ids = self.request.data.get("taka_ids") or self.request.data.get("takaIds") or []
+        if taka_ids:
+            from apps.inventory.models import LotTaka
+            for tid in taka_ids:
+                taka = LotTaka.objects.filter(pk=tid, client_id=self.get_client_id()).first()
+                if taka and taka.available_quantity > ZERO:
+                    stock.post_movement(
+                        client_id=purchase_return.client_id,
+                        item=taka.item,
+                        location=taka.location_id,
+                        type="PURCHASE_RETURN",
+                        quantity=-taka.available_quantity,
+                        lot_taka=taka,
+                        batch_number=taka.lot_number,
+                        reference_type="PurchaseReturn",
+                        reference_id=purchase_return.id,
+                        reference_number=purchase_return.return_number,
+                        movement_date=purchase_return.doc_date,
+                        user=self.request.user,
+                    )
+                    taka.status = "Returned"
+                    taka.available_quantity = ZERO
+                    taka.save(update_fields=["status", "available_quantity", "updated_at"])
+
         return purchase_return
 
     @action(detail=True, methods=["post"])

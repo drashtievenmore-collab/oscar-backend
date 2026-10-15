@@ -135,6 +135,7 @@ CATALOGUE = [
             ("menu_hrms", "HRMS menu"),
             ("menu_admin", "Administration menu"),
             ("menu_pms", "PMS menu"),
+            ("menu_jobwork", "Job Work menu"),
         ],
     ),
     (
@@ -207,6 +208,29 @@ CATALOGUE = [
             ("view_production", "View production"),
             ("enter_production", "Enter production"),
             ("verify_production", "Verify production"),
+        ],
+    ),
+    (
+        "Job Work",
+        "Job Work Operations",
+        [
+            ("view_jobwork", "View job work"),
+            ("manage_jobwork", "Manage job work"),
+            ("approve_jobwork", "Approve job work"),
+        ],
+    ),
+    (
+        "Masters",
+        "Textile & Production Masters",
+        [
+            ("view_masters", "View masters"),
+            ("manage_agencies", "Manage production agencies"),
+            ("manage_brokers", "Manage brokers"),
+            ("manage_processes", "Manage processes"),
+            ("manage_jobwork_rates", "Manage job work rates"),
+            ("manage_defects", "Manage defects"),
+            ("manage_loss_reasons", "Manage loss reasons"),
+            ("manage_return_reasons", "Manage return reasons"),
         ],
     ),
 ]
@@ -319,10 +343,13 @@ DEFAULT_ROLES = [
         "Purchase Officer",
         "Procurement, goods receipt and QC.",
         [
-            "menu_purchase", "menu_inventory",
+            "menu_purchase", "menu_inventory", "menu_jobwork",
             "view_purchase", "create_purchase_order", "create_bill", "receive_goods",
             "approve_qc", "record_payment_out", "cancel_purchase_document",
             "view_inventory", "adjust_stock", "create_transfer",
+            "view_jobwork", "manage_jobwork", "approve_jobwork",
+            "view_masters", "manage_agencies", "manage_brokers", "manage_processes",
+            "manage_jobwork_rates", "manage_defects", "manage_loss_reasons", "manage_return_reasons",
         ],
     ),
     (
@@ -331,7 +358,7 @@ DEFAULT_ROLES = [
         "Stock position, transfers and audits.",
         [
             "menu_inventory", "view_inventory", "adjust_stock", "create_transfer",
-            "approve_zone_request", "perform_audit", "receive_goods",
+            "approve_zone_request", "perform_audit", "receive_goods", "view_jobwork",
         ],
     ),
     (
@@ -363,9 +390,10 @@ DEFAULT_ROLES = [
         "Production Coordinator",
         "Grey-fabric monitoring and verification. No payroll write.",
         [
-            "menu_hrms",
+            "menu_hrms", "menu_jobwork",
             "view_staff",
             "view_production", "enter_production", "verify_production",
+            "view_jobwork", "manage_jobwork", "approve_jobwork",
             "export_excel",
         ],
     ),

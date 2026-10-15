@@ -26,6 +26,28 @@ MOVEMENT_TYPES = [
     ("FAULTY", "FAULTY"),
     ("SERVICE_USAGE", "SERVICE_USAGE"),
     ("ZONE_ISSUE", "ZONE_ISSUE"),
+    ("ZONE_RETURN", "ZONE_RETURN"),
+    ("SAMPLE_ISSUE", "SAMPLE_ISSUE"),
+    # A returned sample is routed by its condition (Phase 1.4): Good goes back
+    # to stock, the rest to the QC Hold / Reprocess / Second Quality / Reject
+    # system locations.
+    ("SAMPLE_RETURN", "SAMPLE_RETURN"),
+    ("SAMPLE_RETURN_HOLD", "SAMPLE_RETURN_HOLD"),
+    ("SAMPLE_RETURN_REPROCESS", "SAMPLE_RETURN_REPROCESS"),
+    ("SAMPLE_RETURN_SECOND_QUALITY", "SAMPLE_RETURN_SECOND_QUALITY"),
+    ("SAMPLE_RETURN_REJECT", "SAMPLE_RETURN_REJECT"),
+    ("JOBWORK_OUTWARD", "JOBWORK_OUTWARD"),
+    ("JOBWORK_INWARD", "JOBWORK_INWARD"),
+    ("QC_PASS", "QC_PASS"),
+    ("QC_HOLD", "QC_HOLD"),
+    ("QC_REPROCESS", "QC_REPROCESS"),
+    ("QC_REJECT", "QC_REJECT"),
+    ("QC_SECOND_QUALITY", "QC_SECOND_QUALITY"),
+    ("SALES_RETURN_GOOD", "SALES_RETURN_GOOD"),
+    ("SALES_RETURN_HOLD", "SALES_RETURN_HOLD"),
+    ("SALES_RETURN_REPROCESS", "SALES_RETURN_REPROCESS"),
+    ("SALES_RETURN_SECOND_QUALITY", "SALES_RETURN_SECOND_QUALITY"),
+    ("SALES_RETURN_REJECT", "SALES_RETURN_REJECT"),
 ]
 
 #: Movements that reverse an earlier one, keyed to what they reverse.
@@ -34,6 +56,39 @@ REVERSAL_OF = {
     "PURCHASE_REVERSAL": "PURCHASE",
     "RETURN_CANCELLATION": "SALES_RETURN",
 }
+
+#: Condition-routed sales returns are cancelled with RETURN_CANCELLATION too.
+SALES_RETURN_TYPES = (
+    "SALES_RETURN",
+    "SALES_RETURN_GOOD",
+    "SALES_RETURN_HOLD",
+    "SALES_RETURN_REPROCESS",
+    "SALES_RETURN_SECOND_QUALITY",
+    "SALES_RETURN_REJECT",
+)
+
+#: Movements undone by posting the *same* type with the opposite sign (linked
+#: through ``original_movement``) -- relocations between two locations have no
+#: separate reversal vocabulary.
+SELF_REVERSING_TYPES = (
+    "TRANSFER_IN",
+    "TRANSFER_OUT",
+    "QC_PASS",
+    "QC_HOLD",
+    "QC_REPROCESS",
+    "QC_REJECT",
+    "QC_SECOND_QUALITY",
+    "SAMPLE_ISSUE",
+    "SAMPLE_RETURN",
+    "SAMPLE_RETURN_HOLD",
+    "SAMPLE_RETURN_REPROCESS",
+    "SAMPLE_RETURN_SECOND_QUALITY",
+    "SAMPLE_RETURN_REJECT",
+    "ZONE_RETURN",
+)
+
+#: Valid values of ``LotTaka.qc_status`` (kept as-is for Phase 1).
+LOT_QC_STATUSES = ("Passed", "Pending", "On Hold", "Reprocess", "Rejected")
 
 
 class StockMovement(TenantModel, LegacyIdMixin):
@@ -75,6 +130,9 @@ class StockMovement(TenantModel, LegacyIdMixin):
     )
 
     batch_number = models.TextField(null=True, blank=True)
+    lot_taka = models.ForeignKey(
+        "inventory.LotTaka", null=True, blank=True, on_delete=models.SET_NULL, related_name="movements"
+    )
     movement_date = models.DateField()
     notes = models.TextField(null=True, blank=True)
 
@@ -171,6 +229,9 @@ class StockTransferLine(TenantModel):
     item = models.ForeignKey("masters.Item", on_delete=models.PROTECT, related_name="+")
     qty = models.DecimalField(max_digits=18, decimal_places=4)
     received_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    #: The takas selected for this line: ``[{"lotTakaId": uuid, "qty": "12.5"}]``.
+    #: A taka may be moved partly; dispatch splits it.
+    takas = models.JSONField(default=list, blank=True)
 
     class Meta:
         db_table = "stock_transfer_lines"
@@ -459,6 +520,21 @@ class LotTaka(TenantModel, LegacyIdMixin):
     item = models.ForeignKey(
         "masters.Item", on_delete=models.PROTECT, related_name="lot_takas"
     )
+    fabric_quality = models.ForeignKey(
+        "masters.FabricQuality", null=True, blank=True, on_delete=models.SET_NULL, related_name="lot_takas"
+    )
+    design = models.ForeignKey(
+        "masters.Design", null=True, blank=True, on_delete=models.SET_NULL, related_name="lot_takas"
+    )
+    shade = models.ForeignKey(
+        "masters.Shade", null=True, blank=True, on_delete=models.SET_NULL, related_name="lot_takas"
+    )
+    parent_taka = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="child_takas"
+    )
+    parent_lots = models.ManyToManyField(
+        "self", blank=True, symmetrical=False, related_name="derived_lots"
+    )
     supplier = models.ForeignKey(
         "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
@@ -472,9 +548,36 @@ class LotTaka(TenantModel, LegacyIdMixin):
     received_quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     available_quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     uom = models.TextField(null=True, blank=True)
+    STATUS_AVAILABLE = "Available"
+    STATUS_RESERVED = "Reserved"
+    STATUS_EXTERNAL_WIP = "External WIP"
+    STATUS_QC_HOLD = "QC Hold"
+    STATUS_REPROCESS = "Reprocess"
+    STATUS_FINISHED = "Finished"
+    STATUS_SECOND_QUALITY = "Second Quality"
+    STATUS_REJECT = "Reject"
+    STATUS_SAMPLE = "Sample"
+    STATUS_DISPATCHED = "Dispatched"
+    STATUS_CUSTOMER_RETURN = "Customer Return"
+
+    STATUS_CHOICES = [
+        ("Available", "Available"),
+        ("Reserved", "Reserved"),
+        ("External WIP", "External WIP"),
+        ("QC Hold", "QC Hold"),
+        ("Reprocess", "Reprocess"),
+        ("Finished", "Finished"),
+        ("Second Quality", "Second Quality"),
+        ("Reject", "Reject"),
+        ("Sample", "Sample"),
+        ("Dispatched", "Dispatched"),
+        ("Customer Return", "Customer Return"),
+        ("Active", "Active"),  # backward compat
+    ]
+
     qc_status = models.TextField(default="Passed")  # Passed, Pending, On Hold, Reprocess, Rejected
     qc_notes = models.TextField(null=True, blank=True)
-    status = models.TextField(default="Active")  # Active, Closed
+    status = models.TextField(choices=STATUS_CHOICES, default="Available")
     barcode = models.TextField(null=True, blank=True, db_index=True)
     tag_status = models.TextField(default="Pending")  # Pending, Printed, Reprinted
     print_count = models.IntegerField(default=0)
@@ -497,6 +600,9 @@ class LotTaka(TenantModel, LegacyIdMixin):
     stock_movement = models.ForeignKey(
         "inventory.StockMovement", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    #: The document line this lot/taka was received on (e.g. a goods-receipt
+    #: line), so a multi-line GRN can be dispositioned line by line.
+    source_line_id = models.UUIDField(null=True, blank=True)
 
     class Meta:
         db_table = "lot_takas"
@@ -550,4 +656,350 @@ class TakaTagPrintLog(TenantModel):
 
     def __str__(self):
         return f"{self.action_type} for {self.taka_id} at {self.printed_at}"
+
+
+class QCInspection(TenantModel, LegacyIdMixin):
+    """Piece-by-piece fabric inspection register header (PDF §08)."""
+
+    STATUSES = [
+        ("Draft", "Draft"),
+        ("Pending", "Pending"),
+        ("Approved", "Approved"),
+        ("Partially Approved", "Partially Approved"),
+        ("On Hold", "On Hold"),
+        ("Rework", "Rework"),
+        ("Rejected", "Rejected"),
+    ]
+
+    SOURCE_TYPES = [
+        ("GRN", "GRN"),
+        ("JWO_INWARD", "Job Work Inward"),
+        ("SALES_RETURN", "Sales Return"),
+        ("INTERNAL", "Internal / Manual"),
+    ]
+
+    inspection_number = models.TextField(db_index=True)
+    source_document_type = models.TextField(choices=SOURCE_TYPES, default="GRN")
+    source_document_id = models.UUIDField(null=True, blank=True)
+    source_document_number = models.TextField(null=True, blank=True)
+    inspection_date = models.DateField(default=timezone.localdate)
+    inspector = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    inspector_employee = models.ForeignKey(
+        "hrms.Employee",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    shift = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="Pending")
+    total_received_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    total_inspected_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    passed_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    second_quality_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    reprocess_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    rejected_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    hold_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    notes = models.TextField(null=True, blank=True)
+    previous_inspection = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="reinspections"
+    )
+
+    class Meta:
+        db_table = "qc_inspections"
+        ordering = ["-inspection_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "inspection_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_qc_inspection_number",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.inspection_number} ({self.status})"
+
+
+class QCInspectionLine(TenantModel):
+    """Piece-by-piece taka inspection line with 4-point calculation (PDF §08)."""
+
+    DISPOSITIONS = [
+        ("Pass", "Pass"),
+        ("Hold", "Hold"),
+        ("Reprocess", "Reprocess"),
+        ("Reject", "Reject"),
+        ("Second Quality", "Second Quality"),
+    ]
+
+    inspection = models.ForeignKey(
+        QCInspection, on_delete=models.CASCADE, related_name="lines"
+    )
+    lot_taka = models.ForeignKey(
+        LotTaka, null=True, blank=True, on_delete=models.SET_NULL, related_name="inspection_lines"
+    )
+    taka_number = models.TextField(default="1")
+    lot_number = models.TextField(null=True, blank=True)
+    original_meter = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    actual_meter = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    roll_weight = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    width = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    gsm = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    grade = models.TextField(default="A")  # A, B, C, Second
+    penalty_points = models.IntegerField(default=0)
+    points_per_100_sq_meter = models.DecimalField(max_digits=9, decimal_places=2, default=0)
+    disposition = models.TextField(choices=DISPOSITIONS, default="Pass")
+    remarks = models.TextField(null=True, blank=True)
+    photo_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+
+    class Meta:
+        db_table = "qc_inspection_lines"
+        ordering = ["created_at"]
+
+
+class QCInspectionLineDefect(TenantModel):
+    """M2M Defect logging per taka (PDF §08)."""
+
+    inspection_line = models.ForeignKey(
+        QCInspectionLine, on_delete=models.CASCADE, related_name="defects"
+    )
+    defect = models.ForeignKey(
+        "masters.DefectMaster", on_delete=models.PROTECT, related_name="+"
+    )
+    defect_count = models.IntegerField(default=1)
+    points = models.IntegerField(default=1)
+    distance_meter = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "qc_inspection_line_defects"
+        ordering = ["created_at"]
+
+
+class LotCostEntry(TenantModel, LegacyIdMixin):
+    """Landed cost ledger per lot/taka (PDF §09)."""
+
+    COST_TYPES = [
+        ("Grey purchase", "Grey purchase"),
+        ("Purchase freight/loading", "Purchase freight/loading"),
+        ("Dyeing/Printing/Finishing", "Dyeing/Printing/Finishing"),
+        ("Processing transport", "Processing transport"),
+        ("Reprocess", "Reprocess"),
+        ("Other direct", "Other direct"),
+        ("Scrap recovery", "Scrap recovery"),
+    ]
+
+    lot_taka = models.ForeignKey(
+        "inventory.LotTaka", null=True, blank=True, on_delete=models.SET_NULL, related_name="cost_entries"
+    )
+    lot_number = models.TextField(db_index=True)
+    cost_type = models.TextField(choices=COST_TYPES)
+    amount = models.DecimalField(max_digits=18, decimal_places=4)
+    quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    cost_per_meter = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    source_document_type = models.TextField(default="MANUAL")
+    source_document_id = models.UUIDField(null=True, blank=True)
+    source_document_number = models.TextField(null=True, blank=True)
+    date = models.DateField(default=timezone.localdate)
+    posted_by = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    is_approved = models.BooleanField(default=True)
+    approval_status = models.TextField(default="Approved")  # Approved, Pending, Rejected
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "lot_cost_entries"
+        ordering = ["-date", "-created_at"]
+        indexes = [
+            models.Index(fields=["client", "lot_number"], name="ix_lot_cost_lot_num"),
+            models.Index(fields=["client", "lot_taka"], name="ix_lot_cost_taka"),
+        ]
+
+    def __str__(self):
+        return f"{self.lot_number} - {self.cost_type}: {self.amount}"
+
+
+class Sample(TenantModel, LegacyIdMixin):
+    """Sampling management with stock movements & expense booking (PDF §10)."""
+
+    STATUSES = [
+        ("Issued", "Issued"),
+        ("Returned", "Returned"),
+        ("Partially Returned", "Partially Returned"),
+        ("Consumed", "Consumed"),
+        ("Overdue", "Overdue"),
+    ]
+    SAMPLE_TYPES = [
+        ("CUT_PIECE", "Cut Piece"),
+        ("FULL_TAKA", "Full Taka"),
+        ("SAMPLE_FOLDER", "Sample Folder / Hanger"),
+    ]
+
+    sample_number = models.TextField(db_index=True)
+    sample_date = models.DateField(default=timezone.localdate)
+    party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="samples"
+    )
+    salesperson = models.ForeignKey(
+        "hrms.Employee", null=True, blank=True, on_delete=models.SET_NULL, related_name="samples"
+    )
+    broker = models.ForeignKey(
+        "masters.Broker", null=True, blank=True, on_delete=models.SET_NULL, related_name="samples"
+    )
+    source_lot_taka = models.ForeignKey(
+        "inventory.LotTaka", null=True, blank=True, on_delete=models.SET_NULL, related_name="samples"
+    )
+    fabric_quality = models.ForeignKey(
+        "masters.FabricQuality", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    design = models.ForeignKey(
+        "masters.Design", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    shade = models.ForeignKey(
+        "masters.Shade", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    sample_type = models.TextField(choices=SAMPLE_TYPES, default="CUT_PIECE")
+    quantity = models.DecimalField(max_digits=18, decimal_places=4, default=1)
+    uom = models.TextField(default="MTR")
+    is_returnable = models.BooleanField(default=True)
+    due_date = models.DateField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="Issued")
+    returned_quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    consumed_quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    estimated_cost = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    photo_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    issued_by = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    journal_entry = models.ForeignKey(
+        "accounting.JournalEntry", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "inventory_samples"
+        ordering = ["-sample_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "sample_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_inventory_sample_number",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.sample_number} ({self.status})"
+
+
+class Trip(TenantModel, LegacyIdMixin):
+    """Logistics / Transport / Tempo trip management (PDF §13)."""
+
+    TRIP_TYPES = [
+        ("INWARD", "Inward / Purchase"),
+        ("OUTWARD", "Outward / Sales Dispatch"),
+        ("JOBWORK_OUT", "Job Work Outward"),
+        ("JOBWORK_IN", "Job Work Inward"),
+        ("INTERNAL", "Internal Transfer"),
+    ]
+    STATUSES = [
+        ("Draft", "Draft"),
+        ("Loaded", "Loaded"),
+        ("In Transit", "In Transit"),
+        ("Delivered", "Delivered"),
+        ("Cancelled", "Cancelled"),
+    ]
+    PAID_BY_CHOICES = [
+        ("Company", "Company"),
+        ("Party", "Party"),
+        ("Transporter", "Transporter"),
+    ]
+    COST_ALLOCATION_CHOICES = [
+        ("LOT", "Allocate to Lots"),
+        ("SALES_ORDER", "Allocate to Sales Order"),
+        ("EXPENSE", "General Freight Expense"),
+    ]
+
+    trip_number = models.TextField(db_index=True)
+    trip_date = models.DateField(default=timezone.localdate)
+    from_location = models.TextField()
+    to_location = models.TextField()
+    transporter = models.ForeignKey(
+        "masters.Transporter", null=True, blank=True, on_delete=models.SET_NULL, related_name="trips"
+    )
+    transporter_party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="transporter_trips"
+    )
+    vehicle_number = models.TextField()
+    driver_name = models.TextField(null=True, blank=True)
+    driver_mobile = models.TextField(null=True, blank=True)
+    lr_number = models.TextField(null=True, blank=True)
+    lr_date = models.DateField(null=True, blank=True)
+    trip_type = models.TextField(choices=TRIP_TYPES, default="OUTWARD")
+    status = models.TextField(choices=STATUSES, default="Draft")
+
+    freight_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    loading_charges = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    unloading_charges = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    other_charges = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    total_charges = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    paid_by = models.TextField(choices=PAID_BY_CHOICES, default="Company")
+    cost_allocation_target = models.TextField(choices=COST_ALLOCATION_CHOICES, default="LOT")
+    is_cost_allocated = models.BooleanField(default=False)
+
+    dispatch_time = models.DateTimeField(null=True, blank=True)
+    delivery_time = models.DateTimeField(null=True, blank=True)
+    proof_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "transport_trips"
+        ordering = ["-trip_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "trip_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_transport_trip_number",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.trip_number} ({self.vehicle_number})"
+
+
+class TripMaterialLine(TenantModel):
+    """Line item in a transport trip (PDF §13)."""
+
+    trip = models.ForeignKey(Trip, on_delete=models.CASCADE, related_name="materials")
+    lot_taka = models.ForeignKey(
+        LotTaka, null=True, blank=True, on_delete=models.SET_NULL, related_name="trip_materials"
+    )
+    lot_number = models.TextField(null=True, blank=True)
+    taka_number = models.TextField(null=True, blank=True)
+    item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    roll_weight = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    document_reference_type = models.TextField(null=True, blank=True)
+    document_reference_id = models.UUIDField(null=True, blank=True)
+    document_reference_number = models.TextField(null=True, blank=True)
+    allocated_freight = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+
+    class Meta:
+        db_table = "transport_trip_materials"
+        ordering = ["created_at"]
+
+
 

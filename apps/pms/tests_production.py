@@ -61,8 +61,12 @@ class ProductionTestBase(TestCase):
             "order_meter": Decimal("100"),
             "user": self.user,
         }
+        approve = overrides.pop("approve", True)
         params.update(overrides)
-        return services.create_instruction(**params)
+        instruction = services.create_instruction(**params)
+        if approve:
+            instruction = services.approve_instruction(instruction, user=self.user)
+        return instruction
 
     def make_scheme(self, rate="10"):
         from apps.pms.models import IncentiveScheme
@@ -308,7 +312,12 @@ class ProductionReportTests(ProductionTestBase):
 
 class ApprovalAuditTests(ProductionTestBase):
     def test_verify_writes_audit_with_actor_time_values_reason(self):
-        instruction = self.make_instruction()
+        employee = self.make_employee()
+        instruction = self.make_instruction(employee=employee)
+        services.record_daily_entry(
+            client=self.client_obj, instruction=instruction, entry_date=date(2026, 10, 1),
+            meters=Decimal("40"), entered_by_employee=employee, entered_by_user=self.user,
+        )
         services.verify_instruction(
             instruction, user=self.user, reason="Meters cross-checked."
         )
@@ -321,8 +330,8 @@ class ApprovalAuditTests(ProductionTestBase):
         self.assertIsNotNone(entry)
         self.assertEqual(entry.actor_id, self.user.id)
         self.assertIsNotNone(entry.created_at)
-        self.assertEqual(entry.from_value, "In Progress")
-        self.assertEqual(entry.to_value, "Verified")
+        self.assertEqual(entry.from_value, "Running")
+        self.assertEqual(entry.to_value, "PO Pending")
         self.assertEqual(entry.comments, "Meters cross-checked.")
 
 

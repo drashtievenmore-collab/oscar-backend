@@ -15,8 +15,8 @@ from apps.core.serializers import (
     TenantPrimaryKeyRelatedField,
 )
 
-from . import services
 from .models import (
+    BrokerCommission,
     DeliveryChallan,
     DeliveryChallanLine,
     PaymentAllocation,
@@ -35,6 +35,7 @@ from .models import (
     WarrantyCard,
     WarrantyCardItem,
 )
+from . import services
 
 
 def line_serializer_for(line_model, table_name, extra_fields=(), extra_read_only=()):
@@ -67,14 +68,14 @@ SalesOrderLineSerializer = line_serializer_for(
     extra_read_only=["dispatched_qty", "invoiced_qty"],
 )
 ProformaInvoiceLineSerializer = line_serializer_for(
-    ProformaInvoiceLine, "proforma_invoice_lines"
+    ProformaInvoiceLine, "proforma_invoice_lines", extra_fields=["sales_order_line"],
 )
 DeliveryChallanLineSerializer = line_serializer_for(
-    DeliveryChallanLine, "delivery_challan_lines"
+    DeliveryChallanLine, "delivery_challan_lines", extra_fields=["taka_allocations"],
 )
 SalesInvoiceLineSerializer = line_serializer_for(
     SalesInvoiceLine, "sales_invoice_lines",
-    extra_fields=["returned_qty"], extra_read_only=["returned_qty"],
+    extra_fields=["returned_qty", "taka_allocations"], extra_read_only=["returned_qty"],
 )
 
 
@@ -126,11 +127,15 @@ class SalesOrderSerializer(DocumentSerializer):
     line_fk_name = "sales_order"
     line_table_name = "sales_order_lines"
 
+    vehicleNo = serializers.CharField(source="vehicle_number", required=False, allow_blank=True, allow_null=True)
+    dispatchDate = serializers.DateField(source="dispatch_date", required=False, allow_null=True)
+
     class Meta:
         model = SalesOrder
         fields = HEADER_FIELDS + [
             "order_number", "stage", "payment_status", "delivery_date",
             "quotation", "pms_project", "reference_number",
+            "dispatch_date", "dispatchDate", "vehicle_number", "vehicleNo", "transporter",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["order_number", "payment_status"]
 
@@ -170,11 +175,14 @@ class DeliveryChallanSerializer(DocumentSerializer):
     line_fk_name = "delivery_challan"
     line_table_name = "delivery_challan_lines"
 
+    vehicleNo = serializers.CharField(source="vehicle_number", required=False, allow_blank=True, allow_null=True)
+    dispatchDate = serializers.DateField(source="dispatch_date", required=False, allow_null=True)
+
     class Meta:
         model = DeliveryChallan
         fields = HEADER_FIELDS + [
             "challan_number", "status", "sales_order", "quotation",
-            "dispatch_date", "vehicle_number", "transporter", "lr_number",
+            "dispatch_date", "dispatchDate", "vehicle_number", "vehicleNo", "transporter", "lr_number",
             "delivery_location", "location", "delivered_at",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["challan_number", "delivered_at"]
@@ -189,6 +197,9 @@ class SalesInvoiceSerializer(DocumentSerializer):
     line_fk_name = "sales_invoice"
     line_table_name = "sales_invoice_lines"
 
+    vehicleNo = serializers.CharField(source="vehicle_number", required=False, allow_blank=True, allow_null=True)
+    dispatchDate = serializers.DateField(source="dispatch_date", required=False, allow_null=True)
+
     #: ``Overdue`` is layered on at read time, never stored (db.md §12).
     displayStatus = serializers.SerializerMethodField()
 
@@ -198,6 +209,7 @@ class SalesInvoiceSerializer(DocumentSerializer):
             "invoice_number", "status", "displayStatus", "due_date",
             "sales_order", "delivery_challan", "proforma_invoice", "location",
             "irn", "eway_bill_number",
+            "dispatch_date", "dispatchDate", "vehicle_number", "vehicleNo", "transporter",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["invoice_number", "status"]
 
@@ -278,10 +290,17 @@ class SalesReturnLineSerializer(DocumentLineSerializer):
         source="sales_invoice_line", queryset=SalesInvoiceLine.objects.all()
     )
     returnedQty = QuantityField(source="returned_qty")
+    condition = serializers.ChoiceField(
+        choices=["Good", "Hold", "Reprocess", "Second Quality", "Reject"],
+        required=False,
+    )
+    lotTakaId = serializers.UUIDField(source="lot_taka_id", required=False, allow_null=True)
 
     class Meta(DocumentLineSerializer.Meta):
         model = SalesReturnLine
-        fields = DocumentLineSerializer.Meta.fields + ["salesInvoiceLineId", "returnedQty"]
+        fields = DocumentLineSerializer.Meta.fields + [
+            "salesInvoiceLineId", "returnedQty", "condition", "lotTakaId",
+        ]
 
 
 class SalesReturnSerializer(DocumentSerializer):
@@ -399,3 +418,23 @@ class WarrantyCardSerializer(BaseModelSerializer):
 
 class ReasonSerializer(BaseSerializer):
     reason = serializers.CharField(required=False, allow_blank=True)
+
+
+class BrokerCommissionSerializer(BaseModelSerializer):
+    brokerName = serializers.CharField(source="broker.name", read_only=True)
+    brokerCode = serializers.CharField(source="broker.code", read_only=True)
+    partyName = serializers.CharField(source="party.name", read_only=True)
+    invoiceNumber = serializers.CharField(source="invoice.invoice_number", read_only=True)
+
+    class Meta:
+        model = BrokerCommission
+        fields = [
+            "id", "commission_number", "broker", "brokerName", "brokerCode",
+            "invoice", "invoiceNumber", "party", "partyName", "salesperson",
+            "invoice_date", "invoice_amount", "commission_basis", "commission_type",
+            "rate", "commission_amount", "paid_amount", "status",
+            "approved_by", "approved_at", "paid_at", "payment_reference",
+            "notes", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+

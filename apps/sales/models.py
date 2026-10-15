@@ -32,13 +32,18 @@ QUOTATION_STATUSES = [
     "Confirmed", "Converted", "Invoiced", "Cancelled",
 ]
 ORDER_STAGES = [
-    "Draft", "Confirmed", "Packing", "Dispatched", "Delivered", "Invoiced", "Cancelled",
+    "Draft", "Confirmed", "Partially Dispatched", "Fully Dispatched", "Invoiced", "Closed", "Cancelled",
 ]
 #: Stages whose open lines no longer reserve stock (api.md §5.4, db.md §5.2).
-NON_RESERVING_STAGES = ["Delivered", "Invoiced", "Cancelled"]
+#: A Draft order has not been committed yet; a Fully Dispatched / Invoiced /
+#: Closed order has already moved its stock; a Cancelled one never will.
+#: Only Confirmed and Partially Dispatched orders reserve their pending qty.
+NON_RESERVING_STAGES = ["Draft", "Fully Dispatched", "Invoiced", "Closed", "Cancelled"]
 PAYMENT_STATUSES = ["Unpaid", "Partially Paid", "Paid"]
 PROFORMA_STATUSES = ["Draft", "Sent", "Accepted", "Converted", "Expired", "Cancelled"]
 CHALLAN_STATUSES = ["Draft", "Dispatched", "In Transit", "Delivered", "Cancelled"]
+#: Challan statuses after the stock has left -- the ones that may be billed.
+CHALLAN_BILLABLE_STATUSES = ["Dispatched", "In Transit", "Delivered"]
 INVOICE_STATUSES = ["Draft", "Unpaid", "Partially Paid", "Paid", "Cancelled"]
 # The strings the UI's <select> actually emits (api.md §0: where code and
 # spec disagree, the frontend code is the fact). PaymentInPage, PaymentOutPage,
@@ -196,6 +201,9 @@ class SalesOrder(DocumentHeader):
         "pms.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     reference_number = models.TextField(null=True, blank=True)
+    dispatch_date = models.DateField(null=True, blank=True)
+    vehicle_number = models.TextField(null=True, blank=True)
+    transporter = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "sales_orders"
@@ -331,6 +339,11 @@ class DeliveryChallanLine(DocumentLine):
         SalesOrderLine, null=True, blank=True, on_delete=models.SET_NULL, related_name="challan_lines"
     )
 
+    #: Lot/taka-tracked items: which takas this line draws on, as
+    #: ``[{"lotTakaId": "<uuid>", "qty": "<stock qty>"}]``. Empty -> the
+    #: oldest available takas at the location are used (FIFO) on dispatch.
+    taka_allocations = models.JSONField(default=list, blank=True)
+
     class Meta(DocumentLine.Meta):
         db_table = "delivery_challan_lines"
         constraints = [
@@ -367,6 +380,9 @@ class SalesInvoice(DocumentHeader):
     )
     irn = models.TextField(null=True, blank=True)
     eway_bill_number = models.TextField(null=True, blank=True)
+    dispatch_date = models.DateField(null=True, blank=True)
+    vehicle_number = models.TextField(null=True, blank=True)
+    transporter = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "sales_invoices"
@@ -400,6 +416,11 @@ class SalesInvoiceLine(DocumentLine):
     )
     #: DERIVED -- how much of this line has come back on a credit note.
     returned_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+
+    #: Lot/taka-tracked items: which takas this line draws on, as
+    #: ``[{"lotTakaId": "<uuid>", "qty": "<stock qty>"}]``. Empty -> the
+    #: oldest available takas at the location are used (FIFO) on dispatch.
+    taka_allocations = models.JSONField(default=list, blank=True)
 
     class Meta(DocumentLine.Meta):
         db_table = "sales_invoice_lines"
@@ -543,6 +564,17 @@ class SalesReturnLine(DocumentLine):
         SalesInvoiceLine, on_delete=models.PROTECT, related_name="return_lines"
     )
     returned_qty = models.DecimalField(max_digits=18, decimal_places=4)
+    #: Phase 1.4 -- where the returned goods go: Good -> the return location,
+    #: Hold -> QC Hold, Reprocess / Second Quality / Reject -> those system
+    #: locations. Unspecified returns are held for QC.
+    condition = models.TextField(
+        choices=[(c, c) for c in ("Good", "Hold", "Reprocess", "Second Quality", "Reject")],
+        default="Hold",
+    )
+    #: The taka the returned fabric came from (required for lot/taka items).
+    lot_taka = models.ForeignKey(
+        "inventory.LotTaka", null=True, blank=True, on_delete=models.PROTECT, related_name="+"
+    )
 
     class Meta(DocumentLine.Meta):
         db_table = "sales_return_lines"
@@ -649,3 +681,70 @@ class WarrantyCardSerial(TenantModel):
                 fields=["warranty_card", "serial"], name="pk_warranty_card_serials"
             )
         ]
+
+
+class BrokerCommission(TenantModel, LegacyIdMixin):
+    """Broker commission ledger per invoice (PDF §12)."""
+
+    STATUSES = [
+        ("Accrued", "Accrued"),
+        ("Approved", "Approved"),
+        ("Payable", "Payable"),
+        ("Paid", "Paid"),
+        ("Hold", "Hold"),
+        ("Cancelled", "Cancelled"),
+    ]
+    COMMISSION_TYPES = [
+        ("percent", "percent"),
+        ("per_meter", "per_meter"),
+        ("fixed", "fixed"),
+    ]
+    BASIS_CHOICES = [
+        ("INVOICE", "Invoice Value"),
+        ("COLLECTION", "Collection Value"),
+        ("QUANTITY", "Meters / Taka"),
+    ]
+
+    commission_number = models.TextField(null=True, blank=True, db_index=True)
+    broker = models.ForeignKey(
+        "masters.Broker", on_delete=models.PROTECT, related_name="commissions"
+    )
+    invoice = models.ForeignKey(
+        "sales.SalesInvoice", on_delete=models.CASCADE, related_name="broker_commissions"
+    )
+    party = models.ForeignKey(
+        "masters.Party", on_delete=models.PROTECT, related_name="+"
+    )
+    salesperson = models.ForeignKey(
+        "hrms.Employee", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    invoice_date = models.DateField()
+    invoice_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    commission_basis = models.TextField(choices=BASIS_CHOICES, default="INVOICE")
+    commission_type = models.TextField(choices=COMMISSION_TYPES, default="percent")
+    rate = models.DecimalField(max_digits=9, decimal_places=2, default=0)
+    commission_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    paid_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    status = models.TextField(choices=STATUSES, default="Accrued")
+    approved_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
+    journal_entry = models.ForeignKey(
+        "accounting.JournalEntry", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    payment_reference = models.TextField(null=True, blank=True)
+    notes = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "broker_commissions"
+        ordering = ["-invoice_date", "-created_at"]
+        indexes = [
+            models.Index(fields=["client", "broker", "status"], name="ix_broker_comm_status"),
+            models.Index(fields=["client", "invoice"], name="ix_broker_comm_inv"),
+        ]
+
+    def __str__(self):
+        return f"{self.commission_number or self.id} ({self.status}): {self.commission_amount}"
+

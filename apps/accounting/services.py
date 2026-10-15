@@ -16,7 +16,7 @@ from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from apps.core.exceptions import BusinessRuleViolation, Codes, ValidationFailed
-from apps.core.money import ZERO, D, round2
+from apps.core.money import ZERO, D, round2, round4
 from apps.core.numbering import allocate_number
 
 from .models import Account, JournalEntry, JournalLine
@@ -221,24 +221,166 @@ def reverse_document_entries(*, client_id, source_document_type, source_document
 
 
 # ---------------------------------------------------------------------------
+# Inventory cost (COGS)
+# ---------------------------------------------------------------------------
+def inventory_unit_cost(client_id, item, location_id=None):
+    """Weighted average cost per stock unit, from ``stock_balances``.
+
+    ``apps.inventory.services._apply_to_balance`` accumulates every costed
+    inward movement (GRN at landed cost, returns, transfers in) into
+    ``inward_value`` / ``inward_qty``; their ratio is the WAC. The location's
+    own WAC is used first, then the item's WAC across all locations. The item
+    master's ``cost_price`` is only the last resort for an item that has never
+    had a costed inward movement (e.g. migrated opening stock).
+    """
+    from apps.inventory.models import StockBalance
+    from apps.masters.models import Item
+
+    item_id = getattr(item, "id", item)
+    balances = StockBalance.objects.filter(client_id=client_id, item_id=item_id)
+    if location_id is not None:
+        row = balances.filter(location_id=location_id).first()
+        if row is not None and row.weighted_average_cost:
+            return round4(row.weighted_average_cost)
+    totals = balances.aggregate(
+        qty=Coalesce(Sum("inward_qty"), Value(Decimal("0")),
+                     output_field=DecimalField(max_digits=18, decimal_places=4)),
+        value=Coalesce(Sum("inward_value"), Value(Decimal("0")),
+                       output_field=DecimalField(max_digits=18, decimal_places=2)),
+    )
+    if D(totals["qty"]) > ZERO:
+        return round4(D(totals["value"]) / D(totals["qty"]))
+
+    cost_price = (
+        item.cost_price
+        if hasattr(item, "cost_price")
+        else Item.objects.filter(pk=item_id).values_list("cost_price", flat=True).first()
+    )
+    return round4(cost_price) if cost_price else None
+
+
+def _movement_unit_cost(client_id, item_id, references):
+    """Average unit cost of the SALE movements posted by ``references``
+    (``[(reference_type, reference_id), ...]``) for one item."""
+    from apps.inventory.models import StockMovement
+
+    condition = Q()
+    for reference_type, reference_id in references:
+        if reference_id:
+            condition |= Q(reference_type=reference_type, reference_id=reference_id)
+    if not condition:
+        return None
+    qty = ZERO
+    value = ZERO
+    for movement in StockMovement.objects.filter(
+        condition, client_id=client_id, item_id=item_id, type="SALE",
+        unit_cost__isnull=False,
+    ):
+        moved = -D(movement.quantity)
+        qty += moved
+        value += moved * D(movement.unit_cost)
+    if qty <= ZERO:
+        return None
+    return round4(value / qty)
+
+
+def sales_line_unit_cost(invoice, line):
+    """Cost per stock unit of what an invoice line sold.
+
+    The stock left either on the invoice itself or on the delivery challan(s)
+    it bills; the cost frozen on those SALE movements is the cost of the goods
+    that actually went out. Falls back to the current WAC.
+    """
+    from apps.sales.models import DeliveryChallanLine
+
+    references = [("SalesInvoice", invoice.id)]
+    if line.delivery_challan_line_id:
+        references.append(
+            ("DeliveryChallan", line.delivery_challan_line.delivery_challan_id)
+        )
+    if invoice.delivery_challan_id:
+        references.append(("DeliveryChallan", invoice.delivery_challan_id))
+    if line.sales_order_line_id:
+        challan_ids = DeliveryChallanLine.objects.filter(
+            sales_order_line_id=line.sales_order_line_id, deleted_at__isnull=True
+        ).exclude(delivery_challan__status__in=["Draft", "Cancelled"]).values_list(
+            "delivery_challan_id", flat=True
+        )
+        references.extend(("DeliveryChallan", cid) for cid in challan_ids)
+
+    cost = _movement_unit_cost(invoice.client_id, line.item_id, references)
+    if cost is None:
+        cost = inventory_unit_cost(invoice.client_id, line.item, invoice.location_id)
+    return cost
+
+
+def _stock_qty(qty, line):
+    from apps.masters import uom
+
+    return D(uom.to_stock_qty(qty, getattr(line, "uom_factor", None) or Decimal("1")))
+
+
+def invoice_cogs(invoice):
+    """COGS of a sales invoice: stock qty x unit cost, per stock-holding line."""
+    total = ZERO
+    for line in invoice.line_items.filter(deleted_at__isnull=True).select_related(
+        "item", "delivery_challan_line"
+    ):
+        if line.item_id is None or not line.item.holds_stock:
+            continue
+        unit_cost = sales_line_unit_cost(invoice, line)
+        if unit_cost is None:
+            continue
+        total += _stock_qty(line.qty, line) * D(unit_cost)
+    return round2(total)
+
+
+def return_cogs(sales_return):
+    """COGS to reverse for a credit note: returned stock qty x the unit cost
+    the original invoice line was costed at."""
+    total = ZERO
+    invoice = sales_return.sales_invoice
+    for line in sales_return.line_items.filter(deleted_at__isnull=True).select_related(
+        "item", "sales_invoice_line", "sales_invoice_line__delivery_challan_line"
+    ):
+        invoice_line = line.sales_invoice_line
+        if line.item_id is None or not line.item.holds_stock or invoice_line is None:
+            continue
+        unit_cost = sales_line_unit_cost(invoice, invoice_line)
+        if unit_cost is None:
+            continue
+        total += _stock_qty(line.returned_qty, invoice_line) * D(unit_cost)
+    return round2(total)
+
+
+# ---------------------------------------------------------------------------
 # api.md §8.1 -- the auto-posting matrix
 # ---------------------------------------------------------------------------
 def post_sales_invoice(invoice, *, user=None):
-    """Dr Debtors | Cr Sales, Cr GST Output."""
+    """Dr Debtors | Cr Sales, Cr GST Output. Dr COGS | Cr Inventory."""
     client_id = invoice.client_id
     tax = round2((invoice.cgst or ZERO) + (invoice.sgst or ZERO) + (invoice.igst or ZERO) + (invoice.cess or ZERO))
     if tax == ZERO:
         tax = round2(invoice.total_tax)
     revenue = round2(invoice.total - tax)
 
+    postings = [
+        debit(system_account(client_id, "debtors"), invoice.total, party=invoice.party,
+              description=f"Invoice {invoice.invoice_number}"),
+        credit(system_account(client_id, "sales"), revenue),
+        credit(system_account(client_id, "gst_output"), tax),
+    ]
+
+    cogs_total = invoice_cogs(invoice)
+    if cogs_total > ZERO:
+        postings.append(debit(system_account(client_id, "cogs"), cogs_total,
+                              description=f"COGS {invoice.invoice_number}"))
+        postings.append(credit(system_account(client_id, "stock"), cogs_total,
+                               description=f"Inventory out {invoice.invoice_number}"))
+
     return post_entry(
         client=invoice.client,
-        postings=[
-            debit(system_account(client_id, "debtors"), invoice.total, party=invoice.party,
-                  description=f"Invoice {invoice.invoice_number}"),
-            credit(system_account(client_id, "sales"), revenue),
-            credit(system_account(client_id, "gst_output"), tax),
-        ],
+        postings=postings,
         entry_date=invoice.doc_date,
         narration=f"Sales invoice {invoice.invoice_number} - {invoice.party_name}",
         source_document_type="SalesInvoice",
@@ -270,17 +412,25 @@ def post_payment_in(payment, *, user=None):
 
 
 def post_sales_return(sales_return, *, user=None):
-    """Dr Sales Return, Dr GST Output | Cr Debtors."""
+    """Dr Sales Return, Dr GST Output | Cr Debtors. Dr Inventory | Cr COGS."""
     client_id = sales_return.client_id
     tax = round2(sales_return.total_tax)
     revenue = round2(sales_return.total - tax)
+    postings = [
+        debit(system_account(client_id, "sales_return"), revenue),
+        debit(system_account(client_id, "gst_output"), tax),
+        credit(system_account(client_id, "debtors"), sales_return.total, party=sales_return.party),
+    ]
+    cogs_total = return_cogs(sales_return)
+    if cogs_total > ZERO:
+        number = sales_return.credit_note_number or sales_return.return_number
+        postings.append(debit(system_account(client_id, "stock"), cogs_total,
+                              description=f"Inventory back {number}"))
+        postings.append(credit(system_account(client_id, "cogs"), cogs_total,
+                               description=f"COGS reversal {number}"))
     return post_entry(
         client=sales_return.client,
-        postings=[
-            debit(system_account(client_id, "sales_return"), revenue),
-            debit(system_account(client_id, "gst_output"), tax),
-            credit(system_account(client_id, "debtors"), sales_return.total, party=sales_return.party),
-        ],
+        postings=postings,
         entry_date=sales_return.doc_date,
         narration=f"Credit note {sales_return.credit_note_number or sales_return.return_number}",
         source_document_type="SalesReturn",
@@ -289,19 +439,75 @@ def post_sales_return(sales_return, *, user=None):
     )
 
 
-def post_purchase_bill(bill, *, user=None):
-    """Dr Purchases/Inventory, Dr GST Input | Cr Creditors."""
+def _debit_signed(account, amount, *, description=None):
+    """A debit that turns into a credit when ``amount`` is negative
+    (e.g. a negative round-off), so the entry still balances."""
+    amount = round2(amount)
+    if amount < ZERO:
+        return credit(account, -amount, description=description)
+    return debit(account, amount, description=description)
+
+
+def purchase_bill_postings(bill):
+    """Debit side of a purchase bill, split per the chart of accounts.
+
+    * stock-holding items (``Item.holds_stock``)  -> Dr Inventory (1200)
+    * non-stock items / free-text lines            -> Dr Purchases (5000)
+    * freight + other charges on the header        -> Dr Freight (5300)
+    * GST                                          -> Dr GST Input (1400)
+
+    The header's taxable value (after any header discount) is split between
+    stock and non-stock in proportion to the lines' net amounts; round-off
+    rides on the larger side so the entry balances to the paisa.
+    """
     client_id = bill.client_id
     tax = round2(bill.total_tax)
-    goods = round2(bill.total - tax)
+    freight = round2(D(bill.freight_charges) + D(bill.other_charges))
+    goods = round2(D(bill.total) - tax - freight)
+
+    stock_net = ZERO
+    non_stock_net = ZERO
+    for line in bill.line_items.filter(deleted_at__isnull=True).select_related("item"):
+        net = D(line.amount) - D(line.discount_amount)
+        if line.item_id is not None and line.item.holds_stock:
+            stock_net += net
+        else:
+            non_stock_net += net
+
+    taxable = round2(bill.taxable_value)
+    gross = stock_net + non_stock_net
+    if gross > ZERO:
+        stock_amt = round2(taxable * stock_net / gross)
+        non_stock_amt = round2(taxable - stock_amt)
+    else:
+        stock_amt, non_stock_amt = ZERO, taxable
+
+    round_off = round2(goods - stock_amt - non_stock_amt)
+    if stock_amt >= non_stock_amt:
+        stock_amt = round2(stock_amt + round_off)
+    else:
+        non_stock_amt = round2(non_stock_amt + round_off)
+
+    return [
+        _debit_signed(system_account(client_id, "stock"), stock_amt,
+                      description="Stock purchased"),
+        _debit_signed(system_account(client_id, "purchases"), non_stock_amt,
+                      description="Non-stock purchases"),
+        _debit_signed(system_account(client_id, "freight"), freight,
+                      description="Freight and other charges"),
+        _debit_signed(system_account(client_id, "gst_input"), tax),
+        credit(system_account(client_id, "creditors"), bill.total, party=bill.party,
+               description=f"Bill {bill.bill_number}"),
+    ]
+
+
+def post_purchase_bill(bill, *, user=None):
+    """Dr Inventory / Purchases / Freight, Dr GST Input | Cr Creditors."""
+    postings = purchase_bill_postings(bill)
+
     return post_entry(
         client=bill.client,
-        postings=[
-            debit(system_account(client_id, "stock"), goods),
-            debit(system_account(client_id, "gst_input"), tax),
-            credit(system_account(client_id, "creditors"), bill.total, party=bill.party,
-                   description=f"Bill {bill.bill_number}"),
-        ],
+        postings=postings,
         entry_date=bill.doc_date,
         narration=f"Purchase bill {bill.bill_number} - {bill.party_name}",
         source_document_type="PurchaseBill",

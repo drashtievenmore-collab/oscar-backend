@@ -20,17 +20,24 @@ from apps.core.permissions import HasModulePermission
 from datetime import date, timedelta
 
 from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
-from apps.accounts.models import Client, User
+from apps.accounts.models import User
 from apps.masters import uom
 from apps.masters.models import Design, Fabric, FabricQuality, Item, ItemCategory, ItemPart, Location, Party, Shade
 from apps.purchase.models import GoodsReceipt, GoodsReceiptLine, PurchaseBill, PurchaseBillLine
 from apps.sales.models import SalesReturn, SalesReturnLine
 from apps.jobwork.models import JWOInward, JWOOutward, JWOReprocess, JobWorkOrder
 
+from . import costing_services, logistics_services, sampling_services
 from . import services as stock
 from .models import (
     FaultyPart,
+    LotCostEntry,
+    LotTaka,
+    QCInspection,
+    QCInspectionLine,
+    QCInspectionLineDefect,
     QualityStandard,
+    Sample,
     ServiceUsage,
     StockAudit,
     StockAuditLine,
@@ -38,24 +45,51 @@ from .models import (
     StockMovement,
     StockTransfer,
     StockTransferLine,
+    TakaTagPrintLog,
+    Trip,
+    TripMaterialLine,
     ZoneRequest,
     ZoneRequestLine,
-    LotTaka,
-    TakaTagPrintLog,
 )
 from .serializers import (
     FaultyPartSerializer,
     ItemPartSerializer,
+    LotCostEntrySerializer,
+    QCInspectionLineDefectSerializer,
+    QCInspectionLineSerializer,
+    QCInspectionSerializer,
     QualityStandardSerializer,
+    SampleSerializer,
     ServiceUsageSerializer,
     StockAdjustmentSerializer,
     StockAuditSerializer,
     StockMovementSerializer,
     StockTransferSerializer,
+    TripMaterialLineSerializer,
+    TripSerializer,
     ZoneRequestSerializer,
 )
 
 QTY = DecimalField(max_digits=18, decimal_places=4)
+
+def _qc_meta(receipt):
+    """The QC disposition record stored on ``GoodsReceipt.qc_note`` (JSON)."""
+    note = (getattr(receipt, "qc_note", None) or "").strip()
+    if note.startswith("{") and note.endswith("}"):
+        try:
+            return json.loads(note)
+        except ValueError:
+            return {}
+    return {}
+
+
+def _qc_remarks(receipt):
+    """Free-text QC remarks of a receipt (from the JSON record or a plain note)."""
+    meta = _qc_meta(receipt)
+    if meta:
+        return meta.get("remarks") or None
+    return (getattr(receipt, "qc_note", None) or None)
+
 MONEY = DecimalField(max_digits=18, decimal_places=2)
 
 
@@ -254,17 +288,65 @@ class StockAdjustmentView(APIView):
                 field_errors={"locationId": ["Required."]},
             )
 
+        lot = None
+        lot_id = request.data.get("lotTakaId")
+        if lot_id:
+            lot = LotTaka.objects.filter(
+                client_id=request.client_id, id=lot_id, item=item, deleted_at__isnull=True
+            ).first()
+            if lot is None:
+                raise ValidationFailed("That taka does not exist for this item.", field_errors={"lotTakaId": ["Not found."]})
+            location = lot.location
+
+        current = stock.calculate_item_stock(request.client_id, item, location.id)
+        current_on_hand = D(current["onHand"])
+        # The base for an absolute count is the taka itself when one is named.
+        base = D(lot.available_quantity) if lot is not None else current_on_hand
         if data.get("isAbsolute"):
-            current = stock.calculate_item_stock(request.client_id, item, location.id)
-            delta = round4(D(data["quantity"]) - D(current["onHand"]))
+            target_qty = round4(D(data["quantity"]))
+            if target_qty < ZERO:
+                raise ValidationFailed(
+                    "Stock quantity cannot be adjusted to a negative value.",
+                    field_errors={"quantity": ["Stock cannot be negative."]},
+                )
+            delta = round4(target_qty - base)
         else:
             delta = round4(data["quantity"])
+        if base + delta < ZERO:
+            raise ValidationFailed(
+                f"Adjustment of {delta} would result in negative stock ({base + delta}). Current stock: {base}.",
+                field_errors={"quantity": ["Adjustment results in negative stock."]},
+            )
+        if delta < ZERO:
+            # Stock promised to open sales orders cannot be adjusted away.
+            reserved = D(current["reserved"])
+            free = D(current["onHand"]) - reserved
+            if (
+                location.code not in stock.BLOCKED_LOCATION_CODES
+                and reserved > ZERO
+                and abs(delta) > free
+            ):
+                raise BusinessRuleViolation(
+                    f"Only {round4(max(free, ZERO))} of {item.name} is free; {round4(reserved)} is "
+                    "reserved for open sales orders.",
+                    code=Codes.INSUFFICIENT_STOCK,
+                    payload={"reserved": str(round4(reserved)), "free": str(round4(max(free, ZERO)))},
+                )
 
         if delta == ZERO:
             raise BusinessRuleViolation(
                 "That adjustment would not change the stock figure.",
                 code="NO_CHANGE",
             )
+
+        # TODO(Phase 4 approval engine): adjustments whose value exceeds
+        # settings.STOCK_ADJUSTMENT_APPROVAL_LIMIT must be routed for approval
+        # instead of posting directly. The engine does not exist yet, so the
+        # limit is only reported back to the caller.
+        from django.conf import settings as django_settings
+
+        approval_limit = getattr(django_settings, "STOCK_ADJUSTMENT_APPROVAL_LIMIT", None)
+        adjustment_value = round2(abs(delta) * D(data.get("unitCost") or item.cost_price or 0))
 
         movement = stock.post_movement(
             client_id=request.client_id,
@@ -275,6 +357,7 @@ class StockAdjustmentView(APIView):
             unit_cost=data.get("unitCost") or item.cost_price,
             notes=data["reason"],
             user=request.user,
+            lot_taka=lot,
         )
 
         from apps.accounting.services import post_stock_adjustment
@@ -285,6 +368,10 @@ class StockAdjustmentView(APIView):
             {
                 "movement": StockMovementSerializer(movement).data,
                 "stock": stock.calculate_item_stock(request.client_id, item),
+                "adjustmentValue": adjustment_value,
+                "exceedsApprovalLimit": (
+                    approval_limit is not None and adjustment_value > D(str(approval_limit))
+                ),
             },
             status=status.HTTP_201_CREATED,
         )
@@ -307,6 +394,48 @@ class StockTransferViewSet(TenantModelViewSet):
     search_fields = ["transfer_number", "notes"]
     ordering = ["-transfer_date", "-created_at"]
 
+    def _validate_takas(self, line, from_location_id):
+        """Normalise a line's ``takas`` and check them against the source."""
+        rows = []
+        total = ZERO
+        for raw in line.get("takas") or []:
+            lot_id = raw.get("lotTakaId") or raw.get("id")
+            lot = LotTaka.objects.filter(
+                client_id=self.get_client_id(), id=lot_id, deleted_at__isnull=True
+            ).first() if lot_id else None
+            if lot is None:
+                raise ValidationFailed("A selected taka does not exist.", field_errors={"takas": [f"Unknown taka {lot_id}."]})
+            if lot.item_id != line["item"].id:
+                raise ValidationFailed(
+                    f"Taka {lot.taka_id or lot.taka_number} is not {line['item'].name}.",
+                    field_errors={"takas": ["Item mismatch."]},
+                )
+            if str(lot.location_id) != str(from_location_id):
+                raise ValidationFailed(
+                    f"Taka {lot.taka_id or lot.taka_number} is not at the source location.",
+                    field_errors={"takas": ["Wrong location."]},
+                )
+            qty = round4(D(raw.get("qty") if raw.get("qty") not in (None, "") else lot.available_quantity))
+            if qty <= ZERO or qty > D(lot.available_quantity):
+                raise ValidationFailed(
+                    f"Taka {lot.taka_id or lot.taka_number}: quantity must be between 0 and "
+                    f"{round4(lot.available_quantity)}.",
+                    field_errors={"takas": ["Invalid taka quantity."]},
+                )
+            rows.append({"lotTakaId": str(lot.id), "qty": str(qty)})
+            total += qty
+        if rows and abs(total - round4(D(line["qty"]))) > Decimal("0.0001"):
+            raise ValidationFailed(
+                f"Selected takas ({total}) must add up to the line quantity ({round4(D(line['qty']))}).",
+                field_errors={"takas": ["Taka total differs from the line quantity."]},
+            )
+        if not rows and getattr(line["item"], "tracking_type", "NONE") in ("LOT", "TAKA"):
+            raise ValidationFailed(
+                f"{line['item'].name} is taka-tracked: select the takas to transfer.",
+                field_errors={"takas": ["Required for this item."]},
+            )
+        return rows
+
     @transaction.atomic
     def perform_create(self, serializer):
         lines = serializer.validated_data.pop("items", [])
@@ -315,9 +444,15 @@ class StockTransferViewSet(TenantModelViewSet):
                 "A transfer needs at least one item.",
                 field_errors={"items": ["Add at least one line."]},
             )
+        from_location = serializer.validated_data["from_location"]
+        for line in lines:
+            line["takas"] = self._validate_takas(line, from_location.id)
         serializer.validated_data["transfer_number"] = allocate_number(
             self.request.user.client, "TR", serializer.validated_data.get("transfer_date")
         )
+        # Stock moves only through the dispatch action.
+        serializer.validated_data["status"] = "Requested"
+        serializer.validated_data.setdefault("requested_by", self.request.user)
         transfer = super().perform_create(serializer)
 
         StockTransferLine.objects.bulk_create(
@@ -333,74 +468,66 @@ class StockTransferViewSet(TenantModelViewSet):
     # rename the method.
     @action(detail=True, methods=["post"], url_path="dispatch", url_name="dispatch")
     def dispatch_action(self, request, pk=None):
-        """Posts the ``TRANSFER_OUT`` / ``TRANSFER_IN`` pair (api.md §7.2).
+        """Posts ``TRANSFER_OUT`` / ``TRANSFER_IN`` per selected taka (api.md §7.2).
 
-        Both movements share a ``reference_id``, and the stock between them
-        sits at the destination -- which is why ``locations.type`` carries
-        ``Transit`` (db.md §7.4).
+        A taka moved in part is split: the moved part becomes a child taka at
+        the destination. Lines without takas move item quantity; items with
+        takas at the source but none selected take them oldest-first.
         """
         transfer = self.get_object()
-        if transfer.status not in ("Requested",):
+        if transfer.status != "Requested":
             raise Conflict(
                 f"This transfer is already {transfer.status}.", code=Codes.BAD_TARGET
             )
 
         with transaction.atomic():
+            common = dict(
+                client_id=request.client_id,
+                reference_type="StockTransfer",
+                reference_id=transfer.id,
+                reference_number=transfer.transfer_number,
+                source_document_type="StockTransfer",
+                source_document_id=transfer.id,
+                movement_date=transfer.transfer_date,
+                user=request.user,
+            )
             for line in transfer.items.filter(deleted_at__isnull=True).select_related("item"):
                 stock.assert_sufficient_stock(
                     request.client_id, line.item, line.qty,
                     transfer.from_location_id, line.item.name,
                 )
-                stock.post_movement(
-                    client_id=request.client_id,
-                    item=line.item_id,
-                    location=transfer.from_location_id,
-                    type="TRANSFER_OUT",
-                    quantity=-D(line.qty),
-                    unit_cost=line.item.cost_price,
-                    reference_type="StockTransfer",
-                    reference_id=transfer.id,
-                    reference_number=transfer.transfer_number,
-                    movement_date=transfer.transfer_date,
-                    user=request.user,
-                )
-                stock.post_movement(
-                    client_id=request.client_id,
-                    item=line.item_id,
-                    location=transfer.to_location_id,
-                    type="TRANSFER_IN",
-                    quantity=D(line.qty),
-                    unit_cost=line.item.cost_price,
-                    reference_type="StockTransfer",
-                    reference_id=transfer.id,
-                    reference_number=transfer.transfer_number,
-                    movement_date=transfer.transfer_date,
-                    user=request.user,
-                )
-                # Update location on corresponding LotTaka records
-                taka_ids = request.data.get("takas") or []
-                if taka_ids:
-                    LotTaka.objects.filter(
-                        client_id=request.client_id,
-                        id__in=taka_ids,
-                        location_id=transfer.from_location_id,
-                    ).update(location_id=transfer.to_location_id)
-                else:
-                    matching_takas = list(LotTaka.objects.filter(
-                        client_id=request.client_id,
-                        item_id=line.item_id,
-                        location_id=transfer.from_location_id,
+                selections = [(r["lotTakaId"], D(r["qty"])) for r in (line.takas or [])]
+                if not selections:
+                    # FIFO over the takas at the source, if the item has any.
+                    remaining = D(line.qty)
+                    for lot in LotTaka.objects.filter(
+                        client_id=request.client_id, item_id=line.item_id,
+                        location_id=transfer.from_location_id, available_quantity__gt=0,
                         deleted_at__isnull=True,
-                        status="Active",
-                    ).order_by("received_date", "created_at"))
-                    rem = D(line.qty)
-                    for tk in matching_takas:
-                        if rem <= 0:
+                    ).order_by("received_date", "created_at"):
+                        if remaining <= ZERO:
                             break
-                        tk_qty = tk.available_quantity or tk.received_quantity or 0
-                        tk.location_id = transfer.to_location_id
-                        tk.save(update_fields=["location", "updated_at"])
-                        rem -= D(tk_qty)
+                        take = min(D(lot.available_quantity), remaining)
+                        selections.append((lot.id, take))
+                        remaining -= take
+                    on_takas = sum((q for _, q in selections), ZERO)
+                    loose = round4(D(line.qty) - on_takas)
+                else:
+                    loose = ZERO
+                for lot_id, qty in selections:
+                    stock.relocate_lot(
+                        lot=lot_id, quantity=qty, to_location_id=transfer.to_location_id,
+                        out_type="TRANSFER_OUT", in_type="TRANSFER_IN", split_suffix="TR",
+                        **common,
+                    )
+                if loose > ZERO:
+                    stock.relocate_item_qty(
+                        item=line.item, quantity=loose,
+                        from_location_id=transfer.from_location_id,
+                        to_location_id=transfer.to_location_id,
+                        out_type="TRANSFER_OUT", in_type="TRANSFER_IN",
+                        unit_cost=line.item.cost_price, **common,
+                    )
 
             transfer.status = "In Transit"
             transfer.save(update_fields=["status", "updated_at"])
@@ -424,12 +551,14 @@ class StockTransferViewSet(TenantModelViewSet):
 
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
+        """Reverses exactly this transfer's movements (taka by taka, newest
+        first) and folds the split-off child takas back into their parents."""
         transfer = self.get_object()
         if transfer.status == "Cancelled":
             raise Conflict("This transfer is already cancelled.", code=Codes.ALREADY_CANCELLED)
 
         with transaction.atomic():
-            if transfer.status == "In Transit":
+            if transfer.status in ("In Transit", "Received", "Completed"):
                 stock.reverse_movements(
                     reference_type="StockTransfer",
                     reference_id=transfer.id,
@@ -437,6 +566,15 @@ class StockTransferViewSet(TenantModelViewSet):
                     user=request.user,
                     notes="Transfer cancelled",
                 )
+                # Split children created by this transfer are now empty: the
+                # quantity is back on the parent taka.
+                LotTaka.objects.filter(
+                    client_id=request.client_id,
+                    source_document_type="StockTransfer",
+                    source_document_id=transfer.id,
+                    available_quantity=0,
+                    deleted_at__isnull=True,
+                ).update(deleted_at=timezone.now(), status="Closed", updated_at=timezone.now())
             transfer.status = "Cancelled"
             transfer.save(update_fields=["status", "updated_at"])
             self.write_audit("cancel", transfer, description=request.data.get("reason"))
@@ -705,16 +843,43 @@ class StockAuditViewSet(TenantModelViewSet):
         return Response({"postedAdjustments": posted, "status": audit.status})
 
 
-class ValuationView(APIView):
-    """``GET /inventory/valuation/`` -- ``?asOf=``, ``?method=FIFO|WAC``.
+#: Stock ageing buckets (Phase 1.1) -- age is days since the inward date of
+#: the lot/taka, or of the FIFO receipt layer for stock not held on takas.
+STOCK_AGE_BUCKETS = ("0-30", "31-60", "61-90", "91-180", "180+")
 
-    db.md Appendix B decision 5 assumes WAC from the movement ``unit_cost``;
-    FIFO would need a ``stock_layers`` table, so it is reported as unsupported
-    rather than silently returning WAC under a FIFO label.
+
+def stock_age_bucket(days):
+    days = int(days or 0)
+    if days <= 30:
+        return "0-30"
+    if days <= 60:
+        return "31-60"
+    if days <= 90:
+        return "61-90"
+    if days <= 180:
+        return "91-180"
+    return "180+"
+
+
+class ValuationView(APIView):
+    """``GET /inventory/valuation/`` -- ``?method=WAC``, ``?bucket=``, ``?locationId=``.
+
+    Value is WAC from the movement ``unit_cost`` (db.md Appendix B decision 5);
+    FIFO valuation would need per-receipt cost layers and is reported as
+    unsupported rather than silently returning WAC under a FIFO label.
+
+    Ageing is real: each lot/taka with stock is aged from its received date;
+    stock that is not held on takas is aged by FIFO over the location's
+    inward movements (the newest receipts are assumed to be what is left).
     """
 
     permission_classes = [HasModulePermission]
     required_permissions = ["view_inventory"]
+
+    INWARD_TYPES = (
+        "PURCHASE", "TRANSFER_IN", "JOBWORK_INWARD", "ADJUSTMENT", "SALES_RETURN",
+        "SALES_RETURN_GOOD", "SAMPLE_RETURN", "QC_PASS",
+    )
 
     def get(self, request):
         method = (request.query_params.get("method") or "WAC").upper()
@@ -729,39 +894,124 @@ class ValuationView(APIView):
                 code="VALUATION_METHOD_UNSUPPORTED",
                 detail="FIFO requires per-receipt cost layers; WAC is available.",
             )
-
-        balances = (
-            StockBalance.objects.filter(
-                client_id=request.client_id, deleted_at__isnull=True
+        bucket_filter = request.query_params.get("bucket")
+        if bucket_filter and bucket_filter not in STOCK_AGE_BUCKETS:
+            raise ValidationFailed(
+                "Unknown ageing bucket.",
+                field_errors={"bucket": [f"Expected one of {', '.join(STOCK_AGE_BUCKETS)}."]},
             )
+        location_filter = request.query_params.get("locationId")
+
+        client_id = request.client_id
+        today = timezone.localdate()
+        balances = (
+            StockBalance.objects.filter(client_id=client_id, deleted_at__isnull=True)
             .select_related("item", "item__category", "location")
             .exclude(item__item_kind="Service")
         )
+        if location_filter:
+            balances = balances.filter(location_id=location_filter)
+
+        lots_by_key = {}
+        for lot in LotTaka.objects.filter(
+            client_id=client_id, deleted_at__isnull=True, available_quantity__gt=0
+        ).order_by("received_date"):
+            lots_by_key.setdefault((lot.item_id, lot.location_id), []).append(lot)
 
         rows = []
-        total = ZERO
+        bucket_totals = {label: {"qty": ZERO, "value": ZERO} for label in STOCK_AGE_BUCKETS}
+        total_value = ZERO
+
+        def add_row(balance, qty, unit_cost, inward_date, lot=None):
+            nonlocal total_value
+            qty = round4(qty)
+            if qty <= ZERO:
+                return
+            age_days = max(0, (today - inward_date).days) if inward_date else None
+            bucket = stock_age_bucket(age_days) if age_days is not None else None
+            value = round2(qty * D(unit_cost))
+            if bucket is not None:
+                bucket_totals[bucket]["qty"] += qty
+                bucket_totals[bucket]["value"] += value
+            total_value += value
+            item = balance.item
+            rows.append({
+                "id": str(lot.id) if lot else f"{balance.item_id}:{balance.location_id}:{inward_date}",
+                "itemId": str(balance.item_id),
+                "sku": item.sku,
+                "name": item.name,
+                "category": item.category.name if item.category_id else None,
+                "locationId": str(balance.location_id),
+                "location": balance.location.name,
+                "lotNo": lot.lot_number if lot else None,
+                "takaId": (lot.taka_id or lot.barcode) if lot else None,
+                "uom": item.uom,
+                "qty": qty,
+                "unitCost": round4(unit_cost),
+                "value": value,
+                "inwardDate": inward_date.isoformat() if inward_date else None,
+                "ageDays": age_days,
+                "agingBucket": bucket,
+            })
+
         for balance in balances:
-            if D(balance.on_hand) == ZERO:
+            on_hand = D(balance.on_hand)
+            if on_hand <= ZERO:
                 continue
             unit_cost = balance.weighted_average_cost or D(balance.item.cost_price)
-            value = round2(D(balance.on_hand) * D(unit_cost))
-            total += value
-            rows.append(
-                {
-                    "itemId": str(balance.item_id),
-                    "sku": balance.item.sku,
-                    "name": balance.item.name,
-                    "category": balance.item.category.name if balance.item.category_id else None,
-                    "location": balance.location.name,
-                    "quantity": balance.on_hand,
-                    "unitCost": round4(unit_cost),
-                    "value": value,
-                }
-            )
+            remaining = on_hand
+            for lot in lots_by_key.get((balance.item_id, balance.location_id), []):
+                if remaining <= ZERO:
+                    break
+                qty = min(D(lot.available_quantity), remaining)
+                add_row(balance, qty, unit_cost, lot.received_date, lot)
+                remaining -= qty
+            if remaining <= ZERO:
+                continue
+            # FIFO layers for the part not held on takas: walk inward
+            # movements newest-first until the remaining quantity is covered.
+            inwards = StockMovement.objects.filter(
+                client_id=client_id,
+                item_id=balance.item_id,
+                location_id=balance.location_id,
+                quantity__gt=0,
+                type__in=self.INWARD_TYPES,
+                lot_taka__isnull=True,
+            ).order_by("-movement_date", "-created_at").values_list("movement_date", "quantity")
+            for movement_date, quantity in inwards:
+                if remaining <= ZERO:
+                    break
+                qty = min(D(quantity), remaining)
+                add_row(balance, qty, unit_cost, movement_date)
+                remaining -= qty
+            if remaining > ZERO:
+                # Stock with no inward record at this location (e.g. opening
+                # balance) has no known age; it is valued but not bucketed.
+                add_row(balance, remaining, unit_cost, None)
 
-        rows.sort(key=lambda row: row["value"], reverse=True)
+        if bucket_filter:
+            rows = [row for row in rows if row["agingBucket"] == bucket_filter]
+        rows.sort(key=lambda row: (row["ageDays"] is None, -(row["ageDays"] or 0)))
         return Response(
-            envelope(rows, aggregates={"method": "WAC", "totalValuation": round2(total)})
+            envelope(
+                rows,
+                aggregates={
+                    "method": "WAC",
+                    "totalValuation": round2(total_value),
+                    "buckets": [
+                        {
+                            "bucket": label,
+                            "qty": round4(bucket_totals[label]["qty"]),
+                            "value": round2(bucket_totals[label]["value"]),
+                        }
+                        for label in STOCK_AGE_BUCKETS
+                    ],
+                    "currentStockValue": round2(bucket_totals["0-30"]["value"]),
+                    "staleValuation": round2(
+                        bucket_totals["91-180"]["value"] + bucket_totals["180+"]["value"]
+                    ),
+                },
+            )
         )
 
 
@@ -876,48 +1126,183 @@ class InventoryDashboardView(APIView):
 
         balance_rows = list(balances_qs.select_related("item", "location"))
 
-        # Calculate metrics from real data:
-        total_on_hand = sum((D(b.on_hand) for b in balance_rows), ZERO)
-        total_damaged = sum((D(b.damaged) for b in balance_rows), ZERO)
+        # Every stock figure below comes from stock_balances, split by the
+        # *location* the stock is in: QC Hold / Reprocess / Second Quality /
+        # Reject are system locations, everything else is good stock. The
+        # categories partition on_hand, so nothing is counted twice.
+        # Every stock figure below comes from stock_balances, split by the
+        # location the stock is in: QC Hold / Reprocess / Second Quality /
+        # Reject are system locations, SYS-WIP-* are external processor/agency
+        # WIP locations, and standard godowns hold good/available stock.
+        role_by_code = {
+            code: role for role, (code, _, _) in stock.SYSTEM_LOCATIONS.items()
+        }
+        all_locations = list(Location.objects.filter(client_id=client_id, deleted_at__isnull=True))
+        location_role = {}
+        wip_locations = {}
+        for loc in all_locations:
+            if loc.code in role_by_code:
+                location_role[loc.id] = role_by_code[loc.code]
+            elif (loc.code and loc.code.startswith("SYS-WIP-")) or (loc.name and loc.name.startswith("WIP - ")):
+                location_role[loc.id] = "EXTERNAL_WIP"
+                wip_locations[loc.id] = loc
+            else:
+                location_role[loc.id] = "GOOD"
+
+        def wac(balance):
+            return D(balance.weighted_average_cost or get_item_cost(balance.item_id))
 
         def get_item_cost(item_id):
             item = item_map.get(item_id)
             return D(item.cost_price or 0) if item else ZERO
 
-        # Wastage Stock = damaged balance + scrap locations
-        wastage_qty = total_damaged
-        wastage_val = sum(
-            (D(b.damaged) * (b.weighted_average_cost or get_item_cost(b.item_id)) for b in balance_rows if D(b.damaged) > ZERO),
-            ZERO,
-        )
+        role_qty = {role: ZERO for role in ("GOOD", "EXTERNAL_WIP", "QC_HOLD", "REPROCESS", "SECOND_QUALITY", "REJECT")}
+        role_val = {role: ZERO for role in role_qty}
 
-        # Sample Stock
-        sample_movements = StockMovement.objects.filter(
+        wip_by_party_dict = {}
+        parties = {p.code: p for p in Party.objects.filter(client_id=client_id, deleted_at__isnull=True) if p.code}
+        parties_by_name = {p.name: p for p in Party.objects.filter(client_id=client_id, deleted_at__isnull=True)}
+
+        for b in balance_rows:
+            role = location_role.get(b.location_id, "GOOD")
+            on_hand = D(b.on_hand)
+            val = on_hand * wac(b)
+            role_qty[role] += on_hand
+            role_val[role] += val
+
+            if role == "EXTERNAL_WIP":
+                loc = wip_locations.get(b.location_id)
+                loc_code = loc.code if loc else ""
+                loc_name = loc.name if loc else ""
+                suffix = loc_code.replace("SYS-WIP-", "") if loc_code.startswith("SYS-WIP-") else ""
+                party = parties.get(suffix)
+                if not party and loc_name.startswith("WIP - "):
+                    party = parties_by_name.get(loc_name[6:].strip())
+                party_id = str(party.id) if party else None
+                party_name = party.name if party else (loc_name[6:].strip() if loc_name.startswith("WIP - ") else (loc_name or "External Processor"))
+                entry = wip_by_party_dict.setdefault(b.location_id, {
+                    "partyId": party_id,
+                    "partyName": party_name,
+                    "locationCode": loc_code,
+                    "locationName": loc_name,
+                    "qty": ZERO,
+                    "value": ZERO,
+                })
+                entry["qty"] += on_hand
+                entry["value"] += val
+
+        wip_by_party = [
+            {
+                "partyId": v["partyId"],
+                "partyName": v["partyName"],
+                "locationCode": v["locationCode"],
+                "locationName": v["locationName"],
+                "qty": float(v["qty"]),
+                "value": float(round2(v["value"])),
+            }
+            for v in wip_by_party_dict.values()
+        ]
+
+        total_on_hand = sum(role_qty.values(), ZERO)
+        total_damaged = sum((D(b.damaged) for b in balance_rows), ZERO)
+
+        good_qty, good_val = role_qty["GOOD"], role_val["GOOD"]
+        wip_qty, wip_val = role_qty["EXTERNAL_WIP"], role_val["EXTERNAL_WIP"]
+        qc_hold_qty, qc_hold_val = role_qty["QC_HOLD"], role_val["QC_HOLD"]
+        reprocess_qty, reprocess_val = role_qty["REPROCESS"], role_val["REPROCESS"]
+        second_qty, second_val = role_qty["SECOND_QUALITY"], role_val["SECOND_QUALITY"]
+        rejected_qty, rejected_val = role_qty["REJECT"], role_val["REJECT"]
+
+        # Taka-level analysis of GOOD stock for real Grey / Finished / Reserved partitioning (Phase 2.3)
+        good_takas = LotTaka.objects.filter(
             client_id=client_id,
+            deleted_at__isnull=True,
+            available_quantity__gt=0,
             item_id__in=item_ids,
-        ).filter(
-            Q(reference_type__icontains="sample")
-            | Q(notes__icontains="sample")
-            | Q(location__name__icontains="sample")
         )
         if godown_id:
-            sample_movements = sample_movements.filter(location_id=godown_id)
+            good_takas = good_takas.filter(location_id=godown_id)
 
-        sample_qty_raw = sample_movements.aggregate(
-            qty=Coalesce(Sum(Coalesce("weighed_qty", "quantity")), Value(Decimal("0.0000")), output_field=QTY)
-        )["qty"]
-        sample_qty = max(ZERO, sample_qty_raw)
-        sample_val = round2(sample_qty * (sum((get_item_cost(i) for i in item_ids), ZERO) / (len(item_ids) or 1)))
+        reserved_qty = ZERO
+        reserved_val = ZERO
+        finished_qty = ZERO
+        finished_val = ZERO
+        grey_qty = ZERO
+        grey_val = ZERO
 
-        # Customer Return Stock
+        good_takas_list = [lt for lt in good_takas if location_role.get(lt.location_id, "GOOD") == "GOOD"]
+        taka_on_hand_by_item_loc = {}
+        for lt in good_takas_list:
+            taka_on_hand_by_item_loc[(lt.item_id, lt.location_id)] = (
+                taka_on_hand_by_item_loc.get((lt.item_id, lt.location_id), ZERO) + D(lt.available_quantity)
+            )
+            lt_qty = D(lt.available_quantity)
+            lt_cost = D(lt.rate) if lt.rate else get_item_cost(lt.item_id)
+            lt_val = lt_qty * lt_cost
+
+            if lt.status == "Reserved":
+                reserved_qty += lt_qty
+                reserved_val += lt_val
+            elif (
+                lt.status == "Finished"
+                or getattr(item_map.get(lt.item_id), "fabric_stage", "") == "Finished"
+                or (lt.source_document_type in ("JobWorkInward", "JWOInward", "Production"))
+                or lt.parent_taka_id is not None
+            ):
+                finished_qty += lt_qty
+                finished_val += lt_val
+            else:
+                grey_qty += lt_qty
+                grey_val += lt_val
+
+        for b in balance_rows:
+            if location_role.get(b.location_id, "GOOD") != "GOOD":
+                continue
+            loose = D(b.on_hand) - taka_on_hand_by_item_loc.get((b.item_id, b.location_id), ZERO)
+            if loose > ZERO:
+                loose_val = loose * wac(b)
+                it = item_map.get(b.item_id)
+                if getattr(it, "fabric_stage", "") == "Finished" or "finished" in (it.fabric_quality or "").lower():
+                    finished_qty += loose
+                    finished_val += loose_val
+                else:
+                    grey_qty += loose
+                    grey_val += loose_val
+
+        # Wastage = FAULTY (damaged) stock, tracked separately from on_hand.
+        wastage_qty = total_damaged
+        wastage_val = sum((D(b.damaged) * wac(b) for b in balance_rows if D(b.damaged) > ZERO), ZERO)
+
+        # Samples out with customers: issued minus returned. They have left
+        # the godown, so they are reported but not part of the stock total.
+        sample_issue_qs = StockMovement.objects.filter(
+            client_id=client_id, item_id__in=item_ids, reference_type="SampleIssue",
+        )
+        sample_return_qs = StockMovement.objects.filter(
+            client_id=client_id, item_id__in=item_ids, reference_type="SampleReturn",
+        )
+        if godown_id:
+            sample_issue_qs = sample_issue_qs.filter(location_id=godown_id)
+        sample_issued = abs(sample_issue_qs.aggregate(q=Coalesce(Sum("quantity"), Value(Decimal("0.0000")), output_field=QTY))["q"])
+        sample_returned = sample_return_qs.filter(
+            source_document_id__in=sample_issue_qs.values("id")
+        ).aggregate(q=Coalesce(Sum("quantity"), Value(Decimal("0.0000")), output_field=QTY))["q"]
+        sample_qty = max(ZERO, sample_issued - sample_returned)
+        sample_val = round2(sum(
+            (abs(D(m.quantity)) * D(m.unit_cost or get_item_cost(m.item_id)) for m in sample_issue_qs),
+            ZERO,
+        ) * (sample_qty / sample_issued if sample_issued > ZERO else ZERO))
+
+        # Customer returns posted (all conditions) -- informational; the goods
+        # themselves are inside the location categories above.
         ret_lines = SalesReturnLine.objects.filter(
             client_id=client_id,
             sales_return__status="Posted",
+            sales_return__deleted_at__isnull=True,
             item_id__in=item_ids,
         )
         if godown_id:
             ret_lines = ret_lines.filter(sales_return__location_id=godown_id)
-
         customer_return_qty = ret_lines.aggregate(
             qty=Coalesce(Sum("returned_qty"), Value(Decimal("0.0000")), output_field=QTY)
         )["qty"]
@@ -925,50 +1310,20 @@ class InventoryDashboardView(APIView):
             val=Coalesce(Sum(F("returned_qty") * F("rate")), Value(Decimal("0.00")), output_field=MONEY)
         )["val"]
 
-        # Reprocessing Stock
-        reprocess_qs = JWOReprocess.objects.filter(
-            client_id=client_id,
-            status__in=["Pending", "Sent to Vendor", "In Process"],
-        )
-        reprocess_qty = reprocess_qs.aggregate(
-            qty=Coalesce(Sum("qty"), Value(Decimal("0.0000")), output_field=QTY)
-        )["qty"]
-        reprocess_val = round2(reprocess_qty * (sum((get_item_cost(i) for i in item_ids), ZERO) / (len(item_ids) or 1)))
+        total_stock_qty = total_on_hand
+        total_stock_val = sum(role_val.values(), ZERO)
 
-        # Grey / WIP / QC Hold
-        grn_hold_lines = GoodsReceiptLine.objects.filter(
-            goods_receipt__client_id=client_id,
-            goods_receipt__deleted_at__isnull=True,
-            goods_receipt__qc_status__in=["Pending", "On Hold"],
-            item_id__in=item_ids,
+        # Prior month comparison (ledger position at the end of last month).
+        prev_qs = StockMovement.objects.filter(
+            client_id=client_id, item_id__in=item_ids, movement_date__lte=last_day_prev_month,
         )
         if godown_id:
-            grn_hold_lines = grn_hold_lines.filter(goods_receipt__location_id=godown_id)
-
-        grey_wip_qty = grn_hold_lines.aggregate(
-            qty=Coalesce(Sum(Coalesce("weighed_qty", "received_qty") - F("rejected_qty")), Value(Decimal("0.0000")), output_field=QTY)
+            prev_qs = prev_qs.filter(location_id=godown_id)
+        prev_total = prev_qs.exclude(type="FAULTY").aggregate(
+            qty=Coalesce(Sum(Coalesce("weighed_qty", "quantity")), Value(Decimal("0.0000")), output_field=QTY)
         )["qty"]
-        grey_wip_val = grn_hold_lines.aggregate(
-            val=Coalesce(Sum((Coalesce("weighed_qty", "received_qty") - F("rejected_qty")) * F("unit_cost")), Value(Decimal("0.00")), output_field=MONEY)
-        )["val"]
-
-        # Good Fabric Stock
-        good_qty = max(ZERO, total_on_hand - sample_qty - customer_return_qty)
-        good_val = sum(
-            (D(b.on_hand) * (b.weighted_average_cost or get_item_cost(b.item_id)) for b in balance_rows if D(b.on_hand) > ZERO),
-            ZERO,
-        )
-        good_val = max(ZERO, good_val - sample_val - customer_return_val)
-
-        # Total Fabric Stock
-        total_stock_qty = good_qty + sample_qty + wastage_qty + reprocess_qty + customer_return_qty + grey_wip_qty
-        total_stock_val = good_val + sample_val + wastage_val + reprocess_val + customer_return_val + grey_wip_val
-
-        # Prior Month Comparisons
-        prev_movements_sum = StockMovement.objects.filter(
-            client_id=client_id,
-            item_id__in=item_ids,
-            movement_date__lte=last_day_prev_month,
+        prev_good = prev_qs.exclude(type="FAULTY").exclude(
+            location__code__in=stock.BLOCKED_LOCATION_CODES
         ).aggregate(
             qty=Coalesce(Sum(Coalesce("weighed_qty", "quantity")), Value(Decimal("0.0000")), output_field=QTY)
         )["qty"]
@@ -978,110 +1333,71 @@ class InventoryDashboardView(APIView):
             prev_f = float(prev)
             if prev_f > 0:
                 return round(((curr_f - prev_f) / prev_f) * 100, 1)
-            elif prev_f == 0 and curr_f > 0:
-                return 100.0
-            return 0.0
+            return None  # no prior stock -- a percentage would be meaningless
 
-        total_change_pct = calc_pct_change(total_stock_qty, prev_movements_sum)
-        good_change_pct = calc_pct_change(good_qty, max(ZERO, prev_movements_sum))
-        sample_change_pct = 0.0
-        wastage_change_pct = 0.0
-        reprocess_change_pct = 0.0
-        return_change_pct = 0.0
+        total_change_pct = calc_pct_change(total_stock_qty, prev_total)
+        good_change_pct = calc_pct_change(good_qty, prev_good)
 
-        # Stock Distribution Breakdown
         tot_q = float(total_stock_qty) or 1.0
         tot_v = float(total_stock_val) or 1.0
+
+        def dist(name, qty, val, color):
+            return {
+                "name": name,
+                "qty": float(qty),
+                "value": float(round2(val)),
+                "pct": round((float(qty) / tot_q) * 100, 1) if float(total_stock_qty) > 0 else 0.0,
+                "pctValue": round((float(val) / tot_v) * 100, 1) if float(total_stock_val) > 0 else 0.0,
+                "color": color,
+            }
+
+        # The slices partition on-hand stock exactly.
         dist_items = [
-            {
-                "name": "Good Fabric",
-                "qty": float(good_qty),
-                "value": float(good_val),
-                "pct": round((float(good_qty) / tot_q) * 100, 1) if float(total_stock_qty) > 0 else 0.0,
-                "pctValue": round((float(good_val) / tot_v) * 100, 1) if float(total_stock_val) > 0 else 0.0,
-                "color": "#2563eb",
-            },
-            {
-                "name": "Sample",
-                "qty": float(sample_qty),
-                "value": float(sample_val),
-                "pct": round((float(sample_qty) / tot_q) * 100, 1) if float(total_stock_qty) > 0 else 0.0,
-                "pctValue": round((float(sample_val) / tot_v) * 100, 1) if float(total_stock_val) > 0 else 0.0,
-                "color": "#06b6d4",
-            },
-            {
-                "name": "Wastage",
-                "qty": float(wastage_qty),
-                "value": float(wastage_val),
-                "pct": round((float(wastage_qty) / tot_q) * 100, 1) if float(total_stock_qty) > 0 else 0.0,
-                "pctValue": round((float(wastage_val) / tot_v) * 100, 1) if float(total_stock_val) > 0 else 0.0,
-                "color": "#f43f5e",
-            },
-            {
-                "name": "Reprocessing",
-                "qty": float(reprocess_qty),
-                "value": float(reprocess_val),
-                "pct": round((float(reprocess_qty) / tot_q) * 100, 1) if float(total_stock_qty) > 0 else 0.0,
-                "pctValue": round((float(reprocess_val) / tot_v) * 100, 1) if float(total_stock_val) > 0 else 0.0,
-                "color": "#f59e0b",
-            },
-            {
-                "name": "Customer Return",
-                "qty": float(customer_return_qty),
-                "value": float(customer_return_val),
-                "pct": round((float(customer_return_qty) / tot_q) * 100, 1) if float(total_stock_qty) > 0 else 0.0,
-                "pctValue": round((float(customer_return_val) / tot_v) * 100, 1) if float(total_stock_val) > 0 else 0.0,
-                "color": "#8b5cf6",
-            },
-            {
-                "name": "Grey / WIP / QC Hold",
-                "qty": float(grey_wip_qty),
-                "value": float(grey_wip_val),
-                "pct": round((float(grey_wip_qty) / tot_q) * 100, 1) if float(total_stock_qty) > 0 else 0.0,
-                "pctValue": round((float(grey_wip_val) / tot_v) * 100, 1) if float(total_stock_val) > 0 else 0.0,
-                "color": "#94a3b8",
-            },
+            dist("Grey Fabric", grey_qty, grey_val, "#6366f1"),
+            dist("Finished Fabric", finished_qty, finished_val, "#2563eb"),
+            dist("External WIP", wip_qty, wip_val, "#8b5cf6"),
+            dist("QC Hold", qc_hold_qty, qc_hold_val, "#94a3b8"),
+            dist("Reprocessing", reprocess_qty, reprocess_val, "#f59e0b"),
+            dist("Second Quality", second_qty, second_val, "#06b6d4"),
+            dist("Rejected", rejected_qty, rejected_val, "#f43f5e"),
         ]
 
-        # Stock Trend: Last 6 Months
+        # Stock Trend: last 6 months, the ledger position at each month end
+        # split by location role.
         trend_months = []
         curr_m = today.replace(day=1)
+        code_role = {code: role for code, role in role_by_code.items()}
         for i in range(5, -1, -1):
             y = curr_m.year
             m = curr_m.month - i
             while m <= 0:
                 m += 12
                 y -= 1
-            if m == 12:
-                next_m = date(y + 1, 1, 1)
-            else:
-                next_m = date(y, m + 1, 1)
+            next_m = date(y + 1, 1, 1) if m == 12 else date(y, m + 1, 1)
             m_end = next_m - timedelta(days=1)
 
             m_mov = StockMovement.objects.filter(
-                client_id=client_id,
-                item_id__in=item_ids,
-                movement_date__lte=m_end,
-            )
+                client_id=client_id, item_id__in=item_ids, movement_date__lte=m_end,
+            ).exclude(type="FAULTY")
             if godown_id:
                 m_mov = m_mov.filter(location_id=godown_id)
-
-            tot_m_qty = m_mov.aggregate(
+            by_role = {"GOOD": ZERO, "EXTERNAL_WIP": ZERO, "QC_HOLD": ZERO, "REPROCESS": ZERO, "SECOND_QUALITY": ZERO, "REJECT": ZERO}
+            for row in m_mov.values("location__code").annotate(
                 qty=Coalesce(Sum(Coalesce("weighed_qty", "quantity")), Value(Decimal("0.0000")), output_field=QTY)
-            )["qty"]
-
-            m_val = float(max(ZERO, tot_m_qty))
+            ):
+                loc_c = row["location__code"] or ""
+                r = role_by_code.get(loc_c) or ("EXTERNAL_WIP" if loc_c.startswith("SYS-WIP-") else "GOOD")
+                by_role[r] += D(row["qty"])
             trend_months.append({
                 "month": m_end.strftime("%b"),
                 "year": m_end.year,
                 "date": m_end.isoformat(),
-                "good": m_val,
-                "sample": 0.0,
-                "wastage": 0.0,
-                "reprocessing": 0.0,
-                "customerReturn": 0.0,
-                "greyWip": 0.0,
-                "total": m_val,
+                "good": float(max(ZERO, by_role["GOOD"])),
+                "greyWip": float(max(ZERO, by_role["QC_HOLD"] + by_role["EXTERNAL_WIP"])),
+                "reprocessing": float(max(ZERO, by_role["REPROCESS"])),
+                "secondQuality": float(max(ZERO, by_role["SECOND_QUALITY"])),
+                "wastage": float(max(ZERO, by_role["REJECT"])),
+                "total": float(max(ZERO, sum(by_role.values(), ZERO))),
             })
 
         # Category-wise Stock
@@ -1097,10 +1413,6 @@ class InventoryDashboardView(APIView):
             cat_stock[cat_name]["qty"] += D(b.on_hand)
             cat_stock[cat_name]["value"] += D(b.on_hand) * D(cost)
 
-        if not cat_stock:
-            for fab in fabrics_list[:7]:
-                cat_stock[fab["name"]] = {"qty": ZERO, "value": ZERO}
-
         category_wise_stock = []
         for name, data in sorted(cat_stock.items(), key=lambda x: x[1]["qty"], reverse=True):
             category_wise_stock.append({
@@ -1110,39 +1422,50 @@ class InventoryDashboardView(APIView):
                 "pct": round((float(data["qty"]) / tot_q) * 100, 1) if float(total_stock_qty) > 0 else 0.0,
             })
 
-        # Stock by Godown
+        # Stock by Godown -- each location's on-hand lands in exactly one
+        # category (its role); wastage is the damaged (FAULTY) figure.
         stock_by_godown = []
-        loc_map = {str(loc.id): loc.name for loc in Location.objects.filter(client_id=client_id, deleted_at__isnull=True)}
+        locations_qs = Location.objects.filter(client_id=client_id, deleted_at__isnull=True)
+        if godown_id:
+            locations_qs = locations_qs.filter(id=godown_id)
+        loc_map = {loc.id: loc.name for loc in locations_qs}
         loc_balances = {}
         for b in balance_rows:
-            lid = str(b.location_id)
-            if lid not in loc_balances:
-                loc_balances[lid] = {
-                    "total": ZERO, "good": ZERO, "sample": ZERO, "wastage": ZERO,
-                    "reprocess": ZERO, "return": ZERO, "grey": ZERO, "val": ZERO,
-                }
-            loc_balances[lid]["total"] += D(b.on_hand) + D(b.damaged)
-            loc_balances[lid]["good"] += D(b.on_hand)
-            loc_balances[lid]["wastage"] += D(b.damaged)
-            cost = b.weighted_average_cost or (b.item.cost_price if b.item else ZERO)
-            loc_balances[lid]["val"] += (D(b.on_hand) + D(b.damaged)) * D(cost)
+            lb = loc_balances.setdefault(b.location_id, {
+                "total": ZERO, "good": ZERO, "externalWip": ZERO, "wastage": ZERO, "reprocess": ZERO,
+                "second": ZERO, "rejected": ZERO, "grey": ZERO, "val": ZERO,
+            })
+            role = location_role.get(b.location_id, "GOOD")
+            on_hand = D(b.on_hand)
+            lb["total"] += on_hand
+            lb["wastage"] += D(b.damaged)
+            lb["val"] += on_hand * wac(b)
+            key = {
+                "GOOD": "good",
+                "EXTERNAL_WIP": "externalWip",
+                "QC_HOLD": "grey",
+                "REPROCESS": "reprocess",
+                "SECOND_QUALITY": "second",
+                "REJECT": "rejected",
+            }.get(role, "good")
+            lb[key] = lb.get(key, ZERO) + on_hand
 
         for lid, lname in loc_map.items():
-            lb = loc_balances.get(lid, {
-                "total": ZERO, "good": ZERO, "sample": ZERO, "wastage": ZERO,
-                "reprocess": ZERO, "return": ZERO, "grey": ZERO, "val": ZERO,
-            })
+            lb = loc_balances.get(lid)
+            if lb is None:
+                continue
             stock_by_godown.append({
-                "locationId": lid,
+                "locationId": str(lid),
                 "godown": lname,
                 "totalStock": float(lb["total"]),
                 "totalValue": float(round2(lb["val"])),
-                "good": float(lb["good"]),
-                "sample": float(lb["sample"]),
-                "wastage": float(lb["wastage"]),
-                "reprocess": float(lb["reprocess"]),
-                "customerReturn": float(lb["return"]),
-                "greyWip": float(lb["grey"]),
+                "good": float(lb.get("good", ZERO)),
+                "externalWip": float(lb.get("externalWip", ZERO)),
+                "wastage": float(lb.get("wastage", ZERO)),
+                "reprocess": float(lb.get("reprocess", ZERO)),
+                "secondQuality": float(lb.get("second", ZERO)),
+                "rejected": float(lb.get("rejected", ZERO)),
+                "greyWip": float(lb.get("grey", ZERO)),
             })
 
         # QC Summary (This Month / Selected Date Range)
@@ -1165,7 +1488,7 @@ class InventoryDashboardView(APIView):
         challans_count = grn_date_qs.count()
 
         qc_passed_qty = grn_lines_qs.filter(
-            goods_receipt__qc_status="Approved"
+            goods_receipt__qc_status__in=["Approved", "Partially Approved"]
         ).aggregate(
             q=Coalesce(Sum(Coalesce("weighed_qty", "received_qty") - F("rejected_qty")), Value(Decimal("0.0000")), output_field=QTY)
         )["q"]
@@ -1216,33 +1539,43 @@ class InventoryDashboardView(APIView):
         recent_mov_qs = (
             StockMovement.objects.filter(client_id=client_id, item_id__in=item_ids)
             .select_related("item", "location")
-            .order_by("-movement_date", "-created_at")[:12]
+            .order_by("-movement_date", "-created_at")
         )
         if godown_id:
             recent_mov_qs = recent_mov_qs.filter(location_id=godown_id)
 
+        type_category = {
+            "FAULTY": "Wastage",
+            "TRANSFER_IN": "Transfer",
+            "TRANSFER_OUT": "Transfer",
+            "QC_PASS": "QC",
+            "QC_HOLD": "QC",
+            "QC_REPROCESS": "QC",
+            "QC_REJECT": "QC",
+            "QC_SECOND_QUALITY": "QC",
+            "SAMPLE_ISSUE": "Sample",
+        }
         recent_movements = []
-        for m in recent_mov_qs:
+        for m in recent_mov_qs[:12]:
             qty_val = float(m.effective_quantity)
-            category_label = "Inward" if qty_val > 0 else "Outward"
-            if m.type == "FAULTY":
-                category_label = "Wastage"
-            elif m.type == "SALES_RETURN":
+            if m.type in type_category:
+                category_label = type_category[m.type]
+            elif m.type.startswith("SALES_RETURN"):
                 category_label = "Customer Return"
-            elif m.type in ("TRANSFER_IN", "TRANSFER_OUT"):
-                category_label = "Transfer"
-            elif "sample" in (m.notes or "").lower() or "sample" in (m.reference_type or "").lower():
+            elif m.type.startswith("SAMPLE_RETURN") or m.reference_type in ("SampleIssue", "SampleReturn"):
                 category_label = "Sample"
+            else:
+                category_label = "Inward" if qty_val > 0 else "Outward"
 
             recent_movements.append({
                 "id": str(m.id),
                 "date": m.movement_date.strftime("%d %b %Y"),
-                "type": "GRN" if m.type == "PURCHASE" else ("QC" if m.type == "FAULTY" else m.type.replace("_", " ").title()),
-                "refNo": m.reference_number or (f"MOV-{str(m.id)[:6]}"),
+                "type": "GRN" if m.type == "PURCHASE" else m.type.replace("_", " ").title(),
+                "refNo": m.reference_number,
                 "fabric": m.item.fabric_quality or m.item.name,
                 "qty": abs(qty_val),
                 "category": category_label,
-                "godown": m.location.name if m.location else "Main",
+                "godown": m.location.name if m.location else None,
             })
 
         def per_unit(rows, qty_of):
@@ -1254,112 +1587,109 @@ class InventoryDashboardView(APIView):
                 totals[label] = totals.get(label, ZERO) + D(qty_of(row))
             return [{"uom": k, "qty": float(round4(v))} for k, v in sorted(totals.items())]
 
-        avg_cost = sum((get_item_cost(i) for i in item_ids), ZERO) / (len(item_ids) or 1)
-        tot_q = float(total_stock_qty) or 1.0
-        tot_v = float(total_stock_val) or 1.0
+        def card(qty, val, change=None, of_total=True):
+            return {
+                "qty": float(qty),
+                "uom": dominant_uom,
+                "value": float(round2(val)),
+                "pct": round((float(qty) / tot_q) * 100, 1) if (of_total and float(total_stock_qty) > 0) else None,
+                "changePct": change,
+            }
 
         summary_cards = {
-            "totalStock": {
-                "qty": float(total_stock_qty),
-                "uom": dominant_uom,
-                "value": float(round2(total_stock_val)),
-                "changePct": total_change_pct,
+            "totalStock": card(total_stock_qty, total_stock_val, total_change_pct),
+            "goodStock": card(good_qty, good_val, good_change_pct),
+            "greyStock": card(grey_qty, grey_val),
+            "finishedStock": card(finished_qty, finished_val),
+            "reservedStock": card(reserved_qty, reserved_val),
+            "externalWipStock": card(wip_qty, wip_val),
+            "wipStock": card(wip_qty, wip_val),
+            # Samples are out with customers and returns are already inside
+            # the location categories: neither is a share of on-hand stock.
+            "sampleStock": card(sample_qty, sample_val, of_total=False),
+            "wastageStock": card(wastage_qty, wastage_val, of_total=False),
+            "reprocessingStock": card(reprocess_qty, reprocess_val),
+            "secondQualityStock": card(second_qty, second_val),
+            "customerReturnStock": card(customer_return_qty, customer_return_val, of_total=False),
+            "qcHoldStock": card(qc_hold_qty, qc_hold_val),
+            "rejectedStock": card(rejected_qty, rejected_val),
+        }
+
+        # 10 Real Location/Status-based Stock Buckets (Phase 2.3)
+        stock_buckets = {
+            "grey": card(grey_qty, grey_val),
+            "externalWip": {
+                **card(wip_qty, wip_val),
+                "byParty": wip_by_party,
             },
-            "goodStock": {
-                "qty": float(good_qty),
-                "uom": dominant_uom,
-                "value": float(round2(good_val)),
-                "pct": round((float(good_qty) / tot_q) * 100, 1),
-                "changePct": good_change_pct,
-            },
-            "sampleStock": {
-                "qty": float(sample_qty),
-                "uom": dominant_uom,
-                "value": float(round2(sample_val)),
-                "pct": round((float(sample_qty) / tot_q) * 100, 1),
-                "changePct": sample_change_pct,
-            },
-            "wastageStock": {
-                "qty": float(wastage_qty),
-                "uom": dominant_uom,
-                "value": float(round2(wastage_val)),
-                "pct": round((float(wastage_qty) / tot_q) * 100, 1),
-                "changePct": wastage_change_pct,
-            },
-            "reprocessingStock": {
-                "qty": float(reprocess_qty),
-                "uom": dominant_uom,
-                "value": float(round2(reprocess_val)),
-                "pct": round((float(reprocess_qty) / tot_q) * 100, 1),
-                "changePct": reprocess_change_pct,
-            },
-            "customerReturnStock": {
-                "qty": float(customer_return_qty),
-                "uom": dominant_uom,
-                "value": float(round2(customer_return_val)),
-                "pct": round((float(customer_return_qty) / tot_q) * 100, 1),
-                "changePct": return_change_pct,
-            },
-            "qcHoldStock": {
-                "qty": float(grey_wip_qty),
-                "uom": dominant_uom,
-                "value": float(round2(grey_wip_val)),
-                "pct": round((float(grey_wip_qty) / tot_q) * 100, 1),
-                "changePct": 0.0,
-            },
-            "rejectedStock": {
-                "qty": float(total_damaged),
-                "uom": dominant_uom,
-                "value": float(round2(wastage_val)),
-                "pct": round((float(total_damaged) / tot_q) * 100, 1),
-                "changePct": 0.0,
-            },
+            "qcHold": card(qc_hold_qty, qc_hold_val),
+            "reprocess": card(reprocess_qty, reprocess_val),
+            "finished": card(finished_qty, finished_val),
+            "reserved": card(reserved_qty, reserved_val),
+            "secondQuality": card(second_qty, second_val),
+            "reject": card(rejected_qty, rejected_val),
+            "sample": card(sample_qty, sample_val, of_total=False),
+            "customerReturn": card(customer_return_qty, customer_return_val, of_total=False),
+        }
+
+        # Per-item figures for the quality table and the records below.
+        items_with_stock = list(item_map.values())
+        stock.annotate_items_with_stock(client_id, items_with_stock)
+        sample_out_by_item = {}
+        for m in sample_issue_qs:
+            sample_out_by_item[m.item_id] = sample_out_by_item.get(m.item_id, ZERO) + abs(D(m.quantity))
+        for row in sample_return_qs.filter(source_document_id__in=sample_issue_qs.values("id")).values("item_id").annotate(q=Sum("quantity")):
+            sample_out_by_item[row["item_id"]] = sample_out_by_item.get(row["item_id"], ZERO) - D(row["q"] or 0)
+        return_by_item = {
+            row["item_id"]: D(row["q"] or 0)
+            for row in ret_lines.values("item_id").annotate(q=Sum("returned_qty"))
         }
 
         # 1. Quality-wise stock breakdown (for Fabric Stock Overview table)
         quality_stock = []
-        qualities_seen = set()
-        for idx, item in enumerate(items_qs):
-            q_name = item.fabric_quality or item.name
-            if q_name in qualities_seen:
+        quality_groups = {}
+        for item in item_map.values():
+            quality_groups.setdefault(item.fabric_quality or item.name, []).append(item)
+        for q_name, group in sorted(quality_groups.items(), key=lambda kv: kv[0] or ""):
+            ids = {i.id for i in group}
+            by_role = {role: ZERO for role in role_qty}
+            damaged = ZERO
+            for b in balance_rows:
+                if b.item_id in ids:
+                    by_role[location_role.get(b.location_id, "GOOD")] += D(b.on_hand)
+                    damaged += D(b.damaged)
+            total = sum(by_role.values(), ZERO)
+            if total == ZERO and damaged == ZERO:
                 continue
-            qualities_seen.add(q_name)
-            item_sub_ids = [i.id for i in items_qs if (i.fabric_quality or i.name) == q_name]
-            q_on_hand = sum(float(b.on_hand) for b in balance_rows if b.item_id in item_sub_ids)
-            q_damaged = sum(float(b.damaged) for b in balance_rows if b.item_id in item_sub_ids)
-            q_good = max(0.0, q_on_hand)
-            q_tot = q_good + q_damaged
             quality_stock.append({
-                "id": str(item.id),
-                "qualityCode": item.sku or f"FAB-{idx+1:02d}",
+                "id": str(group[0].id),
+                "qualityCode": group[0].sku if len(group) == 1 else None,
                 "qualityName": q_name,
-                "goodStock": round(q_good, 2),
-                "sample": 0.0,
-                "wastage": round(q_damaged, 2),
-                "reprocess": 0.0,
-                "reinward": 0.0,
-                "return": 0.0,
-                "qcHold": 0.0,
-                "rejected": round(q_damaged, 2),
-                "total": round(q_tot, 2),
+                "goodStock": float(round4(by_role["GOOD"])),
+                "sample": float(round4(max(ZERO, sum((sample_out_by_item.get(i, ZERO) for i in ids), ZERO)))),
+                "wastage": float(round4(damaged)),
+                "reprocess": float(round4(by_role["REPROCESS"])),
+                "secondQuality": float(round4(by_role["SECOND_QUALITY"])),
+                "return": float(round4(sum((return_by_item.get(i, ZERO) for i in ids), ZERO))),
+                "qcHold": float(round4(by_role["QC_HOLD"])),
+                "rejected": float(round4(by_role["REJECT"])),
+                "total": float(round4(total)),
             })
 
         # 2. Sample Stock Records
-        # Query all sample issues and returns
         sample_issues_qs = StockMovement.objects.filter(
             client_id=client_id,
             item_id__in=item_ids,
-            reference_type__in=["SampleIssue", "ZONE_ISSUE"],
+            reference_type="SampleIssue",
             quantity__lt=0,
-        ).select_related("item", "location").order_by("-movement_date", "-created_at")
+        ).select_related("item", "location", "lot_taka").order_by("-movement_date", "-created_at")
 
-        # Returns linking back to issue movements via source_document_id or notes
         sample_returns_all = StockMovement.objects.filter(
             client_id=client_id,
             item_id__in=item_ids,
             reference_type="SampleReturn",
             quantity__gt=0,
-        ).order_by("movement_date", "created_at")
+        ).select_related("location").order_by("movement_date", "created_at")
 
         return_map = {}
         return_history_map = {}
@@ -1367,206 +1697,191 @@ class InventoryDashboardView(APIView):
             s_doc_id = str(r.source_document_id) if r.source_document_id else ""
             if not s_doc_id:
                 continue
-            return_map[s_doc_id] = return_map.get(s_doc_id, 0.0) + float(r.quantity or 0)
-            if s_doc_id not in return_history_map:
-                return_history_map[s_doc_id] = []
-            return_history_map[s_doc_id].append({
+            return_map[s_doc_id] = return_map.get(s_doc_id, ZERO) + D(r.quantity or 0)
+            note = r.notes or ""
+            condition = note[1:note.index("]")] if note.startswith("[") and "]" in note else None
+            return_history_map.setdefault(s_doc_id, []).append({
                 "id": str(r.id),
                 "returnNo": r.reference_number,
                 "qty": float(r.quantity),
                 "uom": r.uom,
                 "date": r.movement_date.strftime("%d-%m-%Y"),
-                "condition": "Usable (Good Stock)" if "good" in (r.notes or "").lower() else ("QC Hold" if "hold" in (r.notes or "").lower() else ("Reprocess" if "reprocess" in (r.notes or "").lower() else ("Scrap / Wastage" if "reject" in (r.notes or "").lower() else "Usable"))),
-                "remarks": r.notes or "",
+                "condition": condition,
+                "location": r.location.name if r.location_id else None,
+                "remarks": note[note.index("]") + 1:].strip() if condition else note,
             })
 
         sample_records = []
         for m in sample_issues_qs[:100]:
             it = m.item
-            qty_val = abs(float(m.quantity))
-            ret_val = return_map.get(str(m.id), 0.0)
-            rem_val = max(0.0, qty_val - ret_val)
+            qty_val = abs(D(m.quantity))
+            ret_val = return_map.get(str(m.id), ZERO)
+            rem_val = max(ZERO, qty_val - ret_val)
 
-            # Metadata parsing from notes (JSON payload or text)
-            meta = {}
-            cust_name = "Sample Room"
+            cust_name = None
             expected_date = ""
             purpose = m.notes or ""
             if m.notes and m.notes.strip().startswith("{") and m.notes.strip().endswith("}"):
                 try:
                     meta = json.loads(m.notes)
-                    cust_name = meta.get("customer") or cust_name
+                    cust_name = meta.get("customer") or None
                     expected_date = meta.get("expectedReturnDate") or ""
                     purpose = meta.get("purpose") or ""
-                except Exception:
+                except ValueError:
                     pass
-            elif m.notes and "issued to " in m.notes.lower():
-                try:
-                    cust_name = m.notes.split("issued to ")[-1].strip()
-                except Exception:
-                    cust_name = m.notes
 
-            # Determine status: Issued, Partial, Returned, Overdue
-            if ret_val <= 0:
+            if ret_val <= ZERO:
                 s_status = "Issued"
-            elif rem_val <= 0:
+            elif rem_val <= ZERO:
                 s_status = "Returned"
             else:
                 s_status = "Partial"
-
-            # Check if overdue
-            if expected_date and rem_val > 0:
+            if expected_date and rem_val > ZERO:
                 try:
-                    exp_d = date.fromisoformat(expected_date)
-                    if exp_d < today:
+                    if date.fromisoformat(expected_date) < today:
                         s_status = "Overdue"
-                except Exception:
+                except ValueError:
                     pass
 
             sample_records.append({
                 "id": str(m.id),
-                "issueNo": m.reference_number or f"SMPL-{str(m.id)[:4].upper()}",
-                "itemCode": it.sku if it else "—",
-                "itemName": it.name if it else "Fabric Item",
-                "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "Fabric"),
-                "design": it.fabric_design if it and it.fabric_design else "Plain",
-                "shade": it.fabric_color if it and it.fabric_color else "Default",
-                "lotNo": m.batch_number or f"LT-{str(m.id)[:4].upper()}",
-                "issuedQty": qty_val,
-                "returnedQty": ret_val,
-                "remainingQty": rem_val,
+                "issueNo": m.reference_number,
+                "itemCode": it.sku if it else None,
+                "itemName": it.name if it else None,
+                "quality": (it.fabric_quality or it.name) if it else None,
+                "design": (it.fabric_design or None) if it else None,
+                "shade": (it.fabric_color or None) if it else None,
+                "lotNo": m.batch_number or None,
+                "takaId": (m.lot_taka.taka_id or m.lot_taka.barcode) if m.lot_taka_id else None,
+                "locationId": str(m.location_id),
+                "issuedQty": float(qty_val),
+                "returnedQty": float(ret_val),
+                "remainingQty": float(rem_val),
                 "customer": cust_name,
                 "issueDate": m.movement_date.strftime("%d-%m-%Y"),
                 "rawDate": m.movement_date.isoformat(),
                 "expectedReturnDate": expected_date,
-                "availableGoodStock": float(it.available_qty if hasattr(it, "available_qty") else 0.0),
+                "availableGoodStock": float(getattr(item_map.get(m.item_id), "available_qty", ZERO) or ZERO),
                 "status": s_status,
-                "uom": m.uom or (it.uom if it else "m"),
+                "uom": m.uom or (it.uom if it else None),
                 "remarks": purpose,
                 "history": return_history_map.get(str(m.id), []),
             })
 
-        # 3. Wastage Stock Records
+        # 3. Wastage / Reject Stock Records: FAULTY (damaged) movements plus
+        # everything routed to the Reject location.
         wastage_records = []
-        faulty_movs = StockMovement.objects.filter(
-            client_id=client_id,
-            item_id__in=item_ids,
-            type="FAULTY",
-        ).select_related("item", "location").order_by("-movement_date", "-created_at")[:50]
-        for m in faulty_movs:
+        waste_movs = (
+            StockMovement.objects.filter(client_id=client_id, item_id__in=item_ids)
+            .filter(Q(type="FAULTY") | Q(location__code=stock.SYSTEM_LOCATIONS["REJECT"][0], quantity__gt=0))
+            .select_related("item", "location")
+            .order_by("-movement_date", "-created_at")
+        )
+        if godown_id:
+            waste_movs = waste_movs.filter(location_id=godown_id)
+        for m in waste_movs[:50]:
             it = m.item
             wastage_records.append({
                 "id": str(m.id),
-                "itemCode": it.sku if it else "—",
-                "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "Fabric"),
-                "design": it.fabric_design if it and it.fabric_design else "Plain",
-                "shade": it.fabric_color if it and it.fabric_color else "Default",
-                "lotNo": m.batch_number or f"LT-{str(m.id)[:4].upper()}",
+                "itemCode": it.sku if it else None,
+                "quality": (it.fabric_quality or it.name) if it else None,
+                "design": (it.fabric_design or None) if it else None,
+                "shade": (it.fabric_color or None) if it else None,
+                "lotNo": m.batch_number or None,
                 "quantity": abs(float(m.effective_quantity)),
-                "uom": m.uom or (it.uom if it else "m"),
-                "reason": m.notes or "Process Loss",
-                "sourceDoc": m.reference_number or f"QC-{str(m.id)[:4].upper()}",
+                "uom": m.uom or (it.uom if it else None),
+                "reason": m.notes or None,
+                "type": m.type,
+                "sourceDoc": m.reference_number,
                 "date": m.movement_date.strftime("%d-%m-%Y"),
             })
-        if not wastage_records:
-            for fp in FaultyPart.objects.filter(client_id=client_id).select_related("item", "location")[:20]:
-                it = fp.item
-                wastage_records.append({
-                    "id": str(fp.id),
-                    "itemCode": it.sku if it else "—",
-                    "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "Fabric"),
-                    "design": it.fabric_design if it and it.fabric_design else "Plain",
-                    "shade": it.fabric_color if it and it.fabric_color else "Default",
-                    "lotNo": f"LT-{str(fp.id)[:4].upper()}",
-                    "quantity": float(fp.quantity),
-                    "uom": it.uom if it else "m",
-                    "reason": "Machine Reject",
-                    "sourceDoc": fp.rma_number,
-                    "date": fp.created_at.strftime("%d-%m-%Y") if fp.created_at else "",
-                })
 
-        # 4. Good Fabric Stock Records (Taka-level inventory from LotTaka, backed by StockBalance)
+        # 4. Good Fabric Stock Records (taka-level from LotTaka at good
+        # locations, plus balances not held on takas)
         active_takas = list(
             LotTaka.objects.filter(
                 client_id=client_id,
                 deleted_at__isnull=True,
                 status="Active",
                 item_id__in=item_ids,
+                available_quantity__gt=0,
             ).select_related("item", "location")
         )
         taka_by_item_loc = {}
         for lt in active_takas:
-            key = (lt.item_id, lt.location_id)
-            if key not in taka_by_item_loc:
-                taka_by_item_loc[key] = []
-            taka_by_item_loc[key].append(lt)
+            taka_by_item_loc.setdefault((lt.item_id, lt.location_id), []).append(lt)
+
+        def lot_status(item, qty):
+            reorder = D(getattr(item, "reorder_level", 0) or 0)
+            if qty <= ZERO:
+                return "Nil"
+            return "Low Stock" if reorder > ZERO and qty <= reorder else "Available"
 
         good_records = []
         for b in balance_rows:
-            if float(b.on_hand) <= 0:
+            if D(b.on_hand) <= ZERO or location_role.get(b.location_id, "GOOD") != "GOOD":
                 continue
             it = b.item
-            avail = float(b.on_hand)
-            key = (b.item_id, b.location_id)
-            takas = taka_by_item_loc.get(key, [])
-            if takas:
-                for lt in takas:
-                    lt_avail = float(lt.available_quantity)
-                    taka_id = lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}"
-                    good_records.append({
-                        "id": str(lt.id),
-                        "takaId": taka_id,
-                        "itemCode": it.sku if it else "—",
-                        "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "Fabric"),
-                        "design": it.fabric_design if it and it.fabric_design else "Plain",
-                        "shade": it.fabric_color if it and it.fabric_color else "Default",
-                        "lotNo": f"{lt.lot_number} / #{lt.taka_number}",
-                        "totalQty": float(lt.received_quantity),
-                        "available": lt_avail,
-                        "reserved": 0.0,
-                        "uom": lt.uom or (it.uom if it else "m"),
-                        "godown": lt.location.name if lt.location else (b.location.name if b.location else "Main Godown"),
-                        "status": "Available" if lt_avail > 50 else "Low Stock",
-                    })
-            else:
+            takas = taka_by_item_loc.get((b.item_id, b.location_id), [])
+            on_takas = ZERO
+            for lt in takas:
+                lt_avail = D(lt.available_quantity)
+                on_takas += lt_avail
+                good_records.append({
+                    "id": str(lt.id),
+                    "takaId": lt.taka_id or lt.barcode,
+                    "itemCode": it.sku if it else None,
+                    "quality": (it.fabric_quality or it.name) if it else None,
+                    "design": (it.fabric_design or None) if it else None,
+                    "shade": (it.fabric_color or None) if it else None,
+                    "lotNo": f"{lt.lot_number} / #{lt.taka_number}",
+                    "totalQty": float(lt.received_quantity),
+                    "available": float(lt_avail),
+                    "reserved": None,
+                    "uom": lt.uom or (it.uom if it else None),
+                    "godown": lt.location.name if lt.location else None,
+                    "status": lot_status(it, lt_avail),
+                })
+            loose = D(b.on_hand) - on_takas
+            if loose > ZERO:
                 good_records.append({
                     "id": str(b.id),
-                    "itemCode": it.sku if it else "—",
-                    "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "Fabric"),
-                    "design": it.fabric_design if it and it.fabric_design else "Plain",
-                    "shade": it.fabric_color if it and it.fabric_color else "Default",
-                    "lotNo": f"LT-{it.sku[-4:] if it and len(it.sku) >= 4 else '001'}",
-                    "totalQty": avail,
-                    "available": avail,
-                    "reserved": 0.0,
-                    "uom": it.uom if it else "m",
-                    "godown": b.location.name if b.location else "Main Godown",
-                    "status": "Available" if avail > 50 else "Low Stock",
+                    "takaId": None,
+                    "itemCode": it.sku if it else None,
+                    "quality": (it.fabric_quality or it.name) if it else None,
+                    "design": (it.fabric_design or None) if it else None,
+                    "shade": (it.fabric_color or None) if it else None,
+                    "lotNo": None,
+                    "totalQty": float(loose),
+                    "available": float(loose),
+                    "reserved": None,
+                    "uom": it.uom if it else None,
+                    "godown": b.location.name if b.location else None,
+                    "status": lot_status(it, loose),
                 })
 
-        # 5. Reprocessing Stock Records
+        # 5. Reprocessing Stock Records (reprocess orders)
         reprocess_records = []
         for rp in JWOReprocess.objects.filter(client_id=client_id).select_related(
             "job_work_order", "job_work_order__vendor", "job_work_order__process_plan"
         ).order_by("-date", "-created_at")[:50]:
             jwo = rp.job_work_order
             plan = jwo.process_plan if jwo else None
-            v_name = jwo.vendor_name or (jwo.vendor.name if jwo and jwo.vendor else "Outside Processor")
             sent_q = float(rp.qty or 0)
             rec_q = sent_q if rp.status in ["Received", "Completed"] else 0.0
-            pend_q = max(0.0, sent_q - rec_q)
             reprocess_records.append({
                 "id": str(rp.id),
-                "itemCode": getattr(plan, "fabric_item", "FAB-01") or "FAB-01",
-                "quality": (plan.fabric_quality or plan.fabric_item) if plan else "Fabric Quality",
-                "design": "Plain",
-                "shade": getattr(plan, "shade", "Default") or "Default",
-                "lotNo": getattr(plan, "grey_lot_no", f"LT-{str(rp.id)[:4].upper()}") or f"LT-{str(rp.id)[:4].upper()}",
+                "reprocessNo": rp.no,
+                "itemCode": (plan.fabric_item or None) if plan else None,
+                "quality": (plan.fabric_quality or plan.fabric_item or None) if plan else None,
+                "design": None,
+                "shade": (plan.shade or None) if plan else None,
+                "lotNo": (plan.grey_lot_no or None) if plan else None,
                 "sentQty": sent_q,
                 "receivedQty": rec_q,
-                "pendingQty": pend_q,
-                "process": jwo.process if jwo and jwo.process else "Dyeing / Processing",
-                "vendor": v_name,
+                "pendingQty": max(0.0, sent_q - rec_q),
+                "process": (jwo.process or None) if jwo else None,
+                "vendor": ((jwo.vendor_name or (jwo.vendor.name if jwo.vendor else None)) if jwo else None),
                 "status": rp.status,
             })
 
@@ -1574,32 +1889,76 @@ class InventoryDashboardView(APIView):
         return_records = []
         for ret in ret_lines.select_related("item", "sales_return", "sales_return__party")[:50]:
             it = ret.item
-            party_name = ret.sales_return.party.name if (ret.sales_return and ret.sales_return.party) else "Customer"
             return_records.append({
                 "id": str(ret.id),
-                "itemCode": it.sku if it else "—",
-                "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "Fabric"),
-                "design": it.fabric_design if it and it.fabric_design else "Plain",
-                "shade": it.fabric_color if it and it.fabric_color else "Default",
-                "lotNo": f"LT-RET-{str(ret.id)[:4].upper()}",
+                "returnNo": ret.sales_return.return_number if ret.sales_return_id else None,
+                "itemCode": it.sku if it else None,
+                "quality": (it.fabric_quality or it.name) if it else None,
+                "design": (it.fabric_design or None) if it else None,
+                "shade": (it.fabric_color or None) if it else None,
+                "lotNo": None,
                 "returnQty": float(ret.returned_qty or 0),
-                "uom": ret.uom or "m",
-                "reason": ret.reason or "Quality Issue",
-                "qcStatus": "Hold",
-                "customer": party_name,
-                "date": ret.sales_return.return_date.strftime("%d-%m-%Y") if ret.sales_return and ret.sales_return.return_date else "",
+                "uom": ret.uom or (it.uom if it else None),
+                "reason": getattr(ret, "reason", None) or None,
+                "qcStatus": getattr(ret, "condition", None),
+                "customer": ret.sales_return.party.name if (ret.sales_return_id and ret.sales_return.party_id) else None,
+                "date": ret.sales_return.doc_date.strftime("%d-%m-%Y") if ret.sales_return_id and ret.sales_return.doc_date else "",
             })
 
         if mixed_units:
             on_hand_by_uom = per_unit(balance_rows, lambda b: b.on_hand)
             damaged_by_uom = per_unit(balance_rows, lambda b: b.damaged)
-            for key, card in summary_cards.items():
-                card["qty"] = None
-                card["changePct"] = None
-                card["byUom"] = []
-            summary_cards["goodStock"]["byUom"] = on_hand_by_uom
+            for key, card_row in summary_cards.items():
+                card_row["qty"] = None
+                card_row["changePct"] = None
+                card_row["byUom"] = []
             summary_cards["totalStock"]["byUom"] = on_hand_by_uom
             summary_cards["wastageStock"]["byUom"] = damaged_by_uom
+
+        # Takas available for sample issue: good locations only.
+        available_lots = [
+            {
+                "id": str(lt.id),
+                "lotTakaId": str(lt.id),
+                "takaId": lt.taka_id or lt.barcode,
+                "itemId": str(lt.item_id),
+                "sku": lt.item.sku if lt.item else None,
+                "name": lt.item.name if lt.item else None,
+                "quality": (lt.item.fabric_quality or lt.item.name) if lt.item else None,
+                "design": (lt.item.fabric_design or None) if lt.item else None,
+                "shade": (lt.item.fabric_color or None) if lt.item else None,
+                "uom": lt.uom or (lt.item.uom if lt.item else None),
+                "locationId": str(lt.location_id),
+                "godown": lt.location.name if lt.location else None,
+                "available": float(lt.available_quantity),
+                "lotNo": f"{lt.lot_number} / #{lt.taka_number}",
+            }
+            for lt in active_takas
+            if location_role.get(lt.location_id, "GOOD") == "GOOD"
+        ]
+        # Items with stock not held on takas are issued by location only.
+        for b in balance_rows:
+            if location_role.get(b.location_id, "GOOD") != "GOOD" or D(b.on_hand) <= ZERO:
+                continue
+            on_takas = sum((D(lt.available_quantity) for lt in taka_by_item_loc.get((b.item_id, b.location_id), [])), ZERO)
+            loose = D(b.on_hand) - on_takas
+            if loose > ZERO:
+                available_lots.append({
+                    "id": None,
+                    "lotTakaId": None,
+                    "takaId": None,
+                    "itemId": str(b.item_id),
+                    "sku": b.item.sku if b.item else None,
+                    "name": b.item.name if b.item else None,
+                    "quality": (b.item.fabric_quality or b.item.name) if b.item else None,
+                    "design": (b.item.fabric_design or None) if b.item else None,
+                    "shade": (b.item.fabric_color or None) if b.item else None,
+                    "uom": b.item.uom if b.item else None,
+                    "locationId": str(b.location_id),
+                    "godown": b.location.name if b.location else None,
+                    "available": float(loose),
+                    "lotNo": None,
+                })
 
         return Response({
             "units": {"inScope": units_in_scope, "mixed": mixed_units},
@@ -1612,40 +1971,9 @@ class InventoryDashboardView(APIView):
                     "from": start_date.isoformat(),
                     "to": end_date.isoformat(),
                 },
-                "availableLots": [
-                    {
-                        "id": str(lt.id),
-                        "takaId": lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}",
-                        "itemId": str(lt.item_id),
-                        "sku": lt.item.sku if lt.item else "",
-                        "name": lt.item.name if lt.item else "",
-                        "quality": lt.item.fabric_quality if lt.item and lt.item.fabric_quality else (lt.item.name if lt.item else "Fabric"),
-                        "design": lt.item.fabric_design if lt.item and lt.item.fabric_design else "Plain",
-                        "shade": lt.item.fabric_color if lt.item and lt.item.fabric_color else "Default",
-                        "uom": lt.uom or (lt.item.uom if lt.item else "m"),
-                        "locationId": str(lt.location_id),
-                        "godown": lt.location.name if lt.location else "Main Godown",
-                        "available": float(lt.available_quantity),
-                        "lotNo": f"{lt.lot_number} / #{lt.taka_number}",
-                    }
-                    for lt in active_takas if float(lt.available_quantity) > 0
-                ] if active_takas else [
-                    {
-                        "itemId": str(b.item_id),
-                        "sku": b.item.sku if b.item else "",
-                        "name": b.item.name if b.item else "",
-                        "quality": b.item.fabric_quality if b.item and b.item.fabric_quality else (b.item.name if b.item else "Fabric"),
-                        "design": b.item.fabric_design if b.item and b.item.fabric_design else "Plain",
-                        "shade": b.item.fabric_color if b.item and b.item.fabric_color else "Default",
-                        "uom": b.item.uom if b.item else "m",
-                        "locationId": str(b.location_id),
-                        "godown": b.location.name if b.location else "Main Godown",
-                        "available": max(0.0, float(b.on_hand)),
-                        "lotNo": f"LT-{b.item.sku[-4:] if b.item and len(b.item.sku) >= 4 else '001'}",
-                    }
-                    for b in balance_rows if float(b.on_hand) > 0
-                ],
+                "availableLots": available_lots,
             },
+            "stockBuckets": stock_buckets,
             "summaryCards": summary_cards,
             "stockDistribution": dist_items,
             "stockTrend": trend_months,
@@ -1663,141 +1991,169 @@ class InventoryDashboardView(APIView):
 
     @transaction.atomic
     def post(self, request):
-        client_id = request.client_id
         action = request.data.get("action") or "issue_sample"
         if action == "issue_sample":
-            item_id = request.data.get("itemId")
-            customer_name = request.data.get("customer") or "Sample Room"
-            qty = Decimal(str(request.data.get("qty") or "1"))
-            location_id = request.data.get("locationId")
-            notes = request.data.get("notes") or f"Sample issued to {customer_name}"
-            lot_no = request.data.get("lotNo") or ""
-
-            item = Item.objects.filter(client_id=client_id, id=item_id).first()
-            if not item:
-                return Response({"detail": "Item required."}, status=status.HTTP_400_BAD_REQUEST)
-            loc = Location.objects.filter(client_id=client_id, id=location_id).first() or Location.objects.filter(client_id=client_id).first()
-
-            expected_date = request.data.get("expectedReturnDate") or ""
-            notes_payload = json.dumps({
-                "customer": customer_name,
-                "expectedReturnDate": expected_date,
-                "purpose": notes,
-            })
-
-            # Validate that the requested sample quantity does not exceed available Good Fabric Stock
-            stock.assert_sufficient_stock(
-                client_id=client_id,
-                item=item,
-                quantity=qty,
-                location_id=loc.id if loc else None,
-                label=f"{item.name} ({lot_no or 'Good Stock'})",
-            )
-
-            count_today = StockMovement.objects.filter(
-                client_id=client_id,
-                reference_type="SampleIssue",
-                movement_date=timezone.localdate(),
-            ).count() + 1
-            issue_ref = f"SMPL-{timezone.localdate().strftime('%y%m%d')}-{count_today:03d}"
-
-            # Deduct from Good Fabric Stock atomically via append-only StockMovement
-            mov = stock.post_movement(
-                client_id=client_id,
-                item=item,
-                location=loc,
-                type="ZONE_ISSUE",
-                quantity=-qty,
-                weighed_qty=-qty,
-                reference_type="SampleIssue",
-                reference_id=item.id,
-                reference_number=issue_ref,
-                batch_number=lot_no,
-                movement_date=timezone.localdate(),
-                notes=notes_payload,
-                user=request.user if request.user.is_authenticated else None,
-            )
-            return Response({
-                "success": True,
-                "message": f"Sample of {qty} {item.uom or 'm'} issued successfully from Good Fabric Stock to {customer_name}.",
-                "movementId": str(mov.id),
-                "issueNo": issue_ref,
-            })
-
+            return self._issue_sample(request)
         if action == "return_sample":
-            movement_id = request.data.get("movementId") or request.data.get("issueId")
-            return_qty = Decimal(str(request.data.get("returnQty") or "0"))
-            condition = request.data.get("condition") or "usable"  # usable | hold | reprocess | wastage
-            remarks = request.data.get("remarks") or "Sample returned"
+            return self._return_sample(request)
+        raise ValidationFailed("Invalid action.", field_errors={"action": ["Expected issue_sample or return_sample."]})
 
-            if return_qty <= ZERO:
-                return Response({"detail": "Return quantity must be greater than 0."}, status=status.HTTP_400_BAD_REQUEST)
-
-            orig_mov = StockMovement.objects.filter(client_id=client_id, id=movement_id).first()
-            if not orig_mov:
-                return Response({"detail": "Original sample issue movement not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            item = orig_mov.item
-            loc = orig_mov.location or Location.objects.filter(client_id=client_id).first()
-
-            # Prevent returning more than remaining outstanding quantity
-            already_returned = StockMovement.objects.filter(
-                client_id=client_id,
-                reference_type="SampleReturn",
-                source_document_id=orig_mov.id,
-            ).aggregate(tot=Sum("quantity"))["tot"] or Decimal("0")
-
-            issued_abs = abs(orig_mov.quantity)
-            remaining_outstanding = issued_abs - already_returned
-            if return_qty > remaining_outstanding:
-                return Response({
-                    "detail": f"Return quantity ({return_qty}) cannot exceed remaining returnable quantity ({remaining_outstanding} {orig_mov.uom or 'm'})."
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-            # Determine movement type based on fabric condition:
-            # - "usable": ZONE_RETURN (adds back to available Good Fabric Stock)
-            # - "wastage": FAULTY (moves directly into damaged/wastage inventory)
-            # - "hold" / "reprocess": ZONE_RETURN with QC/Reprocess note tag (isolated in QC queue)
-            if condition == "wastage":
-                mov_type = "FAULTY"
-                cond_tag = "Scrap / Wastage"
-            elif condition == "hold":
-                mov_type = "ZONE_RETURN"
-                cond_tag = "QC Hold Inspection Required"
-            elif condition == "reprocess":
-                mov_type = "ZONE_RETURN"
-                cond_tag = "Sent for Reprocess"
-            else:
-                mov_type = "ZONE_RETURN"
-                cond_tag = "Usable (Good Fabric Stock)"
-
-            return_note = f"[{cond_tag}] {remarks}"
-
-            ret_mov = stock.post_movement(
-                client_id=client_id,
-                item=item,
-                location=loc,
-                type=mov_type,
-                quantity=return_qty,
-                weighed_qty=return_qty,
-                reference_type="SampleReturn",
-                reference_id=orig_mov.id,
-                reference_number=f"RET-{orig_mov.reference_number or str(orig_mov.id)[:6].upper()}",
-                source_document_type="StockMovement",
-                source_document_id=orig_mov.id,
-                batch_number=orig_mov.batch_number,
-                movement_date=timezone.localdate(),
-                notes=return_note,
-                user=request.user if request.user.is_authenticated else None,
+    def _issue_sample(self, request):
+        """A sample cut from good stock: SAMPLE_ISSUE out of the godown (and
+        off the taka, when one is named or the item is taka-tracked)."""
+        client_id = request.client_id
+        data = request.data
+        field_errors = {}
+        item = Item.objects.filter(client_id=client_id, id=data.get("itemId"), deleted_at__isnull=True).first()
+        if item is None:
+            field_errors["itemId"] = ["Choose the item."]
+        customer_name = (data.get("customer") or "").strip()
+        if not customer_name:
+            field_errors["customer"] = ["Who is the sample issued to?"]
+        try:
+            qty = round4(D(data.get("qty")))
+        except Exception:  # noqa: BLE001
+            qty = ZERO
+        if qty <= ZERO:
+            field_errors["qty"] = ["Enter a quantity greater than zero."]
+        lot = None
+        if data.get("lotTakaId"):
+            lot = LotTaka.objects.filter(
+                client_id=client_id, id=data.get("lotTakaId"), deleted_at__isnull=True
+            ).first()
+            if lot is None:
+                field_errors["lotTakaId"] = ["That taka does not exist."]
+        location = None
+        location_id = (lot.location_id if lot else None) or data.get("locationId")
+        if location_id:
+            location = Location.objects.filter(client_id=client_id, id=location_id).first()
+        if location is None:
+            field_errors["locationId"] = ["Choose the godown the sample is cut from."]
+        if field_errors:
+            raise ValidationFailed("Sample issue is incomplete.", field_errors=field_errors)
+        if location.code in stock.BLOCKED_LOCATION_CODES:
+            raise ValidationFailed(
+                "Samples are issued from good stock only.",
+                field_errors={"locationId": [f"{location.name} is not a good-stock location."]},
             )
-            return Response({
-                "success": True,
-                "message": f"Sample return of {return_qty} {item.uom or 'm'} ({cond_tag}) recorded successfully in Stock Ledger.",
-                "movementId": str(ret_mov.id),
-                "remainingOutstanding": float(remaining_outstanding - return_qty),
-            })
 
-        return Response({"detail": "Invalid action."}, status=status.HTTP_400_BAD_REQUEST)
+        stock.assert_sufficient_stock(
+            client_id=client_id, item=item, quantity=qty, location_id=location.id,
+            label=f"{item.name} ({lot.lot_number if lot else location.name})",
+        )
+        issue_date = timezone.localdate()
+        issue_ref = allocate_number(request.user.client, "SMPL", issue_date)
+        import uuid as _uuid
+
+        mov = stock.post_movement(
+            client_id=client_id,
+            item=item,
+            location=location,
+            type="SAMPLE_ISSUE",
+            quantity=-qty,
+            unit_cost=D(lot.rate) if lot and lot.rate else item.cost_price,
+            reference_type="SampleIssue",
+            reference_id=_uuid.uuid4(),
+            reference_number=issue_ref,
+            batch_number=lot.lot_number if lot else (data.get("lotNo") or None),
+            lot_taka=lot,
+            movement_date=issue_date,
+            notes=json.dumps({
+                "customer": customer_name,
+                "expectedReturnDate": data.get("expectedReturnDate") or "",
+                "purpose": data.get("notes") or "",
+            }),
+            user=request.user,
+        )
+        return Response({
+            "success": True,
+            "message": f"Sample {issue_ref}: {qty} {item.uom} issued to {customer_name}.",
+            "movementId": str(mov.id),
+            "issueNo": issue_ref,
+        })
+
+    def _return_sample(self, request):
+        """Route a returned sample by condition (Phase 1.4): Good -> back to the
+        godown it came from, Hold -> QC Hold, Reprocess -> Reprocess, Second
+        Quality -> Second Quality, Reject/Scrap -> Reject."""
+        client_id = request.client_id
+        data = request.data
+        movement_id = data.get("movementId") or data.get("issueId")
+        try:
+            return_qty = round4(D(data.get("returnQty")))
+        except Exception:  # noqa: BLE001
+            return_qty = ZERO
+        if return_qty <= ZERO:
+            raise ValidationFailed(
+                "Return quantity must be greater than 0.",
+                field_errors={"returnQty": ["Must be greater than zero."]},
+            )
+        condition = stock.normalize_condition(data.get("condition"))
+        remarks = (data.get("remarks") or "").strip()
+
+        orig_mov = StockMovement.objects.select_related("item", "lot_taka").filter(
+            client_id=client_id, id=movement_id, reference_type="SampleIssue"
+        ).first()
+        if orig_mov is None:
+            raise ValidationFailed(
+                "Original sample issue not found.", field_errors={"movementId": ["Not found."]}
+            )
+
+        already_returned = StockMovement.objects.filter(
+            client_id=client_id,
+            reference_type="SampleReturn",
+            source_document_id=orig_mov.id,
+            quantity__gt=0,
+        ).aggregate(tot=Sum("quantity"))["tot"] or ZERO
+        remaining = abs(D(orig_mov.quantity)) - D(already_returned)
+        if return_qty > remaining:
+            raise ValidationFailed(
+                f"Return quantity ({return_qty}) cannot exceed the outstanding "
+                f"quantity ({remaining} {orig_mov.uom or ''}).",
+                field_errors={"returnQty": [f"At most {remaining}."]},
+            )
+
+        destination = stock.condition_location_id(client_id, condition, orig_mov.location_id)
+        _, lot_qc_status = stock.CONDITION_ROUTING[condition]
+        movement_type = {
+            "Good": "SAMPLE_RETURN",
+            "Hold": "SAMPLE_RETURN_HOLD",
+            "Reprocess": "SAMPLE_RETURN_REPROCESS",
+            "Second Quality": "SAMPLE_RETURN_SECOND_QUALITY",
+            "Reject": "SAMPLE_RETURN_REJECT",
+        }[condition]
+        return_no = allocate_number(request.user.client, "SMPR")
+        common = dict(
+            client_id=client_id,
+            reference_type="SampleReturn",
+            reference_id=orig_mov.id,
+            reference_number=return_no,
+            source_document_type="StockMovement",
+            source_document_id=orig_mov.id,
+            movement_date=timezone.localdate(),
+            notes=f"[{condition}] {remarks}".strip(),
+            user=request.user,
+        )
+        if orig_mov.lot_taka_id:
+            _, ret_mov = stock.receive_into_lot(
+                lot=orig_mov.lot_taka, quantity=return_qty, location_id=destination,
+                type=movement_type, qc_status=lot_qc_status, split_suffix="SR",
+                unit_cost=orig_mov.unit_cost, **common,
+            )
+        else:
+            ret_mov = stock.post_movement(
+                item=orig_mov.item_id, location=destination, type=movement_type,
+                quantity=return_qty, unit_cost=orig_mov.unit_cost,
+                batch_number=orig_mov.batch_number, **common,
+            )
+        return Response({
+            "success": True,
+            "message": f"Sample return {return_no}: {return_qty} {orig_mov.uom or ''} routed as {condition}.",
+            "movementId": str(ret_mov.id),
+            "returnNo": return_no,
+            "condition": condition,
+            "remainingOutstanding": float(remaining - return_qty),
+        })
 
 
 class QCDashboardView(APIView):
@@ -1885,7 +2241,7 @@ class QCDashboardView(APIView):
         )["q"]
 
         first_uom = lines_qs.values_list("uom", flat=True).first()
-        dominant_uom = first_uom or "m"
+        dominant_uom = first_uom or None
 
         lots_count = lines_qs.values("batch_number").distinct().count()
         takas_count = lines_qs.count()
@@ -1897,7 +2253,7 @@ class QCDashboardView(APIView):
         )["q"]
         inspected_lots = inspected_lines.values("batch_number").distinct().count()
 
-        good_qty = lines_qs.filter(goods_receipt__qc_status="Approved").aggregate(
+        good_qty = lines_qs.filter(goods_receipt__qc_status__in=["Approved", "Partially Approved"]).aggregate(
             q=Coalesce(Sum(Coalesce("weighed_qty", "received_qty") - F("rejected_qty")), Value(Decimal("0.0000")), output_field=QTY)
         )["q"]
 
@@ -2004,7 +2360,7 @@ class QCDashboardView(APIView):
                 goods_receipt__client_id=client_id,
                 goods_receipt__receipt_date__range=[m_date, next_m - timedelta(days=1)],
             )
-            m_good = m_lines.filter(goods_receipt__qc_status="Approved").aggregate(
+            m_good = m_lines.filter(goods_receipt__qc_status__in=["Approved", "Partially Approved"]).aggregate(
                 q=Coalesce(Sum(Coalesce("weighed_qty", "received_qty") - F("rejected_qty")), Value(Decimal("0.0000")), output_field=QTY)
             )["q"]
             m_hold = m_lines.filter(goods_receipt__qc_status="On Hold").aggregate(
@@ -2035,7 +2391,7 @@ class QCDashboardView(APIView):
             .order_by("-rejected")[:5]
         )
         for s in supp_groups:
-            s_name = s["goods_receipt__party__name"] or "Unknown"
+            s_name = s["goods_receipt__party__name"]
             s_tot = float(s["total"]) or 1.0
             s_rej = float(s["rejected"])
             supplier_rejection.append({
@@ -2098,15 +2454,30 @@ class QCDashboardView(APIView):
         )["q"]
         on_hold_lots = on_hold_lines.values("goods_receipt_id").distinct().count()
 
+        reason_map = {}
+        for l in on_hold_lines.select_related("goods_receipt"):
+            reason = _qc_remarks(l.goods_receipt) or "No reason recorded"
+            if reason not in reason_map:
+                reason_map[reason] = {"qty": Decimal("0"), "lots": set()}
+            reason_map[reason]["qty"] += D(l.weighed_qty or l.received_qty or 0)
+            reason_map[reason]["lots"].add(l.goods_receipt_id)
+
+        for inw in inwards_qs.filter(status="On Hold"):
+            reason = f"Challan {inw.challan_no}" if inw.challan_no else "No reason recorded"
+            if reason not in reason_map:
+                reason_map[reason] = {"qty": Decimal("0"), "lots": set()}
+            reason_map[reason]["qty"] += D(inw.qty or 0)
+            reason_map[reason]["lots"].add(inw.id)
+
+        hold_breakdown = [
+            {"reason": r, "qty": float(round2(data["qty"])), "lots": len(data["lots"])}
+            for r, data in reason_map.items()
+        ]
+
         on_hold_review = {
             "totalQty": float(on_hold_qty) + float(jwo_hold_qty),
             "totalLots": on_hold_lots + inwards_qs.filter(status="On Hold").count(),
-            "breakdown": [
-                {"reason": "Shade Variation", "qty": round((float(on_hold_qty) + float(jwo_hold_qty)) * 0.4, 2) if (on_hold_lots or jwo_hold_qty) else 0.0, "lots": max(1, round(on_hold_lots * 0.4)) if on_hold_lots else 0},
-                {"reason": "Defect Issue", "qty": round((float(on_hold_qty) + float(jwo_hold_qty)) * 0.35, 2) if (on_hold_lots or jwo_hold_qty) else 0.0, "lots": max(1, round(on_hold_lots * 0.35)) if on_hold_lots else 0},
-                {"reason": "Measurement Issue", "qty": round((float(on_hold_qty) + float(jwo_hold_qty)) * 0.15, 2) if (on_hold_lots or jwo_hold_qty) else 0.0, "lots": max(1, round(on_hold_lots * 0.15)) if on_hold_lots else 0},
-                {"reason": "Other", "qty": round((float(on_hold_qty) + float(jwo_hold_qty)) * 0.1, 2) if (on_hold_lots or jwo_hold_qty) else 0.0, "lots": max(1, round(on_hold_lots * 0.1)) if on_hold_lots else 0},
-            ],
+            "breakdown": hold_breakdown,
         }
 
         # Live inspection records (Purchase GRNs + Job Work Inwards)
@@ -2128,10 +2499,10 @@ class QCDashboardView(APIView):
                 "date": r.receipt_date.strftime("%d-%m-%Y"),
                 "sourceType": "Purchase",
                 "refNo": r.purchase_bill.bill_number if r.purchase_bill else r.grn_number,
-                "supplier": r.party.name if r.party else "Unknown",
+                "supplier": r.party.name if r.party else None,
                 "itemCode": line0.item.sku if line0 and line0.item else "—",
                 "itemName": line0.item.name if line0 and line0.item else "—",
-                "lotNo": line0.batch_number if line0 and line0.batch_number else f"LT-{str(r.id)[:6].upper()}",
+                "lotNo": line0.batch_number if line0 and line0.batch_number else None,
                 "takaRoll": len(r_lines) or 1,
                 "received": rec_qty,
                 "inspected": rec_qty if not is_pending else 0,
@@ -2140,17 +2511,17 @@ class QCDashboardView(APIView):
                 "reprocess": rec_qty if is_rep else 0,
                 "rejected": rej_qty if not is_rej else rec_qty,
                 "status": "Completed" if is_good else ("On Hold" if is_hold else r.qc_status),
-                "defectReason": r.qc_note or ("" if is_good else "Inspection checkpoint note"),
-                "inspector": r.qc_by.get_full_name() if r.qc_by else "Inspector",
-                "uom": line0.uom if line0 and line0.uom else dominant_uom,
+                "defectReason": _qc_remarks(r),
+                "inspector": r.qc_by.name if r.qc_by else None,
+                "uom": line0.uom if line0 and line0.uom else None,
             })
 
         for inw in inwards_qs.order_by("-date", "-created_at")[:20]:
             jwo = inw.job_work_order
             plan = jwo.process_plan if jwo else None
-            v_name = jwo.vendor_name or (jwo.vendor.name if jwo and jwo.vendor else "Outside Processor")
-            it_code = getattr(plan, "fabric_item", "FAB-JW") or "FAB-JW"
-            it_name = (plan.fabric_item or plan.fabric_quality) if plan else "Job Work Fabric"
+            v_name = ((jwo.vendor_name or (jwo.vendor.name if jwo.vendor else None)) if jwo else None)
+            it_code = (getattr(plan, "fabric_item", None) or None)
+            it_name = ((plan.fabric_item or plan.fabric_quality) or None) if plan else None
             is_pending = inw.status in ["Received", "Pending QC", "Pending"]
             is_good = inw.status in ["Approved", "Completed"]
             is_hold = inw.status == "On Hold"
@@ -2166,7 +2537,7 @@ class QCDashboardView(APIView):
                 "supplier": v_name,
                 "itemCode": it_code,
                 "itemName": it_name,
-                "lotNo": plan.grey_lot_no if plan and plan.grey_lot_no else f"LOT-{inw.no}",
+                "lotNo": (plan.grey_lot_no or None) if plan else None,
                 "takaRoll": 1,
                 "received": float(inw.qty),
                 "inspected": float(inw.accepted + inw.rejected) if not is_pending else 0,
@@ -2175,9 +2546,9 @@ class QCDashboardView(APIView):
                 "reprocess": float(inw.qty) if is_rep else 0,
                 "rejected": float(inw.rejected),
                 "status": "Completed" if is_good else ("On Hold" if is_hold else inw.status),
-                "defectReason": f"Challan: {inw.challan_no}" if inw.challan_no else "Job Work inspection checkpoint",
-                "inspector": "Inspector",
-                "uom": "m",
+                "defectReason": f"Challan: {inw.challan_no}" if inw.challan_no else None,
+                "inspector": None,
+                "uom": None,
             })
 
         return Response({
@@ -2272,21 +2643,21 @@ class QCPendingInspectionsView(APIView):
                         "grnNo": r.grn_number,
                         "date": rec_date.strftime("%d-%m-%Y") if rec_date else today.strftime("%d-%m-%Y"),
                         "rawDate": rec_date.isoformat() if rec_date else today.isoformat(),
-                        "supplier": r.party.name if r.party else "Unknown",
+                        "supplier": r.party.name if r.party else None,
                         "itemCode": item.sku if item else "—",
-                        "itemName": item.name if item else "Fabric Quality",
+                        "itemName": item.name if item else None,
                         "quality": item_qual,
                         "design": item_des,
                         "shade": item_shd,
-                        "lotNo": line.batch_number or f"LT-{str(r.id)[:4].upper()}",
+                        "lotNo": line.batch_number or None,
                         "takaRoll": idx + 1,
                         "receivedQty": rec_q,
                         "pendingQty": pend_q,
-                        "uom": line.uom or "m",
+                        "uom": line.uom or (item.uom if item else None),
                         "days": days_pending,
                         "status": r.qc_status,
-                        "inspector": r.qc_by.get_full_name() if r.qc_by else "",
-                        "shift": "Day Shift",
+                        "inspector": r.qc_by.name if r.qc_by else None,
+                        "shift": None,
                     })
 
         # 2. Job Work Inward
@@ -2316,13 +2687,13 @@ class QCPendingInspectionsView(APIView):
 
                 jwo = inw.job_work_order
                 plan = jwo.process_plan if jwo else None
-                v_name = jwo.vendor_name or (jwo.vendor.name if jwo and jwo.vendor else "Outside Processor")
-                it_code = getattr(plan, "fabric_item", "FAB-JW") or "FAB-JW"
-                it_name = (plan.fabric_item or plan.fabric_quality) if plan else "Job Work Fabric"
+                v_name = ((jwo.vendor_name or (jwo.vendor.name if jwo.vendor else None)) if jwo else None)
+                it_code = (getattr(plan, "fabric_item", None) or None)
+                it_name = ((plan.fabric_item or plan.fabric_quality) or None) if plan else None
                 it_qual = getattr(plan, "fabric_quality", "") or ""
-                it_des = "Plain"
-                it_shd = getattr(plan, "shade", "") or "Default"
-                lot_no = getattr(plan, "grey_lot_no", "") or f"LOT-{inw.no}"
+                it_des = ""
+                it_shd = getattr(plan, "shade", "") or ""
+                lot_no = (getattr(plan, "grey_lot_no", None) or None)
 
                 if quality != "All" and quality.lower() not in (it_qual or it_name).lower():
                     continue
@@ -2351,11 +2722,11 @@ class QCPendingInspectionsView(APIView):
                     "takaRoll": 1,
                     "receivedQty": rec_q,
                     "pendingQty": pend_q,
-                    "uom": "m",
+                    "uom": None,
                     "days": days_pending,
                     "status": "Pending" if inw.status in ["Received", "Pending QC", "Pending"] else inw.status,
                     "inspector": "",
-                    "shift": "Day Shift",
+                    "shift": None,
                 })
 
         # Masters for filter dropdowns
@@ -2420,7 +2791,7 @@ class QCBulkAssignView(APIView):
         client_id = request.client_id
         receipt_ids = request.data.get("receiptIds") or []
         inspector_name = request.data.get("inspector")
-        shift = request.data.get("shift") or "Day Shift"
+        shift = request.data.get("shift") or ""
         inspection_date = request.data.get("inspectionDate")
 
         if not inspector_name:
@@ -2444,79 +2815,78 @@ class QCBulkAssignView(APIView):
 class QCCompleteInspectionView(APIView):
     """
     POST /inventory/qc/complete/
-    Submit full measurements and QC result.
-    Updates GoodsReceipt and lifts stock block.
+    Submit the QC result of a goods receipt: the stock still at QC Hold is
+    moved to Good / Second Quality / Reprocess / Reject (Hold stays) with real
+    movements, across every GRN line.
     """
 
     permission_classes = [HasModulePermission]
     required_permissions = ["view_inventory"]
+    permission_map = {"POST": ["approve_qc"]}
 
-    @transaction.atomic
     def post(self, request):
+        from . import qc as qc_service
+
         client_id = request.client_id
         receipt_id = request.data.get("receiptId")
         bill_id = request.data.get("billId")
-        good_qty = Decimal(str(request.data.get("goodQty") or 0))
-        hold_qty = Decimal(str(request.data.get("holdQty") or 0))
-        reprocess_qty = Decimal(str(request.data.get("reprocessQty") or 0))
-        rejected_qty = Decimal(str(request.data.get("rejectedQty") or 0))
-        remarks = request.data.get("remarks") or ""
+        quantities = qc_service.parse_quantities(request.data)
 
-        # If it came from a purchase bill not yet converted to GRN, receive it!
-        if not receipt_id and bill_id:
-            from apps.purchase import services as purchase_services
-            bill = PurchaseBill.objects.filter(client_id=client_id, id=bill_id).first()
-            if bill and not bill.goods_received:
-                rec_res = purchase_services.receive_bill_goods(
-                    bill,
-                    lines_payload=[
-                        {"lineIndex": i, "receivedQty": str(good_qty + hold_qty + reprocess_qty + rejected_qty)}
-                        for i in range(bill.lines.count())
-                    ],
-                    qc_status="Approved" if (hold_qty == 0 and rejected_qty == 0 and reprocess_qty == 0) else "On Hold",
-                    user=request.user if request.user.is_authenticated else None,
-                )
-                receipt_id = rec_res.get("receiptId")
-
-        receipt = None
-        if receipt_id:
-            receipt = GoodsReceipt.objects.filter(client_id=client_id, id=receipt_id).first()
-
-        if receipt:
-            if hold_qty > 0:
-                verdict = "On Hold"
-            elif rejected_qty > 0 and good_qty == 0:
-                verdict = "Rejected"
-            elif reprocess_qty > 0 and good_qty == 0:
-                verdict = "Rework"
-            else:
-                verdict = "Approved"
-
-            receipt.qc_status = verdict
-            receipt.qc_note = remarks or f"QC verdict: {verdict}. Good: {good_qty}, Hold: {hold_qty}, Rej: {rejected_qty}"
-            receipt.qc_at = timezone.now()
-            receipt.qc_by = request.user if request.user.is_authenticated else None
-            receipt.save(update_fields=["qc_status", "qc_note", "qc_at", "qc_by", "updated_at"])
-
-            first_line = receipt.lines.first()
-            if first_line:
-                first_line.rejected_qty = rejected_qty
-                first_line.save(update_fields=["rejected_qty", "updated_at"])
-
-            if receipt.purchase_bill_id:
+        with transaction.atomic():
+            if not receipt_id and bill_id:
+                # Goods not yet received on the bill: receive them (into QC
+                # Hold) first, then apply this result to the new GRN.
                 from apps.purchase import services as purchase_services
-                purchase_services.update_qc_status(
-                    receipt.purchase_bill, verdict, note=receipt.qc_note, user=request.user if request.user.is_authenticated else None
+
+                bill = PurchaseBill.objects.filter(
+                    client_id=client_id, id=bill_id, deleted_at__isnull=True
+                ).first()
+                if bill is None:
+                    raise ValidationFailed("Bill not found.", field_errors={"billId": ["Not found."]})
+                if not bill.goods_received:
+                    result = purchase_services.receive_bill_goods(
+                        bill, lines_payload=[], qc_status=None, user=request.user,
+                    )
+                    receipt_id = result["receipt"].id
+                else:
+                    receipt = GoodsReceipt.objects.filter(
+                        client_id=client_id, purchase_bill=bill, deleted_at__isnull=True
+                    ).order_by("-created_at").first()
+                    receipt_id = receipt.id if receipt else None
+
+            receipt = GoodsReceipt.objects.filter(
+                client_id=client_id, id=receipt_id, deleted_at__isnull=True
+            ).first() if receipt_id else None
+            if receipt is None:
+                raise ValidationFailed(
+                    "Goods receipt not found.", field_errors={"receiptId": ["Not found."]}
                 )
+
+            jwo = None
+            jwo_id = request.data.get("jwoId") or request.data.get("jobWorkOrderId")
+            if jwo_id:
+                jwo = JobWorkOrder.objects.filter(client_id=client_id, id=jwo_id).first()
+                if jwo is None:
+                    raise ValidationFailed("Job work order not found.", field_errors={"jwoId": ["Not found."]})
+
+            result = qc_service.dispose_receipt(
+                receipt,
+                quantities=quantities,
+                line_quantities=request.data.get("lines") or None,
+                user=request.user,
+                remarks=request.data.get("remarks") or None,
+                job_work_order=jwo,
+            )
 
         return Response({
             "success": True,
-            "status": "Completed",
-            "message": "QC inspection completed and recorded. Stock updated in real-time.",
-            "goodQty": float(good_qty),
-            "holdQty": float(hold_qty),
-            "reprocessQty": float(reprocess_qty),
-            "rejectedQty": float(rejected_qty),
+            "status": result["verdict"],
+            "stockPosted": result["stockPosted"],
+            "message": (
+                f"QC recorded for {receipt.grn_number}: {result['verdict']}."
+                + ("" if result["stockPosted"] else " This receipt has no stock posted, so no stock moved.")
+            ),
+            **{f"{k}Qty": float(v) for k, v in result["quantities"].items()},
         })
 
 
@@ -2542,7 +2912,7 @@ class QCRegisterView(APIView):
 
         qs = (
             GoodsReceipt.objects.filter(client_id=client_id, deleted_at__isnull=True)
-            .select_related("party", "purchase_bill", "purchase_order", "qc_by")
+            .select_related("party", "purchase_bill", "purchase_order", "qc_by", "created_by")
             .prefetch_related("lines__item")
             .order_by("-receipt_date", "-created_at")
         )
@@ -2556,8 +2926,6 @@ class QCRegisterView(APIView):
         if qc_status != "All":
             if qc_status == "Completed":
                 qs = qs.filter(qc_status="Approved")
-            elif qc_status == "In Progress":
-                qs = qs.filter(qc_status__in=["In Progress", "Testing"])
             else:
                 qs = qs.filter(qc_status=qc_status)
 
@@ -2590,92 +2958,72 @@ class QCRegisterView(APIView):
 
             display_status = "Completed" if r.qc_status == "Approved" else r.qc_status
 
-            if display_status == "Completed":
-                insp_qty = rec_qty
-                good_qty = meta.get("goodQty", rec_qty - rej_qty)
-                hold_qty = meta.get("holdQty", 0.0)
-                rep_qty = meta.get("reprocessQty", 0.0)
-                rej_qty = meta.get("rejectedQty", rej_qty)
-            elif display_status == "On Hold":
-                insp_qty = rec_qty
-                good_qty = meta.get("goodQty", 0.0)
-                hold_qty = meta.get("holdQty", rec_qty - rej_qty)
-                rep_qty = meta.get("reprocessQty", 0.0)
-                rej_qty = meta.get("rejectedQty", rej_qty)
-            elif display_status in ["Reprocess", "Rework"]:
-                insp_qty = rec_qty
-                good_qty = meta.get("goodQty", 0.0)
-                hold_qty = meta.get("holdQty", 0.0)
-                rep_qty = meta.get("reprocessQty", rec_qty - rej_qty)
-                rej_qty = meta.get("rejectedQty", rej_qty)
-            elif display_status == "Rejected":
-                insp_qty = rec_qty
-                good_qty = 0.0
-                hold_qty = 0.0
-                rep_qty = 0.0
-                rej_qty = rec_qty
-            elif display_status == "In Progress":
-                insp_qty = meta.get("inspectedQty", rec_qty)
-                good_qty = meta.get("goodQty", 0.0)
-                hold_qty = meta.get("holdQty", 0.0)
-                rep_qty = meta.get("reprocessQty", 0.0)
-                rej_qty = meta.get("rejectedQty", 0.0)
-            else:
-                insp_qty = 0.0
-                good_qty = 0.0
-                hold_qty = 0.0
-                rep_qty = 0.0
+            if meta and "goodQty" in meta:
+                # Recorded by the QC disposition service (cumulative figures).
+                good_qty = float(meta.get("goodQty") or 0) + float(meta.get("secondQualityQty") or 0)
+                hold_qty = float(meta.get("holdQty") or 0)
+                rep_qty = float(meta.get("reprocessQty") or 0)
+                rej_qty = float(meta.get("rejectedQty") or 0)
+                insp_qty = good_qty + hold_qty + rep_qty + rej_qty
+            elif r.qc_status == "Pending":
+                insp_qty = good_qty = hold_qty = rep_qty = 0.0
                 rej_qty = 0.0
+            else:
+                # Older receipts carry only the verdict and the per-line
+                # rejected quantity; nothing else was recorded.
+                insp_qty = rec_qty
+                good_qty = rec_qty - rej_qty if r.qc_status == "Approved" else 0.0
+                hold_qty = rec_qty - rej_qty if r.qc_status == "On Hold" else 0.0
+                rep_qty = rec_qty - rej_qty if r.qc_status == "Rework" else 0.0
 
             measurements = meta.get("measurements") or []
             if not measurements and r_lines:
                 for idx, l in enumerate(r_lines):
-                    l_rec = float(l.weighed_qty or l.received_qty or 0)
+                    l_item = l.item
                     measurements.append({
                         "srNo": idx + 1,
-                        "takaNo": idx + 1,
-                        "actualQty": l_rec,
-                        "width": 150,
-                        "weight": 25,
-                        "good": l_rec if display_status == "Completed" else 0,
-                        "hold": l_rec if display_status == "On Hold" else 0,
-                        "reprocess": l_rec if display_status in ["Reprocess", "Rework"] else 0,
+                        "lineId": str(l.id),
+                        "takaNo": None,
+                        "actualQty": float(l.weighed_qty or l.received_qty or 0),
+                        "width": float(l_item.fabric_width) if (l_item and getattr(l_item, "fabric_width", None)) else None,
+                        "weight": float(l.weighed_qty) if l.weighed_qty else None,
                         "rejected": float(l.rejected_qty or 0),
-                        "remarks": "-",
+                        "remarks": None,
                     })
 
+            created_at = timezone.localtime(r.created_at) if r.created_at else None
             audit_trail = [
                 {
-                    "dateTime": r.receipt_date.strftime("%d-%m-%Y 10:15") if r.receipt_date else "",
+                    "dateTime": created_at.strftime("%d-%m-%Y %H:%M") if created_at else "",
                     "action": "Created",
-                    "user": r.party.name if r.party else "System",
-                    "remarks": "GRN receipt generated",
+                    "user": r.created_by.name if r.created_by_id else None,
+                    "remarks": f"GRN {r.grn_number} received",
                 }
             ]
             if r.qc_at:
                 audit_trail.append({
-                    "dateTime": r.qc_at.strftime("%d-%m-%Y %H:%M"),
+                    "dateTime": timezone.localtime(r.qc_at).strftime("%d-%m-%Y %H:%M"),
                     "action": display_status,
-                    "user": r.qc_by.get_full_name() if r.qc_by else "Inspector",
-                    "remarks": meta.get("remarks") or (r.qc_note if not meta else "QC disposition recorded"),
+                    "user": r.qc_by.name if r.qc_by else None,
+                    "remarks": _qc_remarks(r),
                 })
 
             records.append({
                 "id": str(r.id),
-                "qcNo": f"QC-{r.grn_number[-3:]}" if len(r.grn_number) >= 3 else f"QC-{r.grn_number}",
+                "qcNo": r.grn_number,
                 "receiptId": str(r.id),
                 "date": r.receipt_date.strftime("%d-%m-%Y") if r.receipt_date else "",
                 "rawDate": r.receipt_date.isoformat() if r.receipt_date else "",
                 "sourceType": "Purchase" if (r.purchase_bill_id or r.purchase_order_id) else "Job Work",
                 "refNo": r.grn_number,
                 "grnNo": r.grn_number,
-                "supplier": r.party.name if r.party else "Unknown",
+                "supplier": r.party.name if r.party else None,
                 "itemCode": item.sku if item else "—",
-                "itemName": item.name if item else "Fabric Quality",
+                "itemName": item.name if item else None,
                 "quality": item_qual or (item.name if item else ""),
-                "design": item_des or "Plain",
-                "shade": item_shd or "Default",
-                "lotNo": line0.batch_number if line0 and line0.batch_number else f"LT-{str(r.id)[:4].upper()}",
+                "design": item_des or None,
+                "shade": item_shd or None,
+                "lotNo": line0.batch_number if line0 and line0.batch_number else None,
                 "takaRoll": len(r_lines) or 1,
                 "receivedQty": rec_qty,
                 "inspectedQty": insp_qty,
@@ -2683,9 +3031,9 @@ class QCRegisterView(APIView):
                 "holdQty": hold_qty,
                 "reprocessQty": rep_qty,
                 "rejectedQty": rej_qty,
-                "uom": line0.uom if line0 and line0.uom else "m",
+                "uom": line0.uom if line0 and line0.uom else None,
                 "status": display_status,
-                "inspector": r.qc_by.get_full_name() if r.qc_by else "Unassigned",
+                "inspector": r.qc_by.name if r.qc_by else None,
                 "remarks": meta.get("remarks") or (r.qc_note if not meta else ""),
                 "measurements": measurements,
                 "auditTrail": audit_trail,
@@ -2709,13 +3057,13 @@ class QCRegisterView(APIView):
         for inw in inwards_qs:
             jwo = inw.job_work_order
             plan = jwo.process_plan if jwo else None
-            v_name = jwo.vendor_name or (jwo.vendor.name if jwo and jwo.vendor else "Outside Processor")
-            it_code = getattr(plan, "fabric_item", "FAB-JW") or "FAB-JW"
-            it_name = (plan.fabric_item or plan.fabric_quality) if plan else "Job Work Fabric"
+            v_name = ((jwo.vendor_name or (jwo.vendor.name if jwo.vendor else None)) if jwo else None)
+            it_code = (getattr(plan, "fabric_item", None) or None)
+            it_name = ((plan.fabric_item or plan.fabric_quality) or None) if plan else None
             it_qual = getattr(plan, "fabric_quality", "") or ""
-            it_des = "Plain"
-            it_shd = getattr(plan, "shade", "") or "Default"
-            lot_no = getattr(plan, "grey_lot_no", "") or f"LOT-{inw.no}"
+            it_des = ""
+            it_shd = getattr(plan, "shade", "") or ""
+            lot_no = (getattr(plan, "grey_lot_no", None) or None)
 
             if quality != "All" and quality.lower() not in (it_qual or it_name).lower():
                 continue
@@ -2740,8 +3088,8 @@ class QCRegisterView(APIView):
                     "srNo": 1,
                     "takaNo": 1,
                     "actualQty": rec_q,
-                    "width": 150,
-                    "weight": 25,
+                    "width": float(plan.width) if (plan and getattr(plan, "width", None)) else None,
+                    "weight": float(plan.weight_kg) if (plan and getattr(plan, "weight_kg", None)) else None,
                     "good": good_q,
                     "hold": hold_q,
                     "reprocess": rep_q,
@@ -2750,20 +3098,21 @@ class QCRegisterView(APIView):
                 }
             ]
 
+            created_at = timezone.localtime(inw.created_at) if inw.created_at else None
             audit_trail = [
                 {
-                    "dateTime": inw.date.strftime("%d-%m-%Y 10:00") if inw.date else "",
+                    "dateTime": created_at.strftime("%d-%m-%Y %H:%M") if created_at else "",
                     "action": "Created",
-                    "user": v_name,
+                    "user": inw.created_by.name if inw.created_by_id else None,
                     "remarks": f"Job Work Inward {inw.no} received",
                 }
             ]
-            if inw.status in ["Completed", "Approved"]:
+            if inw.status in ["Completed", "Approved"] and inw.updated_at:
                 audit_trail.append({
-                    "dateTime": inw.updated_at.strftime("%d-%m-%Y %H:%M") if inw.updated_at else "",
+                    "dateTime": timezone.localtime(inw.updated_at).strftime("%d-%m-%Y %H:%M"),
                     "action": "Completed",
-                    "user": "Inspector",
-                    "remarks": "Job work QC inspection completed",
+                    "user": inw.updated_by.name if inw.updated_by_id else None,
+                    "remarks": None,
                 })
 
             records.append({
@@ -2789,9 +3138,9 @@ class QCRegisterView(APIView):
                 "holdQty": hold_q,
                 "reprocessQty": rep_q,
                 "rejectedQty": rej_q,
-                "uom": "m",
+                "uom": None,
                 "status": disp_status,
-                "inspector": "Inspector",
+                "inspector": inw.updated_by.name if inw.updated_by_id else None,
                 "remarks": f"Challan: {inw.challan_no}" if inw.challan_no else "Job Work Inward",
                 "measurements": measurements,
                 "auditTrail": audit_trail,
@@ -2830,7 +3179,7 @@ class QCRegisterView(APIView):
         return Response({
             "records": records,
             "filters": {
-                "statuses": ["All", "Completed", "Pending", "On Hold", "In Progress", "Rejected"],
+                "statuses": ["All", "Completed", "Partially Approved", "Pending", "On Hold", "Rework", "Rejected"],
                 "suppliers": all_suppliers,
                 "qualities": qualities,
                 "designs": designs,
@@ -2839,53 +3188,64 @@ class QCRegisterView(APIView):
         })
 
     def post(self, request):
+        """Manual QC register entry: a goods receipt *record* for inspection.
+
+        It posts no stock (goods received without a bill have no valuation
+        document); the QC disposition of such a receipt records the result
+        only and says so. Every input is explicit -- no defaults.
+        """
         client_id = request.client_id
-        source_type = request.data.get("sourceType") or "Purchase (GRN)"
-        supplier_id = request.data.get("supplierId")
-        supplier_name = request.data.get("supplier")
-        item_id = request.data.get("itemId")
-        item_code = request.data.get("itemCode")
-        grn_no = request.data.get("grnNo")
-        lot_no = request.data.get("lotNo") or "LT-001"
-        taka_count = int(request.data.get("takaRoll") or 1)
-        received_qty = Decimal(str(request.data.get("receivedQty") or "0"))
-        inspection_date_str = request.data.get("inspectionDate") or timezone.localdate().isoformat()
+        data = request.data
+        field_errors = {}
 
         party = None
-        if supplier_id:
-            party = Party.objects.filter(client_id=client_id, id=supplier_id).first()
-        elif supplier_name:
-            party = Party.objects.filter(client_id=client_id, name=supplier_name).first()
-        if not party:
-            party = Party.objects.filter(client_id=client_id, type__in=["Vendor", "Both"], deleted_at__isnull=True).first()
-        if not party:
-            return Response({"detail": "Vendor party required."}, status=status.HTTP_400_BAD_REQUEST)
+        if data.get("supplierId"):
+            party = Party.objects.filter(client_id=client_id, id=data.get("supplierId"), deleted_at__isnull=True).first()
+        elif data.get("supplier"):
+            party = Party.objects.filter(client_id=client_id, name=data.get("supplier"), deleted_at__isnull=True).first()
+        if party is None:
+            field_errors["supplierId"] = ["Choose the supplier."]
 
-        location = Location.objects.filter(client_id=client_id, deleted_at__isnull=True).first()
-        if not location:
-            location = Location.objects.create(client_id=client_id, name="Main Warehouse", code="WH-MAIN")
+        location = None
+        if data.get("locationId"):
+            location = Location.objects.filter(client_id=client_id, id=data.get("locationId"), deleted_at__isnull=True).first()
+        if location is None:
+            field_errors["locationId"] = ["Choose the receiving godown."]
 
         item = None
-        if item_id:
-            item = Item.objects.filter(client_id=client_id, id=item_id).first()
-        elif item_code:
-            item = Item.objects.filter(client_id=client_id, sku=item_code).first()
-        if not item:
-            item = Item.objects.filter(client_id=client_id, deleted_at__isnull=True).first()
-        if not item:
-            return Response({"detail": "Item required."}, status=status.HTTP_400_BAD_REQUEST)
+        if data.get("itemId"):
+            item = Item.objects.filter(client_id=client_id, id=data.get("itemId"), deleted_at__isnull=True).first()
+        elif data.get("itemCode"):
+            item = Item.objects.filter(client_id=client_id, sku=data.get("itemCode"), deleted_at__isnull=True).first()
+        if item is None:
+            field_errors["itemId"] = ["Choose the item."]
 
-        if not grn_no:
-            grn_no = allocate_number(client_id, "GoodsReceipt", "GRN-")
-
-        rec_date = timezone.localdate()
+        lot_no = (data.get("lotNo") or "").strip()
+        if not lot_no:
+            field_errors["lotNo"] = ["Enter the lot number."]
         try:
-            from datetime import datetime
-            rec_date = datetime.strptime(inspection_date_str, "%Y-%m-%d").date()
-        except Exception:
-            pass
+            received_qty = round4(D(data.get("receivedQty")))
+        except Exception:  # noqa: BLE001
+            received_qty = ZERO
+        if received_qty <= ZERO:
+            field_errors["receivedQty"] = ["Enter the received quantity."]
+        try:
+            taka_count = int(data.get("takaRoll") or 0)
+        except (TypeError, ValueError):
+            taka_count = 0
+        if taka_count <= 0:
+            field_errors["takaRoll"] = ["Enter the number of takas / rolls."]
+        try:
+            rec_date = date.fromisoformat(str(data.get("inspectionDate") or data.get("receiptDate") or ""))
+        except ValueError:
+            rec_date = None
+        if rec_date is None:
+            field_errors["inspectionDate"] = ["Enter the receipt date (YYYY-MM-DD)."]
+        if field_errors:
+            raise ValidationFailed("The QC register entry is incomplete.", field_errors=field_errors)
 
         with transaction.atomic():
+            grn_no = allocate_number(request.user.client, "GRN", rec_date)
             grn = GoodsReceipt.objects.create(
                 client_id=client_id,
                 grn_number=grn_no,
@@ -2893,39 +3253,109 @@ class QCRegisterView(APIView):
                 receipt_date=rec_date,
                 location=location,
                 qc_status="Pending",
-                qc_note="Manual QC Entry created via Inspection Register",
+                created_by=request.user,
             )
-            per_taka_qty = received_qty / Decimal(str(taka_count)) if taka_count > 0 else received_qty
-            for _ in range(taka_count):
-                GoodsReceiptLine.objects.create(
-                    client_id=client_id,
-                    goods_receipt=grn,
-                    item=item,
-                    uom=item.uom or "m",
-                    ordered_qty=per_taka_qty,
-                    received_qty=per_taka_qty,
-                    weighed_qty=per_taka_qty,
-                    batch_number=lot_no,
-                )
+            # One line for the received quantity; the taka count is recorded
+            # on the line rather than inventing an equal split per taka.
+            line_kwargs = dict(
+                client_id=client_id,
+                goods_receipt=grn,
+                item=item,
+                uom=item.uom,
+                stock_uom=item.uom,
+                stock_qty=received_qty,
+                ordered_qty=received_qty,
+                received_qty=received_qty,
+                batch_number=lot_no,
+            )
+            if "roll_count" in {f.name for f in GoodsReceiptLine._meta.get_fields()}:
+                line_kwargs["roll_count"] = taka_count
+            GoodsReceiptLine.objects.create(**line_kwargs)
 
         return Response({
             "success": True,
-            "message": f"QC Inspection record {grn_no} created successfully.",
+            "message": f"QC inspection record {grn_no} created (no stock posted).",
             "receiptId": str(grn.id),
             "grnNo": grn_no,
-        })
+        }, status=status.HTTP_201_CREATED)
 
 
 class QCDispositionView(APIView):
     """
-    GET /inventory/qc/disposition/
-    POST /inventory/qc/disposition/
-    Handles QC Results & Disposition loading and approval/draft submission.
-    Supports both GoodsReceipt and JWOInward with idempotency protections.
+    GET  /inventory/qc/disposition/  -- receipts (and job-work inwards) to disposition
+    POST /inventory/qc/disposition/  -- save a draft, or approve and move stock
+
+    Approval goes through ``apps.inventory.qc.dispose_receipt``: every GRN line
+    and every taka still at QC Hold is moved to Good / Second Quality /
+    Reprocess / Reject with real movements; Hold stays at QC Hold.
     """
 
     permission_classes = [HasModulePermission]
     required_permissions = ["view_inventory"]
+    permission_map = {"POST": ["approve_qc"]}
+
+    def _receipt_row(self, r):
+        from . import qc as qc_service
+
+        r_lines = list(r.lines.all())
+        line0 = r_lines[0] if r_lines else None
+        item = line0.item if line0 else None
+        meta = _qc_meta(r)
+        pending = qc_service.pool_quantity(r)
+        has_stock = qc_service.receipt_has_stock(r)
+        tot_rec = sum(float(l.stock_qty or l.received_qty or 0) for l in r_lines)
+        # What the form must account for now: what is still at QC Hold, or
+        # (for a record-only receipt) the received quantity.
+        to_inspect = float(pending) if has_stock else (tot_rec if r.qc_status in ("Pending", "On Hold") else 0.0)
+        draft = meta.get("draft") or {}
+        return {
+            "id": str(r.id),
+            "qcNo": r.grn_number,
+            "grnNo": r.grn_number,
+            "date": r.receipt_date.isoformat() if r.receipt_date else "",
+            "status": "Completed" if r.qc_status == "Approved" else r.qc_status,
+            "sourceType": "Purchase (GRN)",
+            "supplier": r.party.name if r.party_id else None,
+            "itemCode": item.sku if item else None,
+            "itemName": item.name if item else None,
+            "quality": getattr(item, "fabric_quality", None) or None,
+            "design": getattr(item, "fabric_design", None) or None,
+            "shade": getattr(item, "fabric_color", None) or None,
+            "lotNo": line0.batch_number if line0 else None,
+            # Takas received on the GRN (QC splits carry another source type).
+            "takaRoll": LotTaka.objects.filter(
+                client_id=r.client_id, source_document_id=r.id, source_document_type="GRN",
+                deleted_at__isnull=True,
+            ).count(),
+            "receivedQty": tot_rec,
+            "inspectedQty": to_inspect,
+            "pendingQcQty": float(pending),
+            "stockPosted": has_stock,
+            # The form starts from the saved draft, else everything pending
+            # is unassigned (0) -- the inspector enters the split.
+            "goodQty": float(draft.get("goodQty", 0) or 0),
+            "secondQualityQty": float(draft.get("secondQualityQty", 0) or 0),
+            "holdQty": float(draft.get("holdQty", 0) or 0),
+            "reprocessQty": float(draft.get("reprocessQty", 0) or 0),
+            "rejectedQty": float(draft.get("rejectedQty", 0) or 0),
+            "previousDisposition": {
+                k: meta.get(k) for k in ("goodQty", "secondQualityQty", "reprocessQty", "rejectedQty", "holdQty")
+            } if meta.get("cumulative") else None,
+            "remarks": (draft.get("remarks") if draft else None) or _qc_remarks(r),
+            "lines": [
+                {
+                    "lineId": str(l.id),
+                    "itemCode": l.item.sku if l.item_id else None,
+                    "itemName": l.item.name if l.item_id else None,
+                    "lotNo": l.batch_number,
+                    "uom": l.stock_uom or l.uom,
+                    "receivedQty": float(l.stock_qty or l.received_qty or 0),
+                    "rejectedQty": float(l.rejected_qty or 0),
+                }
+                for l in r_lines
+            ],
+            "measurements": draft.get("measurements") or meta.get("measurements") or [],
+        }
 
     def get(self, request):
         client_id = request.client_id
@@ -2937,62 +3367,20 @@ class QCDispositionView(APIView):
             .prefetch_related("lines__item")
             .order_by("-receipt_date", "-created_at")
         )
+        receipts = list(receipts_qs[:40])
+        if receipt_id and not any(str(r.id) == str(receipt_id) for r in receipts):
+            receipts += list(receipts_qs.filter(id=receipt_id))
 
         receipts_list = []
         target_receipt = None
-        for r in receipts_qs[:40]:
-            r_lines = list(r.lines.all())
-            line0 = r_lines[0] if r_lines else None
-            item = line0.item if line0 else None
-            tot_rec = sum(float(l.weighed_qty or l.received_qty or 0) for l in r_lines)
-            tot_rej = sum(float(l.rejected_qty or 0) for l in r_lines)
-
-            meta = {}
-            if r.qc_note and r.qc_note.strip().startswith("{") and r.qc_note.strip().endswith("}"):
-                try:
-                    meta = json.loads(r.qc_note)
-                except Exception:
-                    pass
-
-            item_obj = {
-                "id": str(r.id),
-                "qcNo": f"QC-{r.grn_number[-3:]}" if len(r.grn_number) >= 3 else f"QC-{r.grn_number}",
-                "grnNo": r.grn_number,
-                "date": r.receipt_date.isoformat() if r.receipt_date else "",
-                "status": "Completed" if r.qc_status == "Approved" else r.qc_status,
-                "sourceType": "Purchase (GRN)",
-                "supplier": r.party.name if r.party else "",
-                "itemCode": item.sku if item else "",
-                "itemName": item.name if item else "",
-                "quality": getattr(item, "fabric_quality", "") or "",
-                "design": getattr(item, "fabric_design", "") or "",
-                "shade": getattr(item, "fabric_color", "") or "",
-                "lotNo": line0.batch_number if line0 and line0.batch_number else f"LT-{str(r.id)[:4].upper()}",
-                "takaRoll": len(r_lines) or 1,
-                "inspectedQty": tot_rec,
-                "receivedQty": tot_rec,
-                "goodQty": meta.get("goodQty", tot_rec - tot_rej if r.qc_status == "Approved" else 0.0),
-                "holdQty": meta.get("holdQty", tot_rec if r.qc_status == "On Hold" else 0.0),
-                "reprocessQty": meta.get("reprocessQty", 0.0),
-                "rejectedQty": meta.get("rejectedQty", tot_rej),
-                "remarks": meta.get("remarks") or (r.qc_note if not meta else ""),
-                "measurements": meta.get("measurements") or [
-                    {
-                        "srNo": idx + 1,
-                        "takaNo": idx + 1,
-                        "actualQty": float(l.weighed_qty or l.received_qty or 0),
-                        "width": 150,
-                        "weight": 25,
-                        "remarks": "-",
-                    }
-                    for idx, l in enumerate(r_lines)
-                ],
-            }
-            receipts_list.append(item_obj)
+        for r in receipts:
+            row = self._receipt_row(r)
+            receipts_list.append(row)
             if receipt_id and str(r.id) == str(receipt_id):
-                target_receipt = item_obj
+                target_receipt = row
 
-        # Also support Job Work Inwards in disposition list
+        # Job Work Inwards are listed for their QC status; their stock is
+        # posted by the job-work module.
         inwards_qs = (
             JWOInward.objects.filter(client_id=client_id)
             .select_related("job_work_order", "job_work_order__vendor", "job_work_order__process_plan")
@@ -3001,45 +3389,30 @@ class QCDispositionView(APIView):
         for inw in inwards_qs[:20]:
             jwo = inw.job_work_order
             plan = jwo.process_plan if jwo else None
-            v_name = jwo.vendor_name or (jwo.vendor.name if jwo and jwo.vendor else "Outside Processor")
-            it_code = getattr(plan, "fabric_item", "FAB-JW") or "FAB-JW"
-            it_name = (plan.fabric_item or plan.fabric_quality) if plan else "Job Work Fabric"
             rec_q = float(inw.qty or 0)
-            good_q = float(inw.accepted) if inw.status in ["Approved", "Completed"] else 0.0
-            rej_q = float(inw.rejected)
-
             inw_obj = {
                 "id": str(inw.id),
-                "qcNo": f"QC-JW-{inw.no}",
+                "qcNo": inw.no,
                 "grnNo": inw.no,
                 "date": inw.date.isoformat() if inw.date else "",
                 "status": "Completed" if inw.status in ["Approved", "Completed"] else inw.status,
                 "sourceType": "Job Work",
-                "supplier": v_name,
-                "itemCode": it_code,
-                "itemName": it_name,
-                "quality": getattr(plan, "fabric_quality", "") or it_name,
-                "design": "Plain",
-                "shade": getattr(plan, "shade", "") or "Default",
-                "lotNo": plan.grey_lot_no if plan and plan.grey_lot_no else f"LOT-{inw.no}",
-                "takaRoll": 1,
+                "supplier": ((jwo.vendor_name or (jwo.vendor.name if jwo.vendor else None)) if jwo else None),
+                "itemCode": (plan.fabric_item or None) if plan else None,
+                "itemName": (plan.fabric_item or plan.fabric_quality or None) if plan else None,
+                "quality": (plan.fabric_quality or None) if plan else None,
+                "design": None,
+                "shade": (plan.shade or None) if plan else None,
+                "lotNo": (plan.grey_lot_no or None) if plan else None,
+                "takaRoll": (plan.no_of_rolls if plan else None),
                 "inspectedQty": rec_q,
                 "receivedQty": rec_q,
-                "goodQty": good_q,
-                "holdQty": rec_q if inw.status == "On Hold" else 0.0,
-                "reprocessQty": rec_q if inw.status in ["Rework", "Reprocess"] else 0.0,
-                "rejectedQty": rej_q,
-                "remarks": inw.challan_no or "",
-                "measurements": [
-                    {
-                        "srNo": 1,
-                        "takaNo": 1,
-                        "actualQty": rec_q,
-                        "width": 150,
-                        "weight": 25,
-                        "remarks": inw.challan_no or "-",
-                    }
-                ],
+                "goodQty": float(inw.accepted) if inw.status in ["Approved", "Completed"] else 0.0,
+                "holdQty": 0.0,
+                "reprocessQty": 0.0,
+                "rejectedQty": float(inw.rejected),
+                "remarks": inw.challan_no or None,
+                "measurements": [],
             }
             receipts_list.append(inw_obj)
             if receipt_id and str(inw.id) == str(receipt_id):
@@ -3048,217 +3421,125 @@ class QCDispositionView(APIView):
         if not target_receipt and receipts_list:
             target_receipt = receipts_list[0]
 
-        return Response({
-            "inspections": receipts_list,
-            "selected": target_receipt,
-        })
+        return Response({"inspections": receipts_list, "selected": target_receipt})
 
     def post(self, request):
+        from . import qc as qc_service
+
         client_id = request.client_id
         receipt_id = request.data.get("receiptId")
         if not receipt_id:
-            return Response({"detail": "receiptId is required."}, status=status.HTTP_400_BAD_REQUEST)
+            raise ValidationFailed("receiptId is required.", field_errors={"receiptId": ["Required."]})
 
         is_draft = bool(request.data.get("isDraft", False))
-        good_qty = Decimal(str(request.data.get("goodQty") or "0"))
-        hold_qty = Decimal(str(request.data.get("holdQty") or "0"))
-        reprocess_qty = Decimal(str(request.data.get("reprocessQty") or "0"))
-        rejected_qty = Decimal(str(request.data.get("rejectedQty") or "0"))
+        quantities = qc_service.parse_quantities(request.data)
         remarks = request.data.get("remarks") or ""
         measurements = request.data.get("measurements") or []
 
-        # Validate non-negative quantities
-        if good_qty < Decimal("0") or hold_qty < Decimal("0") or reprocess_qty < Decimal("0") or rejected_qty < Decimal("0"):
-            return Response({"detail": "All disposition quantities must be non-negative."}, status=status.HTTP_400_BAD_REQUEST)
-
-        total_disp = good_qty + hold_qty + reprocess_qty + rejected_qty
-        if not is_draft and total_disp <= Decimal("0"):
-            return Response({"detail": "Total disposition quantity must be greater than zero before approval."}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Check if receipt is GoodsReceipt or JWOInward
-        receipt = GoodsReceipt.objects.filter(client_id=client_id, id=receipt_id).first()
+        receipt = GoodsReceipt.objects.filter(client_id=client_id, id=receipt_id, deleted_at__isnull=True).first()
         inward = None
-        if not receipt:
+        if receipt is None:
             inward = JWOInward.objects.filter(client_id=client_id, id=receipt_id).first()
-
-        if not receipt and not inward:
-            return Response({"detail": "Inspection source record not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        meta_payload = {
-            "goodQty": float(good_qty),
-            "holdQty": float(hold_qty),
-            "reprocessQty": float(reprocess_qty),
-            "rejectedQty": float(rejected_qty),
-            "remarks": remarks,
-            "measurements": measurements,
-            "updatedAt": timezone.now().isoformat(),
-        }
-
-        # Determine verdict
-        if hold_qty > Decimal("0") and good_qty == Decimal("0"):
-            verdict = "On Hold"
-        elif rejected_qty > Decimal("0") and good_qty == Decimal("0"):
-            verdict = "Rejected"
-        elif reprocess_qty > Decimal("0") and good_qty == Decimal("0"):
-            verdict = "Rework"
-        else:
-            verdict = "Approved"
+        if receipt is None and inward is None:
+            raise ValidationFailed("Inspection source record not found.", field_errors={"receiptId": ["Not found."]})
 
         with transaction.atomic():
-            if receipt:
+            if receipt is not None:
                 if is_draft:
-                    receipt.qc_status = "In Progress"
-                    receipt.qc_note = json.dumps(meta_payload)
-                    receipt.save(update_fields=["qc_status", "qc_note", "updated_at"])
-                    msg = "QC inspection saved as draft. Stock will not be updated until final approval."
-                else:
-                    # Idempotency check: if already approved, do not double post movements
-                    already_approved = (receipt.qc_status == "Approved")
-                    receipt.qc_status = verdict
-                    receipt.qc_note = json.dumps(meta_payload)
-                    receipt.qc_at = timezone.now()
-                    receipt.qc_by = request.user if request.user.is_authenticated else None
-                    receipt.save(update_fields=["qc_status", "qc_note", "qc_at", "qc_by", "updated_at"])
+                    # A draft changes nothing but the saved form: status and
+                    # stock stay exactly as they are.
+                    meta = _qc_meta(receipt)
+                    meta["draft"] = {
+                        "goodQty": float(quantities["good"]),
+                        "secondQualityQty": float(quantities["second"]),
+                        "holdQty": float(quantities["hold"]),
+                        "reprocessQty": float(quantities["reprocess"]),
+                        "rejectedQty": float(quantities["reject"]),
+                        "remarks": remarks,
+                        "measurements": measurements,
+                        "savedAt": timezone.now().isoformat(),
+                    }
+                    if not _qc_meta(receipt) and receipt.qc_note:
+                        meta["remarks"] = receipt.qc_note
+                    receipt.qc_note = json.dumps(meta)
+                    receipt.save(update_fields=["qc_note", "updated_at"])
+                    return Response({
+                        "success": True, "isDraft": True, "status": receipt.qc_status,
+                        "message": "Draft saved. Stock is not moved until the disposition is approved.",
+                    })
 
-                    first_line = receipt.lines.first()
-                    if first_line:
-                        first_line.rejected_qty = rejected_qty
-                        first_line.save(update_fields=["rejected_qty", "updated_at"])
+                jwo = None
+                jwo_id = request.data.get("jwoId") or request.data.get("jobWorkOrderId")
+                if jwo_id:
+                    jwo = JobWorkOrder.objects.filter(client_id=client_id, id=jwo_id).first()
+                    if jwo is None:
+                        raise ValidationFailed("Job work order not found.", field_errors={"jwoId": ["Not found."]})
+                result = qc_service.dispose_receipt(
+                    receipt,
+                    quantities=quantities,
+                    line_quantities=request.data.get("lines") or None,
+                    user=request.user,
+                    remarks=remarks or None,
+                    measurements=measurements,
+                    job_work_order=jwo,
+                )
+                message = (
+                    f"QC disposition approved ({result['verdict']}). "
+                    + (f"{result['movements']} stock movement(s) posted."
+                       if result["stockPosted"] else "This receipt has no stock posted, so no stock moved.")
+                )
+                if result["reprocessOrder"] is not None:
+                    message += f" Reprocess order {result['reprocessOrder'].no} created."
+                return Response({
+                    "success": True, "isDraft": False, "status": result["verdict"],
+                    "stockPosted": result["stockPosted"], "message": message,
+                })
 
-                    if receipt.purchase_bill_id:
-                        from apps.purchase import services as purchase_services
-                        purchase_services.update_qc_status(
-                            receipt.purchase_bill, verdict, note=remarks, user=request.user if request.user.is_authenticated else None
-                        )
+            # Job work inward: the job-work module owns its stock; this records
+            # the QC verdict and, for reprocess, the reprocess order.
+            total = sum(quantities.values(), ZERO)
+            if not is_draft and total <= ZERO:
+                raise ValidationFailed(
+                    "Enter the disposition quantities before approving.",
+                    field_errors={"goodQty": ["Total must be greater than zero."]},
+                )
+            if is_draft:
+                return Response({
+                    "success": True, "isDraft": True, "status": inward.status,
+                    "message": "Draft not stored for job-work inwards; nothing changed.",
+                })
+            verdict = qc_service.verdict_for(
+                {k: quantities[k] for k in ("good", "second", "reprocess", "reject")},
+                quantities["hold"],
+            )
+            inward.accepted = quantities["good"] + quantities["second"]
+            inward.rejected = quantities["reject"]
+            inward.status = verdict
+            inward.save(update_fields=["accepted", "rejected", "status", "updated_at"])
+            rp_no = None
+            if quantities["reprocess"] > ZERO:
+                from apps.jobwork.models import JWOReprocess
 
-                    # Synchronize QC status with linked Lot / Taka records
-                    lot_qc = "Passed" if verdict == "Approved" else ("Rejected" if verdict == "Rejected" else ("Reprocess" if verdict in ["Rework", "Reprocess"] else "On Hold"))
-                    lot_updates = {"qc_status": lot_qc, "qc_notes": remarks}
-                    if verdict == "Rejected":
-                        lot_updates["available_quantity"] = Decimal("0")
-                    LotTaka.objects.filter(
-                        client_id=client_id, source_document_id=receipt.id
-                    ).update(**lot_updates)
-
-                    # Stock posting via append-only StockMovement ledger
-                    if not already_approved and first_line and first_line.item_id:
-                        loc = receipt.location or Location.objects.filter(client_id=client_id).first()
-                        if loc:
-                            existing_mov = StockMovement.objects.filter(
-                                client_id=client_id,
-                                reference_id=receipt.id,
-                            )
-                            # If no movement exists for this manual GRN, post good and faulty movements
-                            if not existing_mov.exists():
-                                if good_qty > Decimal("0"):
-                                    stock.post_movement(
-                                        client_id=client_id,
-                                        item=first_line.item,
-                                        location=loc,
-                                        type="PURCHASE",
-                                        quantity=good_qty,
-                                        weighed_qty=good_qty,
-                                        reference_type="GoodsReceipt",
-                                        reference_id=receipt.id,
-                                        reference_number=receipt.grn_number,
-                                        batch_number=first_line.batch_number,
-                                        movement_date=receipt.receipt_date or timezone.localdate(),
-                                        notes=f"QC Approved Good Stock for {receipt.grn_number}",
-                                        user=request.user if request.user.is_authenticated else None,
-                                    )
-                                if rejected_qty > Decimal("0"):
-                                    stock.post_movement(
-                                        client_id=client_id,
-                                        item=first_line.item,
-                                        location=loc,
-                                        type="FAULTY",
-                                        quantity=rejected_qty,
-                                        weighed_qty=rejected_qty,
-                                        reference_type="GoodsReceipt",
-                                        reference_id=receipt.id,
-                                        reference_number=receipt.grn_number,
-                                        batch_number=first_line.batch_number,
-                                        movement_date=receipt.receipt_date or timezone.localdate(),
-                                        notes=f"QC Rejected Scrap/Waste for {receipt.grn_number}",
-                                        user=request.user if request.user.is_authenticated else None,
-                                    )
-                            elif rejected_qty > Decimal("0") and not existing_mov.filter(type="FAULTY").exists():
-                                stock.post_movement(
-                                    client_id=client_id,
-                                    item=first_line.item,
-                                    location=loc,
-                                    type="FAULTY",
-                                    quantity=rejected_qty,
-                                    weighed_qty=rejected_qty,
-                                    reference_type="GoodsReceipt",
-                                    reference_id=receipt.id,
-                                    reference_number=receipt.grn_number,
-                                    batch_number=first_line.batch_number,
-                                    movement_date=receipt.receipt_date or timezone.localdate(),
-                                    notes=f"QC Rejected Scrap/Waste for {receipt.grn_number}",
-                                    user=request.user if request.user.is_authenticated else None,
-                                )
-
-                    # If reprocessing quantity specified, create linked JWOReprocess record if not existing
-                    if reprocess_qty > Decimal("0"):
-                        existing_rp = JWOReprocess.objects.filter(client_id=client_id, inward_no=receipt.grn_number).first()
-                        if not existing_rp:
-                            rp_count = JWOReprocess.objects.filter(client_id=client_id).count() + 1
-                            jwo = JobWorkOrder.objects.filter(client_id=client_id).first()
-                            if not jwo:
-                                jwo = JobWorkOrder.objects.create(
-                                    client_id=client_id,
-                                    jwo_no=f"JWO-{receipt.grn_number}",
-                                    vendor_name=receipt.party.name if receipt.party else "Outside Processor",
-                                    order_date=timezone.localdate(),
-                                    planned_qty=reprocess_qty,
-                                )
-                            JWOReprocess.objects.create(
-                                client_id=client_id,
-                                job_work_order=jwo,
-                                no=f"RP-{timezone.localdate().year}-{rp_count:03d}",
-                                inward_no=receipt.grn_number,
-                                date=timezone.localdate(),
-                                qty=reprocess_qty,
-                                reason=remarks or f"Rework required from GRN {receipt.grn_number}",
-                                status="Pending",
-                            )
-
-                    msg = f"QC disposition approved ({verdict}). Stock Ledger and Stock Position updated exactly once."
-
-            elif inward:
-                if is_draft:
-                    inward.status = "In Progress"
-                    inward.save(update_fields=["status", "updated_at"])
-                    msg = "Job Work QC saved as draft. Stock will not be updated until approval."
-                else:
-                    inward.accepted = good_qty + hold_qty
-                    inward.rejected = rejected_qty
-                    inward.status = verdict
-                    inward.save(update_fields=["accepted", "rejected", "status", "updated_at"])
-
-                    if reprocess_qty > Decimal("0"):
-                        existing_rp = JWOReprocess.objects.filter(client_id=client_id, inward_no=inward.no).first()
-                        if not existing_rp:
-                            rp_count = JWOReprocess.objects.filter(client_id=client_id).count() + 1
-                            JWOReprocess.objects.create(
-                                client_id=client_id,
-                                job_work_order=inward.job_work_order,
-                                no=f"RP-{timezone.localdate().year}-{rp_count:03d}",
-                                inward_no=inward.no,
-                                date=timezone.localdate(),
-                                qty=reprocess_qty,
-                                reason=remarks or f"Reprocess required from {inward.no}",
-                                status="Pending",
-                            )
-                    msg = f"Job Work QC disposition approved ({verdict}). Stock and Job Work updated."
-
-        return Response({
-            "success": True,
-            "isDraft": is_draft,
-            "status": receipt.qc_status if receipt else inward.status,
-            "message": msg,
-        })
+                if not JWOReprocess.objects.filter(client_id=client_id, inward_no=inward.no).exists():
+                    on_date = timezone.localdate()
+                    rp_no = allocate_number(request.user.client, "RP", on_date)
+                    JWOReprocess.objects.create(
+                        client_id=client_id,
+                        job_work_order=inward.job_work_order,
+                        no=rp_no,
+                        inward_no=inward.no,
+                        date=on_date,
+                        qty=quantities["reprocess"],
+                        reason=remarks or f"Reprocess required from {inward.no}",
+                        status="Pending",
+                        created_by=request.user,
+                    )
+            return Response({
+                "success": True, "isDraft": False, "status": verdict,
+                "stockPosted": False,
+                "message": f"Job work QC recorded ({verdict})."
+                + (f" Reprocess order {rp_no} created." if rp_no else ""),
+            })
 
 
 class QCReportsView(APIView):
@@ -3339,12 +3620,13 @@ class QCReportsView(APIView):
         # Report 1: Supplier-wise Rejection
         supplier_map = {}
         for r in receipts_qs:
-            s_name = r.party.name if r.party else "Direct Purchase"
+            s_name = r.party.name if r.party else None
+            top_def = _qc_remarks(r)
             if s_name not in supplier_map:
                 supplier_map[s_name] = {
                     "supplier": s_name, "receiptsCount": 0, "receivedQty": 0.0,
                     "inspectedQty": 0.0, "goodQty": 0.0, "holdQty": 0.0,
-                    "reprocessQty": 0.0, "rejectedQty": 0.0, "topDefect": "Minor Defect",
+                    "reprocessQty": 0.0, "rejectedQty": 0.0, "topDefect": top_def,
                 }
             r_lines = list(r.lines.all())
             rec_q = sum(float(l.weighed_qty or l.received_qty or 0) for l in r_lines)
@@ -3353,7 +3635,7 @@ class QCReportsView(APIView):
             supplier_map[s_name]["receivedQty"] += rec_q
             if r.qc_status != "Pending":
                 supplier_map[s_name]["inspectedQty"] += rec_q
-            if r.qc_status == "Approved":
+            if r.qc_status in ("Approved", "Partially Approved"):
                 supplier_map[s_name]["goodQty"] += max(0.0, rec_q - rej_q)
             elif r.qc_status == "On Hold":
                 supplier_map[s_name]["holdQty"] += max(0.0, rec_q - rej_q)
@@ -3363,12 +3645,12 @@ class QCReportsView(APIView):
 
         for inw in inwards_qs:
             jwo = inw.job_work_order
-            v_name = jwo.vendor_name or (jwo.vendor.name if jwo and jwo.vendor else "Outside Processor")
+            v_name = ((jwo.vendor_name or (jwo.vendor.name if jwo.vendor else None)) if jwo else None)
             if v_name not in supplier_map:
                 supplier_map[v_name] = {
                     "supplier": v_name, "receiptsCount": 0, "receivedQty": 0.0,
                     "inspectedQty": 0.0, "goodQty": 0.0, "holdQty": 0.0,
-                    "reprocessQty": 0.0, "rejectedQty": 0.0, "topDefect": "Processing Defect",
+                    "reprocessQty": 0.0, "rejectedQty": 0.0, "topDefect": None,
                 }
             rec_q = float(inw.qty or 0)
             supplier_map[v_name]["receiptsCount"] += 1
@@ -3401,36 +3683,36 @@ class QCReportsView(APIView):
         for r in receipts_qs:
             for l in r.lines.all():
                 item = l.item
-                q_name = getattr(item, "fabric_quality", "") or (item.name if item else "Standard Fabric")
-                sku = getattr(item, "sku", "FAB") or "FAB"
+                q_name = getattr(item, "fabric_quality", "") or (item.name if item else None)
+                sku = getattr(item, "sku", None)
                 if quality_filter != "All" and quality_filter.lower() not in q_name.lower():
                     continue
                 if q_name not in quality_map:
                     quality_map[q_name] = {
                         "quality": q_name, "itemCode": sku, "inspectedQty": 0.0,
                         "goodQty": 0.0, "defectiveQty": 0.0, "lotsCount": 0,
-                        "primaryDefect": "Shade Variation",
+                        "primaryDefect": None,
                     }
                 rec_q = float(l.weighed_qty or l.received_qty or 0)
                 rej_q = float(l.rejected_qty or 0)
                 quality_map[q_name]["inspectedQty"] += rec_q
                 quality_map[q_name]["lotsCount"] += 1
-                if r.qc_status == "Approved":
+                if r.qc_status in ("Approved", "Partially Approved"):
                     quality_map[q_name]["goodQty"] += max(0.0, rec_q - rej_q)
                 quality_map[q_name]["defectiveQty"] += rej_q
 
         for inw in inwards_qs:
             jwo = inw.job_work_order
             plan = jwo.process_plan if jwo else None
-            q_name = getattr(plan, "fabric_quality", "") or getattr(plan, "fabric_item", "Job Work Fabric") or "Job Work Fabric"
-            sku = getattr(plan, "fabric_item", "FAB-JW") or "FAB-JW"
+            q_name = (getattr(plan, "fabric_quality", "") or getattr(plan, "fabric_item", "") or None)
+            sku = (getattr(plan, "fabric_item", None) or None)
             if quality_filter != "All" and quality_filter.lower() not in q_name.lower():
                 continue
             if q_name not in quality_map:
                 quality_map[q_name] = {
                     "quality": q_name, "itemCode": sku, "inspectedQty": 0.0,
                     "goodQty": 0.0, "defectiveQty": 0.0, "lotsCount": 0,
-                    "primaryDefect": "Weaving Fault",
+                    "primaryDefect": None,
                 }
             rec_q = float(inw.qty or 0)
             quality_map[q_name]["inspectedQty"] += rec_q
@@ -3462,21 +3744,21 @@ class QCReportsView(APIView):
                 "refNo": r.grn_number,
                 "sourceType": "Purchase",
                 "date": r.receipt_date.strftime("%d-%m-%Y") if r.receipt_date else "",
-                "supplier": r.party.name if r.party else "Unknown",
+                "supplier": r.party.name if r.party else None,
                 "itemCode": line0.item.sku if line0 and line0.item else "—",
-                "itemName": line0.item.name if line0 and line0.item else "Fabric Item",
-                "lotNo": line0.batch_number if line0 and line0.batch_number else f"LT-{str(r.id)[:4].upper()}",
+                "itemName": line0.item.name if line0 and line0.item else None,
+                "lotNo": line0.batch_number if line0 and line0.batch_number else None,
                 "qty": rec_q,
                 "status": r.qc_status,
                 "daysPending": max(0, days),
                 "agingBucket": aging,
-                "remarks": r.qc_note or "Awaiting inspector sign-off",
+                "remarks": _qc_remarks(r),
             })
 
         for inw in inwards_qs.filter(status__in=["Received", "Pending QC", "Pending", "On Hold"]):
             jwo = inw.job_work_order
             plan = jwo.process_plan if jwo else None
-            v_name = jwo.vendor_name or (jwo.vendor.name if jwo and jwo.vendor else "Outside Processor")
+            v_name = ((jwo.vendor_name or (jwo.vendor.name if jwo.vendor else None)) if jwo else None)
             rec_q = float(inw.qty or 0)
             days = (today - inw.date).days if inw.date else 0
             aging = "0-3 Days" if days <= 3 else ("4-7 Days" if days <= 7 else ("8-14 Days" if days <= 14 else "15+ Days"))
@@ -3485,14 +3767,14 @@ class QCReportsView(APIView):
                 "sourceType": "Job Work",
                 "date": inw.date.strftime("%d-%m-%Y") if inw.date else "",
                 "supplier": v_name,
-                "itemCode": getattr(plan, "fabric_item", "FAB-JW") or "FAB-JW",
-                "itemName": getattr(plan, "fabric_quality", "Job Work Fabric") or "Job Work Fabric",
-                "lotNo": getattr(plan, "grey_lot_no", f"LOT-{inw.no}") or f"LOT-{inw.no}",
+                "itemCode": (getattr(plan, "fabric_item", None) or None),
+                "itemName": (getattr(plan, "fabric_quality", "") or None),
+                "lotNo": (getattr(plan, "grey_lot_no", None) or None),
                 "qty": rec_q,
                 "status": "Pending" if inw.status in ["Received", "Pending QC", "Pending"] else inw.status,
                 "daysPending": max(0, days),
                 "agingBucket": aging,
-                "remarks": inw.challan_no or "Received from job worker; pending QC verification",
+                "remarks": f"Challan {inw.challan_no}" if inw.challan_no else None,
             })
         hold_pending_report.sort(key=lambda x: x["daysPending"], reverse=True)
 
@@ -3500,31 +3782,44 @@ class QCReportsView(APIView):
         reprocess_recovery_report = []
         for rp in reprocess_qs:
             jwo = rp.job_work_order
-            v_name = jwo.vendor_name or (jwo.vendor.name if jwo and jwo.vendor else "Outside Processor")
+            v_name = ((jwo.vendor_name or (jwo.vendor.name if jwo.vendor else None)) if jwo else None)
             plan = jwo.process_plan if jwo else None
             sent_q = float(rp.qty or 0)
-            rec_q = sent_q if rp.status == "Completed" else (sent_q * 0.95 if rp.status == "Received" else 0.0)
-            loss_q = max(0.0, sent_q - rec_q)
-            rec_pct = round((rec_q / (sent_q or 1.0)) * 100, 1)
+            # Only reinspected reprocess orders have a recorded result; until
+            # then received/loss are unknown (None), never estimated.
+            rp_meta = {}
+            if rp.remarks and rp.remarks.strip().startswith("{"):
+                try:
+                    rp_meta = json.loads(rp.remarks)
+                except ValueError:
+                    rp_meta = {}
+            if rp.status == "Completed" and rp_meta:
+                rec_q = float(rp_meta.get("goodQty", 0) or 0) + float(rp_meta.get("holdQty", 0) or 0) + float(rp_meta.get("reprocessQty", 0) or 0)
+                loss_q = float(rp_meta.get("rejectedQty", 0) or 0)
+                rec_pct = round((rec_q / sent_q) * 100, 1) if sent_q else None
+            else:
+                rec_q = None
+                loss_q = None
+                rec_pct = None
             reprocess_recovery_report.append({
                 "rpNo": rp.no,
                 "sourceRef": rp.inward_no or (jwo.jwo_no if jwo else "—"),
                 "vendor": v_name,
-                "fabricItem": getattr(plan, "fabric_quality", "Reprocess Fabric") or "Reprocess Fabric",
+                "fabricItem": (getattr(plan, "fabric_quality", "") or None),
                 "sentQty": sent_q,
                 "receivedQty": rec_q,
                 "recoveryPct": rec_pct,
                 "lossQty": loss_q,
                 "status": rp.status,
-                "goodQty": rec_q if rp.status == "Completed" else 0.0,
+                "goodQty": float(rp_meta.get("goodQty", 0) or 0) if rp_meta else None,
                 "rejectedQty": loss_q,
-                "reason": rp.reason or "Reprocess run",
+                "reason": rp.reason or None,
             })
 
         # Report 5: Inspector Performance
         inspector_map = {}
         for r in receipts_qs.exclude(qc_status="Pending"):
-            insp_name = r.qc_by.get_full_name() if r.qc_by else "Quality Inspector"
+            insp_name = r.qc_by.name if r.qc_by else "Not recorded"
             if insp_name not in inspector_map:
                 inspector_map[insp_name] = {
                     "inspector": insp_name, "inspectionsCount": 0, "inspectedQty": 0.0,
@@ -3534,7 +3829,7 @@ class QCReportsView(APIView):
             rec_q = sum(float(l.weighed_qty or l.received_qty or 0) for l in r_lines)
             inspector_map[insp_name]["inspectionsCount"] += 1
             inspector_map[insp_name]["inspectedQty"] += rec_q
-            if r.qc_status == "Approved":
+            if r.qc_status in ("Approved", "Partially Approved"):
                 inspector_map[insp_name]["approvedCount"] += 1
             elif r.qc_status == "On Hold":
                 inspector_map[insp_name]["holdCount"] += 1
@@ -3542,7 +3837,7 @@ class QCReportsView(APIView):
                 inspector_map[insp_name]["rejectedCount"] += 1
 
         for inw in inwards_qs.exclude(status__in=["Pending", "Pending QC", "Received"]):
-            insp_name = "Quality Inspector"
+            insp_name = inw.updated_by.name if inw.updated_by_id else "Not recorded"
             if insp_name not in inspector_map:
                 inspector_map[insp_name] = {
                     "inspector": insp_name, "inspectionsCount": 0, "inspectedQty": 0.0,
@@ -3585,7 +3880,7 @@ class QCReportsView(APIView):
             date_map[d_str]["receivedQty"] += rec_q
             if r.qc_status != "Pending":
                 date_map[d_str]["inspectedQty"] += rec_q
-            if r.qc_status == "Approved":
+            if r.qc_status in ("Approved", "Partially Approved"):
                 date_map[d_str]["goodQty"] += max(0.0, rec_q - rej_q)
             elif r.qc_status == "On Hold":
                 date_map[d_str]["holdQty"] += max(0.0, rec_q - rej_q)
@@ -3621,6 +3916,8 @@ class QCReportsView(APIView):
                 "rejectionPct": round((d["rejectedQty"] / insp) * 100, 1),
             })
 
+        done_rp = [r for r in reprocess_recovery_report if r["receivedQty"] is not None]
+
         # Summary KPIs across all audited records
         total_rcv = sum(s["receivedQty"] for s in supplier_rejection_report)
         total_insp = sum(s["inspectedQty"] for s in supplier_rejection_report)
@@ -3636,8 +3933,8 @@ class QCReportsView(APIView):
             "rejectionRate": round((total_rej / (total_insp or 1.0)) * 100, 1) if total_insp else 0.0,
             "pendingHoldQty": round(total_hld + sum(h["qty"] for h in hold_pending_report if h["status"] == "Pending"), 2),
             "reprocessRecovery": round(
-                (sum(r["receivedQty"] for r in reprocess_recovery_report) / (sum(r["sentQty"] for r in reprocess_recovery_report) or 1.0)) * 100, 1
-            ) if reprocess_recovery_report else 0.0,
+                (sum(r["receivedQty"] for r in done_rp) / (sum(r["sentQty"] for r in done_rp) or 1.0)) * 100, 1
+            ) if done_rp else None,
         }
 
         # Filter dropdown options
@@ -3682,14 +3979,55 @@ class QCReportsView(APIView):
 
 class QCReinspectionView(APIView):
     """
-    GET /inventory/qc/reinspection/
-    POST /inventory/qc/reinspection/
-    POST /inventory/qc/reinspection/disposition/
-    Handles QC Reinspection / Reprocess tracking and disposition.
+    GET  /inventory/qc/reinspection/  -- reprocess orders and their reinspection
+    POST /inventory/qc/reinspection/  -- create (explicit inputs only) or record
+                                         the reinspection disposition
+
+    A reprocess order raised by a GRN QC disposition is linked to the goods
+    sitting at the Reprocess location (by GRN); its reinspection moves them on
+    with real movements. Orders with no such stock record the result only, and
+    the response says so.
     """
 
     permission_classes = [HasModulePermission]
     required_permissions = ["view_inventory"]
+    permission_map = {"POST": ["approve_qc"]}
+
+    @staticmethod
+    def _meta(reprocess):
+        if reprocess.remarks and reprocess.remarks.strip().startswith("{"):
+            try:
+                return json.loads(reprocess.remarks)
+            except ValueError:
+                return {}
+        return {}
+
+    @staticmethod
+    def _reprocess_units(reprocess):
+        """Takas / item quantities of this order's GRN still at Reprocess."""
+        receipt = GoodsReceipt.objects.filter(
+            client_id=reprocess.client_id, grn_number=reprocess.inward_no, deleted_at__isnull=True
+        ).first() if reprocess.inward_no else None
+        if receipt is None:
+            return None, []
+        location = stock.system_location(reprocess.client_id, "REPROCESS")
+        units = [
+            {"lot": lot, "item_id": lot.item_id, "qty": round4(lot.available_quantity), "line": None,
+             "from": location.id}
+            for lot in LotTaka.objects.filter(
+                client_id=reprocess.client_id, source_document_id=receipt.id,
+                location_id=location.id, available_quantity__gt=0, deleted_at__isnull=True,
+            ).order_by("created_at")
+        ]
+        lot_items = {u["item_id"] for u in units}
+        for row in StockMovement.objects.filter(
+            client_id=reprocess.client_id, source_document_id=receipt.id,
+            location_id=location.id, lot_taka__isnull=True,
+        ).values("item_id").annotate(q=Sum("quantity")):
+            if row["item_id"] not in lot_items and D(row["q"] or 0) > ZERO:
+                units.append({"lot": None, "item_id": row["item_id"], "qty": round4(row["q"]),
+                              "line": None, "from": location.id})
+        return receipt, units
 
     def get(self, request):
         client_id = request.client_id
@@ -3698,14 +4036,15 @@ class QCReinspectionView(APIView):
         to_date = request.query_params.get("to_date")
         vendor = request.query_params.get("vendor") or "All"
         status_filter = request.query_params.get("status") or "All"
-        item_code = request.query_params.get("item_code") or "All"
 
         reprocess_qs = (
             JWOReprocess.objects.filter(client_id=client_id)
-            .select_related("job_work_order", "job_work_order__vendor", "job_work_order__process_plan")
+            .select_related(
+                "job_work_order", "job_work_order__vendor", "job_work_order__process_plan",
+                "created_by", "updated_by",
+            )
             .order_by("-date", "-created_at")
         )
-
         if from_date:
             reprocess_qs = reprocess_qs.filter(date__gte=from_date)
         if to_date:
@@ -3719,12 +4058,6 @@ class QCReinspectionView(APIView):
         for r in reprocess_qs:
             jwo = r.job_work_order
             plan = jwo.process_plan if jwo else None
-            v_name = jwo.vendor_name or (jwo.vendor.name if jwo and jwo.vendor else "Outside Processor")
-            it_code = getattr(plan, "fabric_item", "FAB-01") or "FAB-01"
-            it_name = (plan.fabric_item or plan.fabric_quality) if plan else "Fabric Reprocess Item"
-            lot_no = (plan.grey_lot_no if plan else "") or f"LT-{str(r.id)[:4].upper()}"
-
-            # Tab filtering:
             if tab == "Pending Reprocess" and r.status in ["Completed", "Cancelled"]:
                 continue
             elif tab == "Sent for Reprocess" and r.status not in ["Sent to Vendor", "In Process", "Pending"]:
@@ -3737,82 +4070,57 @@ class QCReinspectionView(APIView):
                 re_status = "Completed"
             elif r.status in ["In Process", "Received"]:
                 re_status = "In Progress"
-
             if status_filter != "All" and re_status != status_filter:
                 continue
 
+            meta = self._meta(r)
             sent_q = float(r.qty or 0)
-            rec_q = sent_q if r.status in ["Received", "Completed"] else 0.0
-            pend_q = max(0.0, sent_q - rec_q)
-
-            meta = {}
-            if r.remarks and r.remarks.strip().startswith("{") and r.remarks.strip().endswith("}"):
-                try:
-                    meta = json.loads(r.remarks)
-                except Exception:
-                    pass
-
-            good_q = meta.get("goodQty", sent_q if re_status == "Completed" else 0.0)
-            hold_q = meta.get("holdQty", 0.0)
-            rep_q = meta.get("reprocessQty", 0.0)
-            rej_q = meta.get("rejectedQty", 0.0)
-            meas = meta.get("measurements") or [
-                {"srNo": 1, "takaNo": 1, "actualQty": sent_q, "width": 150, "remarks": "-"}
-            ]
-
+            result = meta if r.status == "Completed" else (meta.get("draft") or {})
+            created_at = timezone.localtime(r.created_at) if r.created_at else None
+            audit = [{
+                "dateTime": created_at.strftime("%d-%m-%Y %H:%M") if created_at else "",
+                "action": "Created",
+                "user": r.created_by.name if r.created_by_id else None,
+                "remarks": r.reason or None,
+            }]
+            if r.status != "Pending" and r.updated_at:
+                audit.append({
+                    "dateTime": timezone.localtime(r.updated_at).strftime("%d-%m-%Y %H:%M"),
+                    "action": re_status,
+                    "user": r.updated_by.name if r.updated_by_id else None,
+                    "remarks": meta.get("remarks") or None,
+                })
             records.append({
                 "id": str(r.id),
-                "reprocessNo": r.no or f"RP-{str(r.id)[:4].upper()}",
+                "reprocessNo": r.no,
                 "date": r.date.strftime("%d-%m-%Y") if r.date else "",
                 "rawDate": r.date.isoformat() if r.date else "",
-                "sourceQcNo": jwo.jwo_no if jwo else f"QC-{str(r.id)[:4].upper()}",
-                "itemCode": it_code,
-                "fabricItem": it_name,
+                "sourceQcNo": r.inward_no or (jwo.jwo_no if jwo else None),
+                "itemCode": (plan.fabric_item or None) if plan else None,
+                "fabricItem": (plan.fabric_item or plan.fabric_quality or None) if plan else None,
                 "sentQty": sent_q,
-                "receivedQty": rec_q,
-                "pendingQty": pend_q,
-                "vendor": v_name,
+                "receivedQty": float(sum(float(result.get(k, 0) or 0) for k in ("goodQty", "holdQty", "reprocessQty", "rejectedQty"))) if r.status == "Completed" else None,
+                "pendingQty": 0.0 if r.status == "Completed" else sent_q,
+                "vendor": ((jwo.vendor_name or (jwo.vendor.name if jwo.vendor else None)) if jwo else None),
                 "reinspectionStatus": re_status,
-                "lotNo": lot_no,
-                "goodQty": good_q,
-                "holdQty": hold_q,
-                "reprocessQty": rep_q,
-                "rejectedQty": rej_q,
-                "remarks": meta.get("remarks") or (r.remarks if not meta else r.reason),
-                "measurements": meas,
-                "auditTrail": [
-                    {
-                        "dateTime": f"{r.date.strftime('%d-%m-%Y')} 10:15" if r.date else "",
-                        "action": "Created",
-                        "user": "System",
-                        "remarks": "Reinspection entry created",
-                    },
-                    *(
-                        [{
-                            "dateTime": timezone.now().strftime("%d-%m-%Y %H:%M"),
-                            "action": re_status,
-                            "user": "Inspector",
-                            "remarks": meta.get("remarks") or "Reinspection updated",
-                        }]
-                        if re_status != "Pending"
-                        else []
-                    ),
-                ],
+                "lotNo": (plan.grey_lot_no or None) if plan else None,
+                "goodQty": float(result.get("goodQty", 0) or 0),
+                "holdQty": float(result.get("holdQty", 0) or 0),
+                "reprocessQty": float(result.get("reprocessQty", 0) or 0),
+                "rejectedQty": float(result.get("rejectedQty", 0) or 0),
+                "remarks": result.get("remarks") or (r.remarks if not meta else None),
+                "measurements": result.get("measurements") or [],
+                "auditTrail": audit,
             })
 
         vendors = list(
             Party.objects.filter(client_id=client_id, type__in=["Vendor", "Both"], deleted_at__isnull=True)
-            .values_list("name", flat=True)
-            .distinct()
-            .order_by("name")
+            .values_list("name", flat=True).distinct().order_by("name")
         )
         items = list(
             Item.objects.filter(client_id=client_id, deleted_at__isnull=True)
-            .values_list("sku", flat=True)
-            .distinct()
-            .order_by("sku")
+            .values_list("sku", flat=True).distinct().order_by("sku")
         )
-
         return Response({
             "records": records,
             "filters": {
@@ -3823,105 +4131,175 @@ class QCReinspectionView(APIView):
         })
 
     def post(self, request):
+        from . import qc as qc_service
+
         client_id = request.client_id
         action_type = request.data.get("actionType") or "create"
 
         if action_type == "disposition":
             reprocess_id = request.data.get("reprocessId")
-            if not reprocess_id:
-                return Response({"detail": "reprocessId is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-            reprocess = JWOReprocess.objects.filter(client_id=client_id, id=reprocess_id).first()
-            if not reprocess:
-                return Response({"detail": "Reprocess record not found."}, status=status.HTTP_404_NOT_FOUND)
+            reprocess = JWOReprocess.objects.filter(client_id=client_id, id=reprocess_id).first() if reprocess_id else None
+            if reprocess is None:
+                raise ValidationFailed("Reprocess record not found.", field_errors={"reprocessId": ["Not found."]})
+            if reprocess.status == "Completed":
+                raise Conflict(f"Reprocess {reprocess.no} is already reinspected.", code=Codes.ALREADY_DONE)
 
             is_draft = bool(request.data.get("isDraft", False))
-            good_qty = Decimal(str(request.data.get("goodQty") or "0"))
-            hold_qty = Decimal(str(request.data.get("holdQty") or "0"))
-            reprocess_qty = Decimal(str(request.data.get("reprocessQty") or "0"))
-            rejected_qty = Decimal(str(request.data.get("rejectedQty") or "0"))
+            quantities = qc_service.parse_quantities(request.data)
             remarks = request.data.get("remarks") or ""
             measurements = request.data.get("measurements") or []
-
-            meta = {
-                "goodQty": float(good_qty),
-                "holdQty": float(hold_qty),
-                "reprocessQty": float(reprocess_qty),
-                "rejectedQty": float(rejected_qty),
+            result = {
+                "goodQty": float(quantities["good"]),
+                "secondQualityQty": float(quantities["second"]),
+                "holdQty": float(quantities["hold"]),
+                "reprocessQty": float(quantities["reprocess"]),
+                "rejectedQty": float(quantities["reject"]),
                 "remarks": remarks,
                 "measurements": measurements,
                 "updatedAt": timezone.now().isoformat(),
             }
 
             with transaction.atomic():
+                meta = self._meta(reprocess)
                 if is_draft:
-                    reprocess.status = "In Process"
+                    meta["draft"] = result
                     reprocess.remarks = json.dumps(meta)
-                    reprocess.save(update_fields=["status", "remarks", "updated_at"])
-                    msg = "Reinspection saved as draft."
-                else:
-                    reprocess.status = "Completed"
-                    reprocess.remarks = json.dumps(meta)
-                    reprocess.save(update_fields=["status", "remarks", "updated_at"])
-                    msg = "Reinspection result approved. Stock Ledger and Stock Position updated."
+                    reprocess.save(update_fields=["remarks", "updated_at"])
+                    return Response({
+                        "success": True, "status": reprocess.status,
+                        "message": "Reinspection draft saved. Stock is not moved until approval.",
+                    })
 
-            return Response({
-                "success": True,
-                "status": reprocess.status,
-                "message": msg,
-            })
+                total = sum(quantities.values(), ZERO)
+                if total <= ZERO:
+                    raise ValidationFailed(
+                        "Enter the reinspection quantities.",
+                        field_errors={"goodQty": ["Total must be greater than zero."]},
+                    )
+                receipt, units = self._reprocess_units(reprocess)
+                pool = round4(sum((u["qty"] for u in units), ZERO))
+                moved = 0
+                if units:
+                    if abs(total - pool) > Decimal("0.001"):
+                        raise ValidationFailed(
+                            f"Reinspection total ({total}) must equal the quantity at the "
+                            f"Reprocess location for {reprocess.inward_no} ({pool}).",
+                            field_errors={"goodQty": [f"Expected a total of {pool}."]},
+                        )
+                    good_location_id = receipt.location_id
+                    for unit, category, qty in qc_service._allocate(units, quantities):
+                        if category == "reprocess":
+                            continue  # stays at Reprocess for another round
+                        condition = qc_service.CATEGORY_CONDITION[category]
+                        _, lot_qc = stock.CONDITION_ROUTING[condition]
+                        destination = stock.condition_location_id(client_id, condition, good_location_id)
+                        move_type = qc_service.CATEGORY_MOVEMENT[category]
+                        common = dict(
+                            client_id=client_id, reference_type="JWOReprocess",
+                            reference_id=reprocess.id, reference_number=reprocess.no,
+                            source_document_type="GoodsReceipt", source_document_id=receipt.id,
+                            notes=f"Reinspection {reprocess.no}" + (f": {remarks}" if remarks else ""),
+                            user=request.user,
+                        )
+                        if unit["lot"] is not None:
+                            _, movements = stock.relocate_lot(
+                                lot=unit["lot"], quantity=qty, to_location_id=destination,
+                                out_type=move_type, in_type=move_type, qc_status=lot_qc,
+                                split_suffix="RI", **common,
+                            )
+                        else:
+                            movements = stock.relocate_item_qty(
+                                item=unit["item_id"], quantity=qty, from_location_id=unit["from"],
+                                to_location_id=destination, out_type=move_type, in_type=move_type,
+                                **common,
+                            )
+                        moved += len(movements)
 
-        # Create new reinspection entry
-        source_qc_no = request.data.get("sourceQcNo") or "QC-001"
-        vendor_name = request.data.get("vendor") or "Outside Processor"
-        item_code = request.data.get("itemCode") or "FAB-01"
-        sent_qty = Decimal(str(request.data.get("sentQty") or "10"))
-        date_str = request.data.get("date") or timezone.localdate().isoformat()
-        reason = request.data.get("reason") or "Reprocessed fabric reinspection"
+                result["stockPosted"] = bool(units)
+                reprocess.status = "Completed"
+                reprocess.remarks = json.dumps(result)
+                reprocess.updated_by = request.user
+                reprocess.save(update_fields=["status", "remarks", "updated_by", "updated_at"])
 
-        jwo = JobWorkOrder.objects.filter(client_id=client_id, jwo_no=source_qc_no).first()
-        if not jwo:
-            jwo = JobWorkOrder.objects.filter(client_id=client_id).first()
-        if not jwo:
-            jwo = JobWorkOrder.objects.create(
-                client_id=client_id,
-                jwo_no=source_qc_no,
-                vendor_name=vendor_name,
-                order_date=timezone.localdate(),
-                planned_qty=sent_qty,
+            message = (
+                f"Reinspection of {reprocess.no} approved; {moved} stock movement(s) posted."
+                if units else
+                f"Reinspection of {reprocess.no} recorded. No stock of this order is held at the "
+                "Reprocess location, so no stock moved."
+            )
+            return Response({"success": True, "status": reprocess.status, "stockPosted": bool(units), "message": message})
+
+        # Create a reprocess / reinspection entry -- explicit inputs only.
+        jwo_id = request.data.get("jwo_id") or request.data.get("jwoId") or request.data.get("jobWorkOrderId")
+        challan_no = request.data.get("challan_no") or request.data.get("challanNo")
+        meters_raw = request.data.get("meters") or request.data.get("sentQty") or request.data.get("qty")
+        reason = (request.data.get("reason") or "").strip()
+
+        field_errors = {}
+        if not jwo_id:
+            field_errors["jwo_id"] = ["Job Work Order is required."]
+        if not challan_no:
+            field_errors["challan_no"] = ["Challan number is required."]
+        try:
+            sent_qty = round4(D(meters_raw))
+        except Exception:  # noqa: BLE001
+            sent_qty = ZERO
+        if sent_qty <= ZERO:
+            field_errors["meters"] = ["Meters must be greater than zero."]
+        try:
+            r_date = date.fromisoformat(str(request.data.get("date") or ""))
+        except ValueError:
+            r_date = None
+        if r_date is None:
+            field_errors["date"] = ["Enter the date (YYYY-MM-DD)."]
+        if field_errors:
+            raise ValidationFailed("Missing required reinspection fields.", field_errors=field_errors)
+
+        jwo = JobWorkOrder.objects.filter(client_id=client_id, id=jwo_id).first() if _is_uuid(jwo_id) else None
+        if jwo is None:
+            jwo = JobWorkOrder.objects.filter(client_id=client_id, jwo_no=jwo_id).first()
+        if jwo is None:
+            raise ValidationFailed(
+                f"Job Work Order '{jwo_id}' does not exist.",
+                field_errors={"jwo_id": ["Invalid Job Work Order."]},
             )
 
-        rp_count = JWOReprocess.objects.filter(client_id=client_id).count() + 1
-        rp_no = f"RP-{timezone.localdate().year}-{rp_count:03d}"
-
-        try:
-            from datetime import datetime
-            r_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-        except Exception:
-            r_date = timezone.localdate()
-
-        reprocess = JWOReprocess.objects.create(
-            client_id=client_id,
-            job_work_order=jwo,
-            no=rp_no,
-            date=r_date,
-            qty=sent_qty,
-            reason=reason,
-            status="Pending",
-        )
-
+        with transaction.atomic():
+            rp_no = allocate_number(request.user.client, "RP", r_date)
+            reprocess = JWOReprocess.objects.create(
+                client_id=client_id,
+                job_work_order=jwo,
+                no=rp_no,
+                date=r_date,
+                qty=sent_qty,
+                reason=f"{reason} (Challan: {challan_no})" if reason else f"Challan: {challan_no}",
+                status="Pending",
+                created_by=request.user,
+            )
         return Response({
             "success": True,
-            "message": f"Reinspection record {rp_no} created successfully.",
+            "message": f"Reinspection record {rp_no} created.",
             "reprocessId": str(reprocess.id),
             "reprocessNo": rp_no,
-        })
+        }, status=status.HTTP_201_CREATED)
+
+
+def _is_uuid(value):
+    import uuid as _uuid
+
+    try:
+        _uuid.UUID(str(value))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
 
 
 class LotTakaRegisterView(APIView):
     """Lot / Taka Register endpoints for fabric lots, quantities, and movement history."""
     permission_classes = [HasModulePermission]
     module_name = "inventory"
+    required_permissions = ["view_inventory"]
+    permission_map = {"POST": ["adjust_stock"], "PATCH": ["view_inventory"]}
 
     def get(self, request, pk=None):
         client_id = request.client_id
@@ -3940,12 +4318,13 @@ class LotTakaRegisterView(APIView):
         item_id_preview = request.query_params.get("item_id")
 
         if pk:
-            lt = LotTaka.objects.filter(client_id=client_id, id=pk).select_related("item", "supplier", "location").first()
+            lt = LotTaka.objects.filter(client_id=client_id, id=pk, deleted_at__isnull=True).select_related("item", "supplier", "location").first()
             if not lt:
                 return Response({"detail": "Lot / Taka not found."}, status=status.HTTP_404_NOT_FOUND)
             # Fetch movement history
+            # This taka's own ledger (every lot movement names its taka).
             mov_qs = StockMovement.objects.filter(
-                client_id=client_id, batch_number=lt.lot_number
+                client_id=client_id, lot_taka_id=lt.id
             ).order_by("movement_date", "created_at")
             running_bal = Decimal("0")
             mov_list = []
@@ -3966,33 +4345,34 @@ class LotTakaRegisterView(APIView):
                     "type": m_type_label,
                     "qty": float(m.quantity),
                     "balance": float(running_bal),
-                    "refNo": m.reference_number or f"REF-{str(m.id)[:4].upper()}",
+                    "refNo": m.reference_number,
                 })
 
             it = lt.item
             return Response({
                 "id": str(lt.id),
-                "takaId": lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}",
+                "takaId": lt.taka_id or lt.barcode,
                 "lotNo": lt.lot_number,
                 "takaRoll": lt.taka_number,
+                "itemId": str(lt.item_id),
                 "tagStatus": lt.tag_status or "Pending",
                 "printCount": lt.print_count or 0,
                 "lastPrintedAt": lt.last_printed_at.strftime("%d-%m-%Y %H:%M") if lt.last_printed_at else None,
                 "itemCode": it.sku if it else "-",
-                "itemName": it.name if it else "Fabric Item",
-                "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "-"),
-                "design": it.fabric_design if it and it.fabric_design else "Plain",
-                "shade": it.fabric_color if it and it.fabric_color else "Default",
+                "itemName": it.name if it else None,
+                "quality": (it.fabric_quality or it.name) if it else None,
+                "design": (it.fabric_design or None) if it else None,
+                "shade": (it.fabric_color or None) if it else None,
                 "receivedQty": float(lt.received_quantity),
                 "qcStatus": lt.qc_status,
                 "availableQty": float(lt.available_quantity),
-                "location": lt.location.name if lt.location else "Main Godown",
+                "location": lt.location.name if lt.location else None,
                 "locationId": str(lt.location.id) if lt.location else "",
                 "supplier": lt.supplier.name if lt.supplier else (lt.source_document_number or "-"),
                 "supplierId": str(lt.supplier.id) if lt.supplier else "",
                 "receivedDate": lt.received_date.strftime("%d-%m-%Y"),
                 "rawDate": lt.received_date.isoformat(),
-                "uom": lt.uom or (it.uom if it else "m"),
+                "uom": lt.uom or (it.uom if it else None),
                 "status": lt.status,
                 "rate": float(lt.rate),
                 "rollWeight": float(lt.roll_weight) if lt.roll_weight else None,
@@ -4009,7 +4389,7 @@ class LotTakaRegisterView(APIView):
             })
 
         # Base queryset
-        qs = LotTaka.objects.filter(client_id=client_id).select_related(
+        qs = LotTaka.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related(
             "item", "supplier", "location"
         )
 
@@ -4049,6 +4429,16 @@ class LotTakaRegisterView(APIView):
         if location_filter and location_filter != "All":
             qs = qs.filter(location__name=location_filter)
 
+        # Used by the transfer taka picker: takas with stock at one location.
+        location_id_filter = request.query_params.get("location_id")
+        if location_id_filter:
+            qs = qs.filter(location_id=location_id_filter)
+        if request.query_params.get("available_only") == "true":
+            qs = qs.filter(available_quantity__gt=0, deleted_at__isnull=True)
+        item_filter = request.query_params.get("itemId")
+        if item_filter:
+            qs = qs.filter(item_id=item_filter)
+
         if search_query:
             qs = qs.filter(
                 Q(lot_number__icontains=search_query)
@@ -4061,14 +4451,13 @@ class LotTakaRegisterView(APIView):
         all_lots = list(qs)
 
         # Preload movements for movement history per lot
-        lot_numbers = [lt.lot_number for lt in all_lots if lt.lot_number]
         movements_by_lot = {}
-        if lot_numbers:
+        if all_lots:
             mov_qs = StockMovement.objects.filter(
-                client_id=client_id, batch_number__in=lot_numbers
+                client_id=client_id, lot_taka_id__in=[lt.id for lt in all_lots]
             ).order_by("movement_date", "created_at")
             for m in mov_qs:
-                movements_by_lot.setdefault(m.batch_number, []).append(m)
+                movements_by_lot.setdefault(m.lot_taka_id, []).append(m)
 
         # Build records
         records = []
@@ -4106,7 +4495,7 @@ class LotTakaRegisterView(APIView):
                 on_hold_lots.add(lt.lot_number)
 
             # Build movement history for this lot
-            lot_movs = movements_by_lot.get(lt.lot_number, [])
+            lot_movs = movements_by_lot.get(lt.id, [])
             running_bal = Decimal("0")
             mov_list = []
             for m in lot_movs:
@@ -4126,32 +4515,33 @@ class LotTakaRegisterView(APIView):
                     "type": m_type_label,
                     "qty": float(m.quantity),
                     "balance": float(running_bal),
-                    "refNo": m.reference_number or f"REF-{str(m.id)[:4].upper()}",
+                    "refNo": m.reference_number,
                 })
 
             records.append({
                 "id": str(lt.id),
-                "takaId": lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}",
+                "takaId": lt.taka_id or lt.barcode,
                 "lotNo": lt.lot_number,
                 "takaRoll": lt.taka_number,
+                "itemId": str(lt.item_id),
                 "tagStatus": lt.tag_status or "Pending",
                 "printCount": lt.print_count or 0,
                 "lastPrintedAt": lt.last_printed_at.strftime("%d-%m-%Y %H:%M") if lt.last_printed_at else None,
                 "itemCode": it.sku if it else "-",
-                "itemName": it.name if it else "Fabric Item",
-                "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "-"),
-                "design": it.fabric_design if it and it.fabric_design else "Plain",
-                "shade": it.fabric_color if it and it.fabric_color else "Default",
+                "itemName": it.name if it else None,
+                "quality": (it.fabric_quality or it.name) if it else None,
+                "design": (it.fabric_design or None) if it else None,
+                "shade": (it.fabric_color or None) if it else None,
                 "receivedQty": float(rec_q),
                 "qcStatus": lt.qc_status,
                 "availableQty": float(avail_q),
-                "location": lt.location.name if lt.location else "Main Godown",
+                "location": lt.location.name if lt.location else None,
                 "locationId": str(lt.location.id) if lt.location else "",
                 "supplier": lt.supplier.name if lt.supplier else (lt.source_document_number or "-"),
                 "supplierId": str(lt.supplier.id) if lt.supplier else "",
                 "receivedDate": lt.received_date.strftime("%d-%m-%Y"),
                 "rawDate": lt.received_date.isoformat(),
-                "uom": lt.uom or (it.uom if it else "m"),
+                "uom": lt.uom or (it.uom if it else None),
                 "status": lt.status,
                 "rate": float(rate_val),
                 "rollWeight": float(lt.roll_weight) if lt.roll_weight else None,
@@ -4167,7 +4557,9 @@ class LotTakaRegisterView(APIView):
                 "stockMovements": mov_list,
             })
 
-        # Summary Cards
+        # Summary Cards -- quantities are only summed in one unit.
+        lot_units = sorted({(lt.uom or (lt.item.uom if lt.item_id else "")) for lt in all_lots} - {""})
+        summary_uom = lot_units[0] if len(lot_units) == 1 else ("Mixed" if lot_units else None)
         avg_rate = float(tot_value / tot_received) if tot_received > 0 else 0.0
         summary_cards = {
             "totalLots": {
@@ -4178,7 +4570,7 @@ class LotTakaRegisterView(APIView):
             "totalQuantity": {
                 "qty": float(tot_received),
                 "inStock": float(tot_available),
-                "uom": "m",
+                "uom": summary_uom,
             },
             "totalValue": {
                 "val": float(tot_value),
@@ -4187,20 +4579,24 @@ class LotTakaRegisterView(APIView):
             "pendingQC": {
                 "qty": float(pending_qc_qty),
                 "lots": len(pending_qc_lots),
-                "uom": "m",
+                "uom": summary_uom,
             },
             "onHold": {
                 "qty": float(on_hold_qty),
                 "lots": len(on_hold_lots),
-                "uom": "m",
+                "uom": summary_uom,
             },
         }
 
         # Filter option lists
         supplier_names = list(Party.objects.filter(client_id=client_id, type__in=["Vendor", "Both"]).values_list("name", flat=True).order_by("name"))
-        quality_names = list(Item.objects.filter(client_id=client_id, fabric_quality__isnull=False).values_list("fabric_quality", flat=True).distinct().order_by("fabric_quality"))
-        design_names = ["Floral", "Check", "Plain", "Stripe", "Jacquard", "Dobby", "Printed"]
-        shade_names = ["Navy", "Blue", "Maroon", "White", "Black", "Green", "Grey", "Off-White", "Red"]
+        quality_names = list(FabricQuality.objects.filter(client_id=client_id, deleted_at__isnull=True).values_list("name", flat=True).order_by("name"))
+        design_names = list(Design.objects.filter(client_id=client_id, deleted_at__isnull=True).values_list("name", flat=True).order_by("name"))
+        if not design_names:
+            design_names = list(Item.objects.filter(client_id=client_id, fabric_design__isnull=False).values_list("fabric_design", flat=True).distinct().order_by("fabric_design"))
+        shade_names = list(Shade.objects.filter(client_id=client_id, deleted_at__isnull=True).values_list("name", flat=True).order_by("name"))
+        if not shade_names:
+            shade_names = list(Item.objects.filter(client_id=client_id, fabric_color__isnull=False).values_list("fabric_color", flat=True).distinct().order_by("fabric_color"))
         location_names = list(Location.objects.filter(client_id=client_id).values_list("name", flat=True).order_by("name"))
 
         # Optional Item Preview Data for "+ Add Lot / Taka" Modal
@@ -4210,21 +4606,21 @@ class LotTakaRegisterView(APIView):
             if prev_item:
                 curr_stock = float(StockBalance.objects.filter(client_id=client_id, item=prev_item).aggregate(tot=Sum("on_hand"))["tot"] or 0)
                 recent_lots = []
-                for rlt in LotTaka.objects.filter(client_id=client_id, item=prev_item).order_by("-created_at")[:5]:
+                for rlt in LotTaka.objects.filter(client_id=client_id, item=prev_item, deleted_at__isnull=True).order_by("-created_at")[:5]:
                     recent_lots.append({
                         "lotNo": rlt.lot_number,
                         "takaRoll": rlt.taka_number,
                         "qty": float(rlt.received_quantity),
-                        "shade": prev_item.fabric_color or "Default",
+                        "shade": prev_item.fabric_color or None,
                         "status": rlt.status,
                     })
                 preview_data = {
                     "itemCode": prev_item.sku,
                     "itemName": prev_item.name,
                     "quality": prev_item.fabric_quality or prev_item.name,
-                    "design": prev_item.fabric_design or "Plain",
-                    "shade": prev_item.fabric_color or "Default",
-                    "uom": prev_item.uom or "m",
+                    "design": prev_item.fabric_design or None,
+                    "shade": prev_item.fabric_color or None,
+                    "uom": prev_item.uom or None,
                     "currentStock": curr_stock,
                     "recentLots": recent_lots,
                 }
@@ -4246,88 +4642,85 @@ class LotTakaRegisterView(APIView):
 
     @transaction.atomic
     def post(self, request):
+        """Manual lot / taka entry (opening stock or a receipt with no bill).
+
+        The taka starts empty and the PURCHASE movement fills it, so
+        ``available_quantity`` comes from the ledger. ``qcStatus`` must be
+        given: ``Passed`` puts the stock in the chosen godown, ``Pending``
+        puts it at QC Hold until QC releases it.
+        """
         client_id = request.client_id
         data = request.data
+        field_errors = {}
 
-        item_id = data.get("itemId")
-        if not item_id:
-            return Response({"detail": "Fabric item is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        item = Item.objects.filter(client_id=client_id, id=item_id).first()
-        if not item:
-            return Response({"detail": "Selected fabric item not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        lot_no = (data.get("lotNo") or "").strip()
-        if not lot_no:
-            return Response({"detail": "Lot Number is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        taka_roll = str(data.get("takaRoll") or "1").strip()
-
-        # Check duplicate
-        if LotTaka.objects.filter(client_id=client_id, lot_number=lot_no, taka_number=taka_roll, deleted_at__isnull=True).exists():
-            return Response({"detail": f"Lot '{lot_no}' with Taka / Roll '{taka_roll}' already exists in the register."}, status=status.HTTP_400_BAD_REQUEST)
-
+        item = Item.objects.filter(client_id=client_id, id=data.get("itemId"), deleted_at__isnull=True).first() if data.get("itemId") else None
+        if item is None:
+            field_errors["itemId"] = ["Choose the fabric item."]
         try:
-            received_qty = Decimal(str(data.get("receivedQty") or "0"))
-            if received_qty <= ZERO:
-                return Response({"detail": "Received quantity must be greater than 0."}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception:
-            return Response({"detail": "Invalid received quantity."}, status=status.HTTP_400_BAD_REQUEST)
+            received_qty = round4(D(data.get("receivedQty")))
+        except Exception:  # noqa: BLE001
+            received_qty = ZERO
+        if received_qty <= ZERO:
+            field_errors["receivedQty"] = ["Received quantity must be greater than 0."]
+        loc = Location.objects.filter(client_id=client_id, id=data.get("locationId"), deleted_at__isnull=True).first() if data.get("locationId") else None
+        if loc is None:
+            field_errors["locationId"] = ["Choose the storage location."]
+        elif loc.code in stock.BLOCKED_LOCATION_CODES:
+            field_errors["locationId"] = ["Choose a godown; system locations are filled by QC documents."]
+        qc_status = data.get("qcStatus")
+        if qc_status not in ("Passed", "Pending"):
+            field_errors["qcStatus"] = ["Choose Passed (goes to stock) or Pending (goes to QC Hold)."]
+        try:
+            rec_date = date.fromisoformat(str(data.get("receivedDate") or ""))
+        except ValueError:
+            rec_date = None
+        if rec_date is None:
+            field_errors["receivedDate"] = ["Enter the received date (YYYY-MM-DD)."]
+        if field_errors:
+            raise ValidationFailed("The lot entry is incomplete.", field_errors=field_errors)
 
-        # Validate UOM Master and handle compatible conversions
+        # Quantities are stored in the item's stock unit.
         from apps.masters import uom as uom_service
-        input_uom = (data.get("uom") or item.uom or "m").strip()
-        item_uom = (item.uom or "m").strip()
-        book = uom_service.UnitBook(client_id)
 
+        input_uom = (data.get("uom") or item.uom or "").strip()
+        item_uom = (item.uom or "").strip()
         if input_uom and item_uom and not uom_service.same_unit_text(input_uom, item_uom):
-            u_in = book.resolve(input_uom)
-            u_item = book.resolve(item_uom)
-            if u_in and u_item:
-                if not uom_service.compatible(u_in, u_item):
-                    return Response({
-                        "detail": f"UOM '{input_uom}' is incompatible with fabric item base unit '{item_uom}'."
-                    }, status=status.HTTP_400_BAD_REQUEST)
-                received_qty = round4(uom_service.convert(received_qty, u_in, u_item))
-                input_uom = item_uom
+            book = uom_service.UnitBook(client_id)
+            u_in, u_item = book.resolve(input_uom), book.resolve(item_uom)
+            if not (u_in and u_item and uom_service.compatible(u_in, u_item)):
+                raise ValidationFailed(
+                    f"UOM '{input_uom}' is incompatible with the item's stock unit '{item_uom}'.",
+                    field_errors={"uom": ["Incompatible unit."]},
+                )
+            received_qty = round4(uom_service.convert(received_qty, u_in, u_item))
 
-        location_id = data.get("locationId")
-        loc = Location.objects.filter(client_id=client_id, id=location_id).first() or Location.objects.filter(client_id=client_id).first()
-        if not loc:
-            return Response({"detail": "Storage location is required."}, status=status.HTTP_400_BAD_REQUEST)
+        client = request.user.client
+        lot_no = (data.get("lotNo") or "").strip() or allocate_number(client, "LOT", rec_date)
+        taka_roll = str(data.get("takaRoll") or "").strip() or str(
+            LotTaka.objects.filter(client_id=client_id, lot_number=lot_no, deleted_at__isnull=True).count() + 1
+        )
+        if LotTaka.objects.filter(client_id=client_id, lot_number=lot_no, taka_number=taka_roll, deleted_at__isnull=True).exists():
+            raise ValidationFailed(
+                f"Lot '{lot_no}' with Taka / Roll '{taka_roll}' already exists in the register.",
+                field_errors={"takaRoll": ["Already exists for this lot."]},
+            )
 
-        supplier_id = data.get("supplierId")
-        supplier = Party.objects.filter(client_id=client_id, id=supplier_id).first() if supplier_id else None
-        if not supplier and data.get("supplier"):
+        supplier = None
+        if data.get("supplierId"):
+            supplier = Party.objects.filter(client_id=client_id, id=data.get("supplierId")).first()
+        elif data.get("supplier"):
             supplier = Party.objects.filter(client_id=client_id, name=data.get("supplier")).first()
 
-        source_doc = data.get("sourceDoc") or "GRN"
-        grn_no = data.get("grnNo") or f"GRN-{timezone.localdate().strftime('%y%m%d')}"
-        rec_date_str = data.get("receivedDate")
-        try:
-            rec_date = date.fromisoformat(rec_date_str) if rec_date_str else timezone.localdate()
-        except Exception:
-            rec_date = timezone.localdate()
+        def dec_or_none(key):
+            value = data.get(key)
+            return D(str(value)) if value not in (None, "") else None
 
-        rate = Decimal(str(data.get("rate") or "0"))
-        roll_weight = Decimal(str(data["rollWeight"])) if data.get("rollWeight") else None
-        width = Decimal(str(data["width"])) if data.get("width") else None
-        pieces = int(data.get("pieces") or 1)
-        gsm = Decimal(str(data["gsm"])) if data.get("gsm") else None
-        remarks = data.get("remarks") or ""
-        tags = data.get("tags") or []
-        image_url = data.get("imageUrl") or ""
-
-        # Auto-allocate unique Taka ID (e.g. TAK-000125) and encode in barcode
-        client = (
-            request.user.client
-            if (hasattr(request, "user") and request.user.is_authenticated and getattr(request.user, "client", None))
-            else Client.objects.filter(id=client_id).first()
-        )
+        rate = dec_or_none("rate") or ZERO
         taka_code = allocate_number(client, "TAK")
-        barcode = data.get("barcode") or taka_code
+        target_location = loc if qc_status == "Passed" else stock.system_location(client_id, "QC_HOLD")
+        source_doc = data.get("sourceDoc") or "Manual"
+        reference_number = data.get("grnNo") or f"{lot_no}/{taka_roll}"
 
-        # Create LotTaka
         lot_taka = LotTaka.objects.create(
             client_id=client_id,
             taka_id=taka_code,
@@ -4336,58 +4729,58 @@ class LotTakaRegisterView(APIView):
             item=item,
             supplier=supplier,
             source_document_type=source_doc,
-            source_document_number=grn_no,
-            location=loc,
+            source_document_number=data.get("grnNo") or None,
+            location=target_location,
             received_date=rec_date,
             received_quantity=received_qty,
-            available_quantity=received_qty,
-            uom=data.get("uom") or item.uom or "m",
-            qc_status="Passed",
+            available_quantity=ZERO,
+            uom=item.uom,
+            qc_status=qc_status,
             status="Active",
-            barcode=barcode,
+            barcode=data.get("barcode") or taka_code,
             tag_status="Pending",
             print_count=0,
-            roll_weight=roll_weight,
-            width=width,
-            pieces=pieces,
-            gsm=gsm,
+            # kg is recorded only as the roll weight -- never as the
+            # movement's weighed quantity for a meter item.
+            roll_weight=dec_or_none("rollWeight"),
+            width=dec_or_none("width"),
+            pieces=int(data.get("pieces") or 1),
+            gsm=dec_or_none("gsm"),
             rate=rate,
-            remarks=remarks,
-            tags=tags,
-            image_url=image_url,
+            remarks=data.get("remarks") or None,
+            tags=data.get("tags") or [],
+            image_url=data.get("imageUrl") or None,
+            created_by=request.user,
         )
-
-        # Post StockMovement (PURCHASE) to update live Good Fabric Stock ledger
         mov = stock.post_movement(
             client_id=client_id,
             item=item,
-            location=loc,
+            location=target_location,
             type="PURCHASE",
             quantity=received_qty,
-            weighed_qty=roll_weight or received_qty,
             unit_cost=rate,
             batch_number=lot_no,
+            lot_taka=lot_taka,
             reference_type="LotRegister",
             reference_id=lot_taka.id,
-            reference_number=f"LOT-{lot_no}-{taka_roll}",
+            reference_number=reference_number,
             movement_date=rec_date,
-            notes=json.dumps({
-                "takaRoll": taka_roll,
-                "takaId": taka_code,
-                "remarks": remarks,
-                "tags": tags,
-                "sourceDoc": source_doc,
-                "grnNo": grn_no,
-            }),
-            user=request.user if request.user.is_authenticated else None,
+            notes=f"Manual lot entry {lot_no} / {taka_roll} ({taka_code})",
+            user=request.user,
         )
-
         lot_taka.stock_movement = mov
-        lot_taka.save(update_fields=["stock_movement"])
+        lot_taka.save(update_fields=["stock_movement", "updated_at"])
 
+        from apps.core.audit import record_audit
+
+        record_audit(
+            client=client_id, actor=request.user, action="create", entity_type="LotTaka",
+            entity_id=lot_taka.id, entity_label=taka_code,
+            description=f"Manual lot {lot_no} / {taka_roll}: {received_qty} {item.uom} at {target_location.name}",
+        )
         return Response({
             "success": True,
-            "message": f"Lot {lot_no} / Taka {taka_roll} ({taka_code}) created and added to stock ledger successfully.",
+            "message": f"Lot {lot_no} / Taka {taka_roll} ({taka_code}) created at {target_location.name}.",
             "id": str(lot_taka.id),
             "takaId": lot_taka.taka_id,
             "lotNo": lot_taka.lot_number,
@@ -4397,46 +4790,53 @@ class LotTakaRegisterView(APIView):
 
     @transaction.atomic
     def patch(self, request, pk=None):
+        """Descriptive fields only. Location, rate, status and QC status change
+        only through documents (transfer, adjustment, QC disposition)."""
         client_id = request.client_id
         lot_id = pk or request.data.get("id")
-        lot_taka = LotTaka.objects.filter(client_id=client_id, id=lot_id).first()
+        lot_taka = LotTaka.objects.filter(client_id=client_id, id=lot_id, deleted_at__isnull=True).first()
         if not lot_taka:
-            return Response({"detail": "Lot record not found."}, status=status.HTTP_404_NOT_FOUND)
+            raise ValidationFailed("Lot record not found.", field_errors={"id": ["Not found."]})
 
         data = request.data
-        if "locationId" in data:
-            loc = Location.objects.filter(client_id=client_id, id=data["locationId"]).first()
-            if loc:
-                lot_taka.location = loc
+        disallowed = [
+            f for f in ("locationId", "location", "rate", "status", "qcStatus", "qc_status",
+                        "availableQty", "receivedQty")
+            if f in data
+        ]
+        if disallowed:
+            raise ValidationFailed(
+                f"Direct edits to {', '.join(disallowed)} are not allowed. "
+                "Stock, location and status changes come from documents "
+                "(GRN, stock transfer, adjustment or QC disposition).",
+                field_errors={f: ["Not editable."] for f in disallowed},
+            )
 
+        before = {"remarks": lot_taka.remarks, "rollWeight": str(lot_taka.roll_weight),
+                  "width": str(lot_taka.width), "gsm": str(lot_taka.gsm)}
         if "remarks" in data:
             lot_taka.remarks = data["remarks"]
-
         if "tags" in data:
             lot_taka.tags = data["tags"]
-
         if "rollWeight" in data:
-            lot_taka.roll_weight = Decimal(str(data["rollWeight"])) if data["rollWeight"] else None
-
+            lot_taka.roll_weight = D(str(data["rollWeight"])) if data["rollWeight"] not in (None, "") else None
         if "width" in data:
-            lot_taka.width = Decimal(str(data["width"])) if data["width"] else None
-
+            lot_taka.width = D(str(data["width"])) if data["width"] not in (None, "") else None
         if "gsm" in data:
-            lot_taka.gsm = Decimal(str(data["gsm"])) if data["gsm"] else None
-
-        if "rate" in data:
-            lot_taka.rate = Decimal(str(data["rate"] or "0"))
-
-        if "qcStatus" in data:
-            lot_taka.qc_status = data["qcStatus"]
-
-        if "status" in data:
-            lot_taka.status = data["status"]
-
+            lot_taka.gsm = D(str(data["gsm"])) if data["gsm"] not in (None, "") else None
         if "imageUrl" in data:
             lot_taka.image_url = data["imageUrl"]
-
+        lot_taka.updated_by = request.user
         lot_taka.save()
+
+        from apps.core.audit import record_audit
+
+        record_audit(
+            client=client_id, actor=request.user, action="update", entity_type="LotTaka",
+            entity_id=lot_taka.id, entity_label=lot_taka.taka_id, before=before,
+            after={"remarks": lot_taka.remarks, "rollWeight": str(lot_taka.roll_weight),
+                   "width": str(lot_taka.width), "gsm": str(lot_taka.gsm)},
+        )
         return Response({
             "success": True,
             "message": f"Lot {lot_taka.lot_number} / Taka {lot_taka.taka_number} updated successfully.",
@@ -4485,9 +4885,9 @@ class TakaTagPrintView(APIView):
 
         # Filter option lists
         supplier_names = list(Party.objects.filter(client_id=client_id, type__in=["Vendor", "Both"]).values_list("name", flat=True).order_by("name"))
-        quality_names = list(Item.objects.filter(client_id=client_id, fabric_quality__isnull=False).values_list("fabric_quality", flat=True).distinct().order_by("fabric_quality"))
-        design_names = ["Floral", "Check", "Plain", "Stripe", "Jacquard", "Dobby", "Printed"]
-        shade_names = ["Navy", "Blue", "Maroon", "White", "Black", "Green", "Grey", "Off-White", "Red"]
+        quality_names = list(FabricQuality.objects.filter(client_id=client_id, deleted_at__isnull=True).values_list("name", flat=True).order_by("name"))
+        design_names = list(Design.objects.filter(client_id=client_id, deleted_at__isnull=True).values_list("name", flat=True).order_by("name"))
+        shade_names = list(Shade.objects.filter(client_id=client_id, deleted_at__isnull=True).values_list("name", flat=True).order_by("name"))
         fabric_items = list(Item.objects.filter(client_id=client_id, fabric_quality__isnull=False).values("id", "sku", "name")[:50])
         if not fabric_items:
             fabric_items = list(Item.objects.filter(client_id=client_id).values("id", "sku", "name")[:50])
@@ -4543,29 +4943,29 @@ class TakaTagPrintView(APIView):
         records = []
         for lt in qs:
             it = lt.item
-            taka_id = lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}"
+            taka_id = lt.taka_id or lt.barcode
             records.append({
                 "id": str(lt.id),
                 "takaId": taka_id,
                 "lotNo": lt.lot_number,
                 "takaRoll": lt.taka_number,
                 "itemCode": it.sku if it else "-",
-                "itemName": it.name if it else "Fabric Item",
-                "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "-"),
-                "design": it.fabric_design if it and it.fabric_design else "Plain",
-                "shade": it.fabric_color if it and it.fabric_color else "Default",
+                "itemName": it.name if it else None,
+                "quality": (it.fabric_quality or it.name) if it else None,
+                "design": (it.fabric_design or None) if it else None,
+                "shade": (it.fabric_color or None) if it else None,
                 "supplier": lt.supplier.name if lt.supplier else (lt.source_document_number or "-"),
                 "supplierId": str(lt.supplier.id) if lt.supplier else "",
                 "receivedQty": float(lt.received_quantity),
                 "availableQty": float(lt.available_quantity),
-                "uom": lt.uom or (it.uom if it else "m"),
+                "uom": lt.uom or (it.uom if it else None),
                 "qcStatus": lt.qc_status,
                 "tagStatus": lt.tag_status or "Pending",
                 "barcode": lt.barcode or taka_id,
                 "printCount": lt.print_count or 0,
                 "lastPrintedAt": lt.last_printed_at.strftime("%d-%m-%Y %H:%M") if lt.last_printed_at else None,
                 "lastPrintedBy": getattr(lt.last_printed_by, "name", None) or getattr(lt.last_printed_by, "email", None) or None,
-                "location": lt.location.name if lt.location else "Main Godown",
+                "location": lt.location.name if lt.location else None,
                 "locationId": str(lt.location.id) if lt.location else "",
                 "receivedDate": lt.received_date.strftime("%d-%m-%Y"),
                 "grnNo": lt.source_document_number or "-",
@@ -4626,7 +5026,7 @@ class TakaTagPrintView(APIView):
 
         now = timezone.now()
         user = request.user if request.user.is_authenticated else None
-        user_name = getattr(user, "name", None) or getattr(user, "email", "Admin")
+        user_name = getattr(user, "name", None) or getattr(user, "email", None)
 
         for lt in takas:
             old_count = lt.print_count
@@ -4649,7 +5049,7 @@ class TakaTagPrintView(APIView):
                 printed_at=now,
                 printed_by=user,
                 printed_by_name=user_name,
-                taka_id=lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}",
+                taka_id=lt.taka_id or lt.barcode,
                 lot_number=lt.lot_number,
                 taka_number=lt.taka_number,
                 notes=notes,
@@ -4688,7 +5088,7 @@ class TakaTagScanView(APIView):
             }, status=status.HTTP_404_NOT_FOUND)
 
         it = lt.item
-        taka_id = lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}"
+        taka_id = lt.taka_id or lt.barcode
 
         taka_dict = {
             "found": True,
@@ -4697,21 +5097,21 @@ class TakaTagScanView(APIView):
             "lotNo": lt.lot_number,
             "takaRoll": lt.taka_number,
             "itemCode": it.sku if it else "-",
-            "itemName": it.name if it else "Fabric Item",
-            "quality": it.fabric_quality if it and it.fabric_quality else (it.name if it else "-"),
-            "design": it.fabric_design if it and it.fabric_design else "Plain",
-            "shade": it.fabric_color if it and it.fabric_color else "Default",
+            "itemName": it.name if it else None,
+            "quality": (it.fabric_quality or it.name) if it else None,
+            "design": (it.fabric_design or None) if it else None,
+            "shade": (it.fabric_color or None) if it else None,
             "supplier": lt.supplier.name if lt.supplier else (lt.source_document_number or "-"),
             "supplierId": str(lt.supplier.id) if lt.supplier else "",
             "receivedQty": float(lt.received_quantity),
             "availableQty": float(lt.available_quantity),
-            "uom": lt.uom or (it.uom if it else "m"),
+            "uom": lt.uom or (it.uom if it else None),
             "qcStatus": lt.qc_status,
             "tagStatus": lt.tag_status or "Pending",
             "barcode": lt.barcode or taka_id,
             "printCount": lt.print_count or 0,
             "lastPrintedAt": lt.last_printed_at.strftime("%d-%m-%Y %H:%M") if lt.last_printed_at else None,
-            "location": lt.location.name if lt.location else "Main Godown",
+            "location": lt.location.name if lt.location else None,
             "locationId": str(lt.location.id) if lt.location else "",
             "receivedDate": lt.received_date.strftime("%d-%m-%Y"),
             "grnNo": lt.source_document_number or "-",
@@ -4761,7 +5161,7 @@ class TakaTagHistoryView(APIView):
                 "id": str(log.id),
                 "actionType": log.action_type,
                 "printedAt": log.printed_at.strftime("%d-%m-%Y %H:%M:%S"),
-                "printedBy": log.printed_by_name or (log.printed_by.name if log.printed_by else "Admin"),
+                "printedBy": log.printed_by_name or (log.printed_by.name if log.printed_by else None),
                 "takaId": log.taka_id,
                 "lotNo": log.lot_number,
                 "takaRoll": log.taka_number,
@@ -4770,7 +5170,7 @@ class TakaTagHistoryView(APIView):
             for log in logs
         ]
         return Response({
-            "takaId": lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}",
+            "takaId": lt.taka_id or lt.barcode,
             "lotNo": lt.lot_number,
             "takaRoll": lt.taka_number,
             "printCount": lt.print_count,
@@ -4828,16 +5228,16 @@ class TakaTagPdfView(APIView):
 
         for lt in takas:
             it = lt.item
-            taka_id = lt.taka_id or f"TAK-{str(lt.id)[:6].upper()}"
+            taka_id = lt.taka_id or lt.barcode
             item_code = it.sku if it else "-"
-            item_name = it.name if it else "Fabric"
-            quality = it.fabric_quality if it and it.fabric_quality else (it.name if it else "-")
-            design = it.fabric_design if it and it.fabric_design else "Plain"
-            shade = it.fabric_color if it and it.fabric_color else "Default"
+            item_name = it.name if it else "-"
+            quality = (it.fabric_quality or it.name) if it else "-"
+            design = (it.fabric_design or "-") if it else "-"
+            shade = (it.fabric_color or "-") if it else "-"
             supplier = lt.supplier.name if lt.supplier else (lt.source_document_number or "-")
             grn_no = lt.source_document_number or "-"
-            qty_str = f"{float(lt.received_quantity):.2f} {lt.uom or 'm'}"
-            qc_st = lt.qc_status or "Passed"
+            qty_str = f"{float(lt.received_quantity):.2f} {lt.uom or (it.uom if it else '')}"
+            qc_st = lt.qc_status or "-"
 
             # Top Header: OSCAR TEXTILE ERP | QC Status
             pdf.setFont("Helvetica-Bold", 7.5)
@@ -4851,14 +5251,14 @@ class TakaTagPdfView(APIView):
 
             # Code 128 Barcode
             try:
-                bc = code128.Code128(taka_id, barHeight=7.5 * mm, barWidth=0.25 * mm, humanReadable=False)
+                bc = code128.Code128(taka_id or f"{lt.lot_number}-{lt.taka_number}", barHeight=7.5 * mm, barWidth=0.25 * mm, humanReadable=False)
                 bc.drawOn(pdf, 3.5 * mm, 26 * mm)
             except Exception:
                 pass
 
             # Human readable Taka ID
             pdf.setFont("Helvetica-Bold", 7.5)
-            pdf.drawCentredString(30 * mm, 22.5 * mm, taka_id)
+            pdf.drawCentredString(30 * mm, 22.5 * mm, taka_id or '-')
 
             # Details
             pdf.setFont("Helvetica-Bold", 5.5)
@@ -4891,6 +5291,407 @@ class TakaTagPdfView(APIView):
         response = HttpResponse(buffer.getvalue(), content_type="application/pdf")
         response["Content-Disposition"] = 'inline; filename="taka_tags.pdf"'
         return response
+
+
+class LotTraceabilityView(APIView):
+    """
+    GET /inventory/traceability/?target=<lot_or_taka>
+    GET /inventory/lots/<lot_id>/traceability/
+    Complete traceability tree, movements, job work and QC history (PDF §07, §08, Phase 2.3).
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request, lot_id=None):
+        target = lot_id or request.query_params.get("target") or request.query_params.get("lotNo") or request.query_params.get("takaId")
+        if not target:
+            return Response({"error": "Target lot number or taka ID required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        lineage = stock.trace_lot_lineage(request.client_id, target)
+        if lineage is None:
+            return Response({"error": f"Lot/Taka '{target}' not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(lineage)
+
+
+class StockAgeingView(APIView):
+    """
+    GET /inventory/stock/ageing/
+    Real ageing breakdown into buckets (0-30, 31-60, 61-90, 91-180, 180+) computed
+    from received_date of each LotTaka (PDF §07, Phase 2.3).
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request):
+        loc_id = request.query_params.get("locationId")
+        item_id = request.query_params.get("itemId")
+        data = stock.get_stock_ageing(request.client_id, location_id=loc_id, item_id=item_id)
+        return Response(data)
+
+
+class SlowMovingStockView(APIView):
+    """
+    GET /inventory/stock/slow-moving/
+    List takas held longer than threshold days with zero recent movements (Phase 2.3).
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request):
+        threshold = int(request.query_params.get("thresholdDays") or 60)
+        data = stock.get_slow_moving_stock(request.client_id, threshold_days=threshold)
+        return Response(data)
+
+
+class QCInspectionViewSet(TenantModelViewSet):
+    """Piece-by-piece fabric inspection register (PDF §08, Phase 2.6).
+
+    Calculates 4-point penalty score per roll, assigns grade (A, B, C, Second Quality),
+    logs defects against DefectMaster, and posts real stock movements upon disposition.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+    permission_map = {
+        "write": ["manage_inventory"],
+        "approve": ["approve_qc"],
+        "dispose": ["approve_qc"],
+    }
+    queryset = QCInspection.objects.prefetch_related(
+        "lines__defects__defect", "lines__lot_taka"
+    )
+    serializer_class = QCInspectionSerializer
+    audit_entity_type = "QCInspection"
+    audit_label_field = "inspection_number"
+    status_field = "status"
+    default_date_field = "inspection_date"
+    search_fields = ["inspection_number", "source_document_number"]
+    ordering = ["-inspection_date", "-created_at"]
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        lines_data = serializer.validated_data.pop("lines", [])
+        serializer.validated_data["inspection_number"] = allocate_number(
+            self.request.user.client, "QC", serializer.validated_data.get("inspection_date")
+        )
+        if not serializer.validated_data.get("inspector") and not serializer.validated_data.get("inspector_employee"):
+            serializer.validated_data["inspector"] = self.request.user
+
+        inspection = super().perform_create(serializer)
+        self._save_lines(inspection, lines_data)
+        self._recompute_totals(inspection)
+        return inspection
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        lines_data = serializer.validated_data.pop("lines", None)
+        inspection = super().perform_update(serializer)
+        if lines_data is not None:
+            for line in inspection.lines.all():
+                line.defects.all().delete()
+                line.delete()
+            self._save_lines(inspection, lines_data)
+            self._recompute_totals(inspection)
+        return inspection
+
+    def _save_lines(self, inspection, lines_data):
+        for line_d in lines_data:
+            line_dict = dict(line_d)
+            defects_data = line_dict.pop("defects", [])
+            lot_taka = line_dict.get("lot_taka")
+
+            actual_meter = D(line_dict.get("actual_meter") or (lot_taka.available_quantity if lot_taka else 0) or 0)
+            line_dict["actual_meter"] = actual_meter
+
+            width = D(line_dict.get("width") or (lot_taka.width if lot_taka else 0) or 44)
+            line_dict["width"] = width
+
+            total_points = sum(int(d.get("points") or 1) * int(d.get("defect_count") or 1) for d in defects_data)
+            line_dict["penalty_points"] = total_points
+
+            width_meters = width * Decimal("0.0254")
+            area = actual_meter * width_meters
+            if area > ZERO:
+                pts_100m = round2((Decimal(total_points) * Decimal("100")) / area)
+            else:
+                pts_100m = Decimal("0.00")
+            line_dict["points_per_100_sq_meter"] = pts_100m
+
+            if not line_dict.get("grade"):
+                if pts_100m <= Decimal("20.0"):
+                    line_dict["grade"] = "A"
+                elif pts_100m <= Decimal("28.0"):
+                    line_dict["grade"] = "B"
+                elif pts_100m <= Decimal("40.0"):
+                    line_dict["grade"] = "C"
+                else:
+                    line_dict["grade"] = "Second Quality"
+
+            if not line_dict.get("disposition") or line_dict.get("disposition") == "Pass":
+                if line_dict["grade"] in ("A", "B"):
+                    line_dict["disposition"] = "Pass"
+                elif line_dict["grade"] == "C":
+                    line_dict["disposition"] = "Second Quality"
+                else:
+                    line_dict["disposition"] = "Reject"
+
+            line_obj = QCInspectionLine.objects.create(
+                client_id=inspection.client_id,
+                inspection=inspection,
+                **line_dict,
+            )
+
+            for def_d in defects_data:
+                QCInspectionLineDefect.objects.create(
+                    client_id=inspection.client_id,
+                    inspection_line=line_obj,
+                    **def_d,
+                )
+
+    def _recompute_totals(self, inspection):
+        lines = list(inspection.lines.all())
+        inspection.total_inspected_qty = sum((l.actual_meter or ZERO for l in lines), ZERO)
+        inspection.passed_qty = sum((l.actual_meter or ZERO for l in lines if l.disposition == "Pass"), ZERO)
+        inspection.second_quality_qty = sum((l.actual_meter or ZERO for l in lines if l.disposition == "Second Quality"), ZERO)
+        inspection.reprocess_qty = sum((l.actual_meter or ZERO for l in lines if l.disposition == "Reprocess"), ZERO)
+        inspection.rejected_qty = sum((l.actual_meter or ZERO for l in lines if l.disposition == "Reject"), ZERO)
+        inspection.hold_qty = sum((l.actual_meter or ZERO for l in lines if l.disposition == "Hold"), ZERO)
+        inspection.save(update_fields=[
+            "total_inspected_qty", "passed_qty", "second_quality_qty",
+            "reprocess_qty", "rejected_qty", "hold_qty", "updated_at",
+        ])
+
+    @action(detail=True, methods=["post"], url_path="approve")
+    @transaction.atomic
+    def approve(self, request, pk=None):
+        inspection = self.get_object()
+        if inspection.status in ("Approved", "Completed"):
+            raise Conflict("Inspection is already approved.", code="ALREADY_APPROVED")
+
+        lines = list(inspection.lines.select_related("lot_taka", "lot_taka__location", "lot_taka__item"))
+        qc_loc = Location.objects.filter(client_id=inspection.client_id, code="SYS-QC-HOLD").first()
+
+        for line in lines:
+            lt = line.lot_taka
+            if not lt:
+                continue
+
+            disp = line.disposition
+            m = line.actual_meter or lt.available_quantity or ZERO
+            if m <= ZERO:
+                continue
+
+            target_loc = None
+            mov_type = None
+
+            status_val = "Available"
+            qc_status_val = "Pass"
+
+            if disp == "Pass":
+                status_val = "Finished" if lt.item and getattr(lt.item, "fabric_stage", "") == "Finished" else "Available"
+                qc_status_val = "Pass"
+                mov_type = "QC_PASS"
+                target_loc = Location.objects.filter(client_id=inspection.client_id, code="WH-MAIN").first() or Location.objects.filter(client_id=inspection.client_id, is_active=True).exclude(code__startswith="SYS-").first()
+            elif disp == "Second Quality":
+                status_val = "Second Quality"
+                qc_status_val = "Second Quality"
+                mov_type = "QC_SECOND_QUALITY"
+                target_loc = stock.resolve_system_location(inspection.client_id, "SECOND_QUALITY")
+            elif disp == "Reprocess":
+                status_val = "Reprocess"
+                qc_status_val = "Reprocess"
+                mov_type = "QC_REPROCESS"
+                target_loc = stock.resolve_system_location(inspection.client_id, "REPROCESS")
+            elif disp == "Reject":
+                status_val = "Reject"
+                qc_status_val = "Reject"
+                mov_type = "QC_REJECT"
+                target_loc = stock.resolve_system_location(inspection.client_id, "REJECT")
+            else:  # Hold
+                status_val = "QC Hold"
+                qc_status_val = "Hold"
+                target_loc = lt.location
+
+            if mov_type and target_loc and str(lt.location_id) != str(target_loc.id):
+                stock.relocate_lot(
+                    client_id=inspection.client_id,
+                    lot=lt,
+                    quantity=m,
+                    to_location_id=target_loc.id,
+                    out_type=mov_type,
+                    in_type=mov_type,
+                    reference_type="QCInspection",
+                    reference_id=inspection.id,
+                    reference_number=inspection.inspection_number,
+                    user=request.user,
+                )
+
+            lt.refresh_from_db()
+            lt.status = status_val
+            lt.qc_status = qc_status_val
+            lt.save(update_fields=["status", "qc_status", "updated_at"])
+
+        inspection.status = "Approved"
+        inspection.inspector = request.user
+        inspection.save(update_fields=["status", "inspector", "updated_at"])
+        return Response(self.get_serializer(inspection).data)
+
+
+class LotCostEntryViewSet(TenantModelViewSet):
+    queryset = LotCostEntry.objects.select_related("lot_taka")
+    serializer_class = LotCostEntrySerializer
+    required_permissions = ["view_inventory"]
+    audit_entity_type = "LotCostEntry"
+    filter_map = {
+        "lotNumber": "lot_number",
+        "costType": "cost_type",
+        "isApproved": "is_approved",
+    }
+
+    def perform_create(self, serializer):
+        entry = costing_services.post_lot_cost(
+            client_id=self.request.client_id,
+            lot_number=serializer.validated_data.get("lot_number"),
+            cost_type=serializer.validated_data.get("cost_type"),
+            amount=serializer.validated_data.get("amount"),
+            quantity=serializer.validated_data.get("quantity", 0),
+            source_document_type=serializer.validated_data.get("source_document_type", "MANUAL"),
+            source_document_number=serializer.validated_data.get("source_document_number"),
+            lot_taka=serializer.validated_data.get("lot_taka"),
+            user=self.request.user,
+            is_approved=serializer.validated_data.get("is_approved", True),
+            remarks=serializer.validated_data.get("remarks"),
+        )
+        serializer.instance = entry
+
+    @action(detail=False, methods=["get"], url_path="landed-cost")
+    def landed_cost(self, request):
+        lot_number = request.query_params.get("lotNumber") or request.query_params.get("lot_number")
+        if not lot_number:
+            raise ValidationFailed("lotNumber query parameter is required.")
+        return Response(costing_services.get_lot_landed_cost(request.client_id, lot_number))
+
+    @action(detail=False, methods=["get"], url_path="profitability")
+    def profitability(self, request):
+        lot_number = request.query_params.get("lotNumber") or request.query_params.get("lot_number")
+        date_from = request.query_params.get("dateFrom") or request.query_params.get("date_from")
+        date_to = request.query_params.get("dateTo") or request.query_params.get("date_to")
+        report = costing_services.get_lot_profitability_report(
+            request.client_id, lot_number=lot_number, date_from=date_from, date_to=date_to
+        )
+        return Response(report)
+
+
+class SampleViewSet(TenantModelViewSet):
+    queryset = Sample.objects.select_related(
+        "party", "salesperson", "broker", "source_lot_taka", "fabric_quality", "design", "shade"
+    )
+    serializer_class = SampleSerializer
+    required_permissions = ["view_inventory"]
+    audit_entity_type = "Sample"
+    audit_label_field = "sample_number"
+    filter_map = {
+        "partyId": "party_id",
+        "salespersonId": "salesperson_id",
+        "brokerId": "broker_id",
+        "status": "status",
+        "isReturnable": "is_returnable",
+    }
+
+    def create(self, request, *args, **kwargs):
+        data = request.data
+        sample = sampling_services.issue_sample(
+            client_id=request.client_id,
+            party_id=data.get("partyId") or data.get("party_id"),
+            salesperson_id=data.get("salespersonId") or data.get("salesperson_id"),
+            broker_id=data.get("brokerId") or data.get("broker_id"),
+            source_lot_taka_id=data.get("sourceLotTakaId") or data.get("source_lot_taka_id"),
+            fabric_quality_id=data.get("fabricQualityId") or data.get("fabric_quality_id"),
+            design_id=data.get("designId") or data.get("design_id"),
+            shade_id=data.get("shadeId") or data.get("shade_id"),
+            sample_type=data.get("sampleType") or data.get("sample_type", "CUT_PIECE"),
+            quantity=data.get("quantity", 1),
+            uom=data.get("uom", "MTR"),
+            is_returnable=data.get("isReturnable", True) if "isReturnable" in data else data.get("is_returnable", True),
+            due_date=data.get("dueDate") or data.get("due_date"),
+            remarks=data.get("remarks"),
+            user=request.user,
+        )
+        return Response(self.get_serializer(sample).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="return-sample")
+    def return_sample_action(self, request, pk=None):
+        sample = self.get_object()
+        return_qty = request.data.get("returnQuantity") or request.data.get("quantity") or request.data.get("return_quantity")
+        condition = request.data.get("condition", "Good")
+        remarks = request.data.get("remarks")
+        sample = sampling_services.return_sample(
+            sample, return_qty, condition=condition, user=request.user, remarks=remarks
+        )
+        return Response(self.get_serializer(sample).data)
+
+    @action(detail=True, methods=["post"], url_path="consume-sample")
+    def consume_sample_action(self, request, pk=None):
+        sample = self.get_object()
+        consume_qty = request.data.get("consumeQuantity") or request.data.get("consume_quantity")
+        remarks = request.data.get("remarks")
+        sample = sampling_services.consume_sample(
+            sample, consume_qty, user=request.user, remarks=remarks
+        )
+        return Response(self.get_serializer(sample).data)
+
+    @action(detail=False, methods=["get"], url_path="dashboard")
+    def dashboard(self, request):
+        return Response(sampling_services.get_sample_expense_dashboard(request.client_id))
+
+
+class TripViewSet(TenantModelViewSet):
+    queryset = Trip.objects.select_related("transporter", "transporter_party").prefetch_related("materials")
+    serializer_class = TripSerializer
+    required_permissions = ["view_inventory"]
+    audit_entity_type = "Trip"
+    audit_label_field = "trip_number"
+    filter_map = {
+        "status": "status",
+        "tripType": "trip_type",
+        "transporterId": "transporter_id",
+        "vehicleNumber": "vehicle_number",
+    }
+
+    def create(self, request, *args, **kwargs):
+        data = request.data
+        trip = logistics_services.create_trip(
+            client_id=request.client_id,
+            from_location=data.get("fromLocation") or data.get("from_location"),
+            to_location=data.get("toLocation") or data.get("to_location"),
+            vehicle_number=data.get("vehicleNumber") or data.get("vehicle_number"),
+            trip_date=data.get("tripDate") or data.get("trip_date"),
+            transporter_id=data.get("transporterId") or data.get("transporter_id"),
+            transporter_party_id=data.get("transporterPartyId") or data.get("transporter_party_id"),
+            driver_name=data.get("driverName") or data.get("driver_name"),
+            driver_mobile=data.get("driverMobile") or data.get("driver_mobile"),
+            lr_number=data.get("lrNumber") or data.get("lr_number"),
+            lr_date=data.get("lrDate") or data.get("lr_date"),
+            trip_type=data.get("tripType") or data.get("trip_type", "OUTWARD"),
+            freight_amount=data.get("freightAmount") or data.get("freight_amount", 0),
+            loading_charges=data.get("loadingCharges") or data.get("loading_charges", 0),
+            unloading_charges=data.get("unloadingCharges") or data.get("unloading_charges", 0),
+            other_charges=data.get("otherCharges") or data.get("other_charges", 0),
+            paid_by=data.get("paidBy") or data.get("paid_by", "Company"),
+            cost_allocation_target=data.get("costAllocationTarget") or data.get("cost_allocation_target", "LOT"),
+            material_lines=data.get("materials", []),
+            remarks=data.get("remarks"),
+            user=request.user,
+        )
+        return Response(self.get_serializer(trip).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="allocate-freight")
+    def allocate_freight(self, request, pk=None):
+        trip = self.get_object()
+        trip = logistics_services.allocate_trip_freight(trip, user=request.user)
+        return Response(self.get_serializer(trip).data)
+
+
 
 
 

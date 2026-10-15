@@ -26,8 +26,10 @@ from apps.core.viewsets import TenantModelViewSet
 from apps.inventory import services as stock
 from apps.masters import uom
 
-from . import services
+from . import broker_services, services
 from .models import (
+    BrokerCommission,
+    CHALLAN_BILLABLE_STATUSES,
     DeliveryChallan,
     DeliveryChallanLine,
     PaymentAllocation,
@@ -47,6 +49,7 @@ from .models import (
 )
 from .serializers import (
     AllocateSerializer,
+    BrokerCommissionSerializer,
     ConvertLinesSerializer,
     DeliveryChallanSerializer,
     InvoiceOutstandingSerializer,
@@ -529,6 +532,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         serializer.validated_data["order_number"] = allocate_number(
             self.request.user.client, "SO", serializer.validated_data.get("doc_date")
         )
+        serializer.validated_data.setdefault("stage", "Confirmed")
         return super().perform_create(serializer)
 
     def perform_update(self, serializer):
@@ -548,6 +552,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 user=self.request.user,
                 override=bool(self.request.data.get("overrideCreditLimit")),
             )
+            services.reserve_order_takas(order)
         return order
 
     def check_draft_only(self, instance, verb):
@@ -582,10 +587,14 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         order.cancelled_by = request.user
         order.cancellation_reason = reason
         order.save()
-        # Moving to Cancelled takes the lines out of the reservation query,
-        # which is what "releases the reservation" means here.
+        services.release_order_takas(order)
         self.write_audit("cancel", order, description=reason)
         return Response(self.get_serializer(order).data)
+
+    @action(detail=True, methods=["get"], url_path="picking-list")
+    def picking_list(self, request, pk=None):
+        """Return picking list with reserved takas, locations, barcodes, meters (PDF §11)."""
+        return Response(services.get_picking_list(self.get_object()))
 
     @action(detail=True, methods=["get"])
     def fulfilment(self, request, pk=None):
@@ -615,29 +624,55 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         requested = {
             str(row.get("lineId") or row.get("line_id")): row for row in data.get("lines") or []
         }
-        source_lines = list(order.line_items.filter(deleted_at__isnull=True).order_by("line_no"))
+        source_lines = list(
+            order.line_items.filter(deleted_at__isnull=True)
+            .select_related("item")
+            .order_by("line_no")
+        )
 
         selected = []
+        awaiting_dispatch = []
         for line in source_lines:
             row = requested.get(str(line.id))
             if requested and row is None:
                 continue
-            already = line.dispatched_qty if target == "challan" else line.invoiced_qty
-            remaining = D(line.qty) - D(already)
+            if target == "challan":
+                remaining = D(line.qty) - D(line.dispatched_qty)
+            elif line.item_id is not None and line.item.holds_stock:
+                # Stock lines are invoiced from what actually left the
+                # warehouse: dispatched minus already invoiced.
+                remaining = D(line.dispatched_qty) - D(line.invoiced_qty)
+                if D(line.qty) - D(line.dispatched_qty) > ZERO:
+                    awaiting_dispatch.append(line)
+            else:
+                # Non-stock lines (services, charges) never pass a challan.
+                remaining = D(line.qty) - D(line.invoiced_qty)
+            remaining = remaining if remaining > ZERO else ZERO
             qty = D(row.get("qty")) if row and row.get("qty") is not None else remaining
             if qty <= ZERO:
                 continue
             if qty > remaining + Decimal("0.0001"):
                 code = Codes.OVER_DISPATCH if target == "challan" else Codes.OVER_INVOICE
+                verb = "dispatch" if target == "challan" else "invoice (dispatched, not yet invoiced)"
                 raise BusinessRuleViolation(
-                    f"{line.item_name}: only {round4(remaining)} left to "
-                    f"{'dispatch' if target == 'challan' else 'invoice'}.",
+                    f"{line.item_name}: only {round4(remaining)} left to {verb}.",
                     code=code,
                     payload={"lineId": str(line.id), "remaining": str(round4(remaining))},
                 )
-            selected.append((line, qty, (row or {}).get("serials") or []))
+            selected.append((
+                line, qty, (row or {}).get("serials") or [],
+                (row or {}).get("takaAllocations") or (row or {}).get("taka_allocations")
+                or (row or {}).get("takas") or [],
+            ))
 
         if not selected:
+            if target == "invoice" and awaiting_dispatch:
+                raise BusinessRuleViolation(
+                    "Nothing has been dispatched yet that is not already invoiced. "
+                    "Dispatch the goods on a delivery challan first.",
+                    code="NOT_DISPATCHED",
+                    payload={"lineIds": [str(line.id) for line in awaiting_dispatch]},
+                )
             raise ValidationFailed(
                 "Nothing left to convert on this order.",
                 field_errors={"lines": ["Every line is already fully converted."]},
@@ -686,7 +721,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
             "delivery_challan_lines" if target == "challan" else "sales_invoice_lines"
         )
 
-        for index, (source, qty, serials) in enumerate(selected, start=1):
+        for index, (source, qty, serials, takas) in enumerate(selected, start=1):
             new_line = line_model.objects.create(
                 client_id=order.client_id,
                 **{line_fk: document},
@@ -706,6 +741,11 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 is_bom_generated=source.is_bom_generated,
                 bom_source_item_id=source.bom_source_item_id,
                 parent_sku=source.parent_sku,
+                taka_allocations=[
+                    {"lotTakaId": str(t.get("lotTakaId") or t.get("lot_taka_id")),
+                     "qty": str(t.get("qty"))}
+                    for t in takas if (t.get("lotTakaId") or t.get("lot_taka_id"))
+                ],
             )
             if serials:
                 resolved = stock.resolve_serials(order.client_id, source.item_id, serials)
@@ -780,6 +820,47 @@ class ProformaInvoiceViewSet(SalesDocumentViewSet):
         proforma = self.get_object()
         if proforma.status == "Converted":
             raise Conflict("This proforma is already converted.", code=Codes.ALREADY_DONE)
+        if proforma.status in ("Cancelled", "Expired"):
+            raise Conflict(
+                f"A {proforma.status.lower()} proforma cannot be invoiced.",
+                code=Codes.ALREADY_CANCELLED,
+            )
+
+        # A proforma raised against an order bills the order's lines, so the
+        # same dispatch rule applies: stock lines are invoiced only from what
+        # has been dispatched and not yet invoiced (no double depletion).
+        order_line_for = {}
+        if proforma.sales_order_id:
+            order_lines = list(
+                SalesOrderLine.objects.filter(
+                    sales_order_id=proforma.sales_order_id, deleted_at__isnull=True
+                )
+            )
+            for line in proforma.line_items.filter(deleted_at__isnull=True).select_related(
+                "item", "sales_order_line"
+            ):
+                # Lines carry their order line when the proforma was built
+                # from the order; otherwise match on the item.
+                order_line = next(
+                    (ol for ol in order_lines if ol.id == line.sales_order_line_id), None
+                ) or next(
+                    (ol for ol in order_lines if line.item_id and ol.item_id == line.item_id),
+                    None,
+                )
+                if order_line is None:
+                    continue
+                order_line_for[line.id] = order_line.id
+                if line.item_id is None or not line.item.holds_stock:
+                    continue
+                billable = D(order_line.dispatched_qty) - D(order_line.invoiced_qty)
+                wanted = uom.between_lines(line.qty, line, order_line)
+                if wanted > billable + Decimal("0.0001"):
+                    raise BusinessRuleViolation(
+                        f"{line.item_name}: only {round4(max(billable, ZERO))} has been "
+                        "dispatched and not yet invoiced. Dispatch the goods first.",
+                        code="NOT_DISPATCHED",
+                        payload={"lineId": str(line.id), "billable": str(round4(max(billable, ZERO)))},
+                    )
 
         invoice = _clone_document(
             proforma,
@@ -793,6 +874,7 @@ class ProformaInvoiceViewSet(SalesDocumentViewSet):
             series="INV",
             line_model_name="SalesInvoiceLine",
             line_fk="sales_invoice",
+            line_overrides=lambda line: {"sales_order_line_id": order_line_for.get(line.id)},
         )
         # The number is allocated for real at finalization; a draft keeps none.
         invoice.invoice_number = None
@@ -867,6 +949,31 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
         challan = self.get_object()
         if challan.status == "Cancelled":
             raise Conflict("This challan is cancelled.", code=Codes.ALREADY_CANCELLED)
+        # Any post-dispatch status (Dispatched / In Transit / Delivered) can be
+        # billed, but only once the stock has actually been posted.
+        if challan.status not in CHALLAN_BILLABLE_STATUSES or challan.posted_at is None:
+            raise BusinessRuleViolation(
+                "Only dispatched delivery challans can be converted to an invoice.",
+                code="NOT_DISPATCHED",
+                detail=f"This challan is {challan.status}. Dispatch it first.",
+            )
+
+        existing_invoice = (
+            SalesInvoice.objects.filter(
+                Q(delivery_challan=challan)
+                | Q(line_items__delivery_challan_line__delivery_challan=challan),
+                client_id=challan.client_id,
+                deleted_at__isnull=True,
+            )
+            .exclude(status="Cancelled")
+            .distinct()
+            .first()
+        )
+        if existing_invoice:
+            raise Conflict(
+                f"An invoice ({existing_invoice.invoice_number or existing_invoice.id}) already exists for this challan.",
+                code=Codes.OVER_INVOICE,
+            )
 
         invoice = SalesInvoice.objects.create(
             client_id=challan.client_id,
@@ -1219,6 +1326,12 @@ class SalesReturnViewSet(SalesDocumentViewSet):
             "sales_invoice_line", "item"
         ).all():
             invoice_line = line.sales_invoice_line
+            if invoice_line.sales_invoice_id != invoice.id:
+                raise ValidationFailed(
+                    f"{line.item_name}: the returned line is not on invoice "
+                    f"{invoice.invoice_number}.",
+                    field_errors={"salesInvoiceLineId": ["Must be a line of this invoice."]},
+                )
             remaining = D(invoice_line.qty) - D(invoice_line.returned_qty)
             if D(line.returned_qty) > remaining + Decimal("0.0001"):
                 raise BusinessRuleViolation(
@@ -1249,11 +1362,17 @@ class SalesReturnViewSet(SalesDocumentViewSet):
             invoice_line.save(update_fields=["returned_qty", "updated_at"])
 
             if line.item_id and line.item.holds_stock and location_id:
-                movement = stock.post_movement(
+                # Phase 1.4: route by condition (Good -> return location,
+                # Hold -> QC Hold, Reprocess / Second Quality / Reject -> their
+                # system locations), taka by taka when a taka is named.
+                condition = stock.normalize_condition(line.condition or "Hold")
+                destination = stock.condition_location_id(
+                    sales_return.client_id, condition, location_id
+                )
+                _, lot_qc_status = stock.CONDITION_ROUTING[condition]
+                movement_kwargs = dict(
                     client_id=sales_return.client_id,
-                    item=line.item_id,
-                    location=location_id,
-                    type="SALES_RETURN",
+                    type="SALES_RETURN_" + condition.upper().replace(" ", "_"),
                     # returned_qty is counted in the invoice line's unit.
                     quantity=uom.to_stock_qty(line.returned_qty, invoice_line.uom_factor),
                     unit_cost=line.item.cost_price,
@@ -1263,6 +1382,15 @@ class SalesReturnViewSet(SalesDocumentViewSet):
                     movement_date=sales_return.doc_date,
                     user=self.request.user,
                 )
+                if line.lot_taka_id:
+                    _, movement = stock.receive_into_lot(
+                        lot=line.lot_taka_id, location_id=destination,
+                        qc_status=lot_qc_status, split_suffix="RET", **movement_kwargs,
+                    )
+                else:
+                    movement = stock.post_movement(
+                        item=line.item_id, location=destination, **movement_kwargs,
+                    )
                 if serial_numbers:
                     resolved = stock.resolve_serials(
                         sales_return.client_id, line.item_id, serial_numbers,
@@ -1275,6 +1403,17 @@ class SalesReturnViewSet(SalesDocumentViewSet):
             sales_return.journal_entry = entry
             sales_return.save(update_fields=["journal_entry", "updated_at"])
         services.refresh_invoice_payment_status(invoice)
+
+        # Auto reverse/adjust incentive and brokerage (PDF §11, §12)
+        from apps.pms.production_services import reverse_incentives_for_invoice
+        from apps.sales.broker_services import reverse_broker_commission_for_invoice
+
+        reverse_incentives_for_invoice(
+            invoice, user=self.request.user, reason=f"Sales Return {sales_return.return_number}"
+        )
+        reverse_broker_commission_for_invoice(
+            invoice, user=self.request.user, reason=f"Sales Return {sales_return.return_number}"
+        )
 
     @action(detail=True, methods=["post"])
     @transaction.atomic
@@ -1391,3 +1530,135 @@ class WarrantyCardViewSet(TenantModelViewSet):
                 card, self.get_serializer_class(), request=request, title="Warranty Card"
             )
         )
+
+
+class BrokerCommissionViewSet(TenantModelViewSet):
+    queryset = BrokerCommission.objects.select_related("broker", "invoice", "party", "salesperson")
+    serializer_class = BrokerCommissionSerializer
+    required_permissions = ["view_sales"]
+    audit_entity_type = "BrokerCommission"
+    audit_label_field = "commission_number"
+    filter_map = {
+        "brokerId": "broker_id",
+        "invoiceId": "invoice_id",
+        "status": "status",
+    }
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        comm = self.get_object()
+        comm = broker_services.approve_broker_commission(comm, user=request.user)
+        return Response(self.get_serializer(comm).data)
+
+    @action(detail=True, methods=["post"], url_path="make-payable")
+    def make_payable(self, request, pk=None):
+        comm = self.get_object()
+        comm = broker_services.make_broker_payable(comm, user=request.user)
+        return Response(self.get_serializer(comm).data)
+
+    @action(detail=True, methods=["post"])
+    def pay(self, request, pk=None):
+        comm = self.get_object()
+        amount = request.data.get("amount")
+        payment_ref = request.data.get("paymentReference") or request.data.get("payment_reference")
+        comm = broker_services.pay_broker_commission(
+            comm, amount=amount, payment_ref=payment_ref, user=request.user
+        )
+        return Response(self.get_serializer(comm).data)
+
+    @action(detail=False, methods=["get"], url_path="statement")
+    def statement(self, request):
+        broker_id = request.query_params.get("brokerId") or request.query_params.get("broker_id")
+        if not broker_id:
+            raise ValidationFailed("brokerId query parameter is required.")
+        commissions = self.get_queryset().filter(broker_id=broker_id)
+        total_accrued = commissions.aggregate(val=Sum("commission_amount"))["val"] or ZERO
+        total_paid = commissions.aggregate(val=Sum("paid_amount"))["val"] or ZERO
+        pending_balance = round2(D(total_accrued) - D(total_paid))
+        return Response({
+            "brokerId": str(broker_id),
+            "totalAccrued": str(round2(total_accrued)),
+            "totalPaid": str(round2(total_paid)),
+            "pendingBalance": str(pending_balance),
+            "commissions": self.get_serializer(commissions, many=True).data,
+        })
+
+
+class PartyDiscountViewSet(TenantModelViewSet):
+    """Transaction-wise discount register and annual party-wise discount report (PDF §12)."""
+
+    queryset = SalesInvoice.objects.select_related("party", "salesperson_fk", "broker_fk").filter(
+        total_discount__gt=0
+    ).exclude(status="Cancelled")
+    serializer_class = SalesInvoiceSerializer
+    required_permissions = ["view_sales"]
+
+    def list(self, request, *args, **kwargs):
+        qs = self.get_queryset()
+        party_id = request.query_params.get("partyId") or request.query_params.get("party_id")
+        if party_id:
+            qs = qs.filter(party_id=party_id)
+        year = request.query_params.get("year")
+        if year:
+            qs = qs.filter(doc_date__year=int(year))
+
+        records = []
+        for inv in qs.order_by("-doc_date")[:200]:
+            sub = D(inv.subtotal) if inv.subtotal else ZERO
+            disc = D(inv.total_discount) if inv.total_discount else ZERO
+            pct = round2((disc / sub) * 100) if sub > ZERO else ZERO
+            records.append({
+                "invoiceId": str(inv.id),
+                "invoiceNumber": inv.invoice_number,
+                "date": inv.doc_date.isoformat(),
+                "partyId": str(inv.party_id),
+                "partyName": inv.party_name or (inv.party.name if inv.party else ""),
+                "salesperson": inv.salesperson or (inv.salesperson_fk.name if inv.salesperson_fk else ""),
+                "broker": inv.broker or (inv.broker_fk.name if inv.broker_fk else ""),
+                "subtotal": str(round2(sub)),
+                "totalDiscount": str(round2(disc)),
+                "discountPct": str(pct),
+                "total": str(round2(inv.total)),
+            })
+        return Response(records)
+
+    @action(detail=False, methods=["get"], url_path="annual-report")
+    def annual_report(self, request):
+        year = int(request.query_params.get("year", timezone.localdate().year))
+        invoices = SalesInvoice.objects.filter(
+            client_id=request.client_id,
+            doc_date__year=year,
+            deleted_at__isnull=True,
+        ).exclude(status__in=["Draft", "Cancelled"]).select_related("party")
+
+        party_map = {}
+        for inv in invoices:
+            pid = str(inv.party_id)
+            if pid not in party_map:
+                party_map[pid] = {
+                    "partyId": pid,
+                    "partyName": inv.party_name or (inv.party.name if inv.party else ""),
+                    "grossSales": ZERO,
+                    "totalDiscount": ZERO,
+                    "defaultDiscountLimit": str(getattr(inv.party, "default_discount_pct", "0.00") or "0.00"),
+                }
+            party_map[pid]["grossSales"] += D(inv.subtotal or 0)
+            party_map[pid]["totalDiscount"] += D(inv.total_discount or 0)
+
+        results = []
+        for pid, data in party_map.items():
+            gross = data["grossSales"]
+            disc = data["totalDiscount"]
+            effective_pct = round2((disc / gross) * 100) if gross > ZERO else ZERO
+            results.append({
+                "partyId": pid,
+                "partyName": data["partyName"],
+                "grossSales": str(round2(gross)),
+                "totalDiscount": str(round2(disc)),
+                "effectiveDiscountPct": str(effective_pct),
+                "defaultDiscountLimit": data["defaultDiscountLimit"],
+            })
+        results.sort(key=lambda x: Decimal(x["totalDiscount"]), reverse=True)
+        return Response({"year": year, "parties": results})
+
+

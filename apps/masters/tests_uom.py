@@ -185,7 +185,7 @@ class StockPostingUomTests(UomTestBase):
             "locationId": str(self.location.id), "qcStatus": "Approved", "lines": [],
         })
         self.assertEqual(again.status_code, 409, again.content[:400])
-        self.assertEqual(StockMovement.objects.filter(item=self.fabric).count(), 1)
+        self.assertEqual(StockMovement.objects.filter(item=self.fabric, type="PURCHASE").count(), 1)
 
     def test_reservation_is_counted_in_stock_units(self):
         self._received_bill("Mtr", 10, 50)

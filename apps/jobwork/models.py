@@ -1,4 +1,5 @@
 """Job Work models — process plans and job work orders with nested lines."""
+from django.conf import settings as django_settings
 from django.db import models
 
 from apps.core.models import LegacyIdMixin, TenantModel
@@ -35,9 +36,23 @@ class ProcessPlan(TenantModel, LegacyIdMixin):
     no_of_rolls = models.IntegerField(null=True, blank=True)
     start_date = models.DateField(null=True, blank=True)
     expected_completion_date = models.DateField(null=True, blank=True)
-    target_date = models.DateField(null=True, blank=True)
     assigned_employee = models.TextField(null=True, blank=True)
     approver = models.TextField(null=True, blank=True)
+    process_master = models.ForeignKey(
+        "masters.ProcessMaster", null=True, blank=True, on_delete=models.SET_NULL, related_name="process_plans"
+    )
+    assigned_employee_fk = models.ForeignKey(
+        "hrms.Employee", null=True, blank=True, on_delete=models.SET_NULL, related_name="process_plans"
+    )
+    approver_fk = models.ForeignKey(
+        "hrms.Employee", null=True, blank=True, on_delete=models.SET_NULL, related_name="approved_process_plans"
+    )
+    fabric_quality_fk = models.ForeignKey(
+        "masters.FabricQuality", null=True, blank=True, on_delete=models.SET_NULL, related_name="process_plans"
+    )
+    shade_fk = models.ForeignKey(
+        "masters.Shade", null=True, blank=True, on_delete=models.SET_NULL, related_name="process_plans"
+    )
     status = models.TextField(choices=STATUSES, default="Active")
     remarks = models.TextField(null=True, blank=True)
 
@@ -79,9 +94,21 @@ class JobWorkOrder(TenantModel, LegacyIdMixin):
 
     STATUSES = [
         ("Draft", "Draft"),
+        ("Sent", "Sent"),
         ("In-Process", "In-Process"),
+        ("Partially Received", "Partially Received"),
+        ("Received", "Received"),
+        ("QC Pending", "QC Pending"),
+        ("Reprocess", "Reprocess"),
         ("Completed", "Completed"),
+        ("Closed", "Closed"),
     ]
+
+    #: Statuses that only a holder of ``approve_jobwork`` may move an order
+    #: into (or out of).
+    APPROVAL_STATUSES = ("Completed", "Closed")
+    #: Child rows of an order in one of these statuses are frozen.
+    LOCKED_STATUSES = ("Closed",)
 
     jwo_no = models.TextField(db_index=True)
     process_plan = models.ForeignKey(
@@ -89,6 +116,15 @@ class JobWorkOrder(TenantModel, LegacyIdMixin):
         related_name="job_work_orders",
     )
     process = models.TextField(default="")
+    process_master = models.ForeignKey(
+        "masters.ProcessMaster", null=True, blank=True, on_delete=models.SET_NULL, related_name="job_work_orders"
+    )
+    assigned_employee = models.ForeignKey(
+        "hrms.Employee", null=True, blank=True, on_delete=models.SET_NULL, related_name="job_work_orders"
+    )
+    approver_employee = models.ForeignKey(
+        "hrms.Employee", null=True, blank=True, on_delete=models.SET_NULL, related_name="approved_job_work_orders"
+    )
     vendor_name = models.TextField(default="")
     vendor = models.ForeignKey(
         "masters.Party", null=True, blank=True, on_delete=models.SET_NULL,
@@ -97,6 +133,10 @@ class JobWorkOrder(TenantModel, LegacyIdMixin):
     order_date = models.DateField()
     planned_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     rate = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    rate_master = models.ForeignKey(
+        "masters.JobWorkRateMaster", null=True, blank=True, on_delete=models.SET_NULL, related_name="job_work_orders"
+    )
+    expected_loss_pct = models.DecimalField(max_digits=7, decimal_places=4, default=0)
     total_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     expected_completion = models.DateField(null=True, blank=True)
     status = models.TextField(choices=STATUSES, default="In-Process")
@@ -125,8 +165,17 @@ class JWOMaterial(TenantModel):
     )
     fabric_item = models.TextField(default="")
     fabric_quality = models.TextField(default="")
+    fabric_quality_master = models.ForeignKey(
+        "masters.FabricQuality", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     shade = models.TextField(null=True, blank=True)
+    shade_master = models.ForeignKey(
+        "masters.Shade", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     lot_no = models.TextField(null=True, blank=True)
+    lot_taka = models.ForeignKey(
+        "inventory.LotTaka", null=True, blank=True, on_delete=models.SET_NULL, related_name="jwo_materials"
+    )
     qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     rate = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
@@ -143,13 +192,35 @@ class JWOOutward(TenantModel):
     no = models.TextField(default="")
     date = models.DateField()
     qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    challan_no = models.TextField(null=True, blank=True)
     lr_no = models.TextField(null=True, blank=True)
     transporter = models.TextField(null=True, blank=True)
+    warehouse = models.TextField(null=True, blank=True)
+    vehicle_no = models.TextField(null=True, blank=True)
+    driver = models.TextField(null=True, blank=True)
+    remarks = models.TextField(null=True, blank=True)
     status = models.TextField(default="Sent")
 
     class Meta:
         db_table = "jobwork_outwards"
         ordering = ["-date", "-created_at"]
+
+
+class JWOOutwardTaka(TenantModel):
+    """Specific takas dispatched in outward challan (Phase 2.5)."""
+
+    outward = models.ForeignKey(
+        JWOOutward, on_delete=models.CASCADE, related_name="takas"
+    )
+    lot_taka = models.ForeignKey(
+        "inventory.LotTaka", on_delete=models.PROTECT, related_name="jwo_outward_lines"
+    )
+    meters = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    weight_kg = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+
+    class Meta:
+        db_table = "jobwork_outward_takas"
+        ordering = ["created_at"]
 
 
 class JWOInward(TenantModel):
@@ -167,6 +238,64 @@ class JWOInward(TenantModel):
     class Meta:
         db_table = "jobwork_inwards"
         ordering = ["-date", "-created_at"]
+
+
+class JWOInwardTaka(TenantModel):
+    """Specific finished takas received on inward challan (Phase 2.5)."""
+
+    inward = models.ForeignKey(
+        JWOInward, on_delete=models.CASCADE, related_name="takas"
+    )
+    source_taka = models.ForeignKey(
+        "inventory.LotTaka", null=True, blank=True, on_delete=models.SET_NULL, related_name="jwo_inward_sources"
+    )
+    received_taka = models.ForeignKey(
+        "inventory.LotTaka", null=True, blank=True, on_delete=models.SET_NULL, related_name="jwo_inward_receipts"
+    )
+    taka_number = models.TextField(default="1")
+    meters = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    weight_kg = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    width = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    shade = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "jobwork_inward_takas"
+        ordering = ["created_at"]
+
+
+class JWOLossEntry(TenantModel):
+    """Approved loss entry for JWO reconciliation (PDF §07)."""
+
+    STATUSES = [
+        ("Pending Approval", "Pending Approval"),
+        ("Approved", "Approved"),
+        ("Rejected", "Rejected"),
+    ]
+
+    job_work_order = models.ForeignKey(
+        JobWorkOrder, on_delete=models.CASCADE, related_name="loss_entries"
+    )
+    loss_reason = models.ForeignKey(
+        "masters.LossReasonMaster", on_delete=models.PROTECT, related_name="jwo_losses"
+    )
+    qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    taka_count = models.IntegerField(default=0)
+    weight_kg = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="Pending Approval")
+    approved_by = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "jobwork_loss_entries"
+        ordering = ["-created_at"]
+
 
 
 class JWOCharge(TenantModel):
@@ -220,12 +349,37 @@ class JWOReprocess(TenantModel):
         ordering = ["-date", "-created_at"]
 
 
-class VendorProcessInstruction(TenantModel, LegacyIdMixin):
-    """Grey-fabric outside-processing instruction (PO → vendor).
+class JWODocument(TenantModel):
+    """A document (challan, invoice, QC report, ...) attached to a JWO.
 
-    Frontend ERPContext shape kept 1:1 so the existing screens work
-    unchanged: pi_number, po/vendor/fabric references as text plus
-    quantities and dates. The server owns pi_number (VPI series).
+    The bytes live in ``core.File`` (uploaded through ``/files/`` first);
+    this row only links the committed file to the order.
+    """
+
+    job_work_order = models.ForeignKey(
+        JobWorkOrder, on_delete=models.CASCADE, related_name="documents"
+    )
+    type = models.TextField(default="Other")
+    no = models.TextField(null=True, blank=True)
+    date = models.DateField(null=True, blank=True)
+    file_name = models.TextField(default="")
+    file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "jobwork_documents"
+        ordering = ["-created_at"]
+
+
+class VendorProcessInstruction(TenantModel, LegacyIdMixin):
+    """DEPRECATED: grey-fabric outside-processing instruction (PO → vendor).
+
+    Superseded by apps.pms ProductionInstruction (/api/v1/production/).
+    No API exposes this model any more; rows were copied by
+    pms migration 0005_migrate_vpi_to_production. The table is kept only so
+    rows that could not be matched to an employee are not lost.
     """
 
     STATUSES = [

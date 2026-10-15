@@ -31,7 +31,9 @@ PO_STATUSES = [
 ]
 BILL_STATUSES = ["Draft", "Unpaid", "Partially Paid", "Paid", "Cancelled"]
 #: api.md §6.4 -- only `Approved` releases stock for sale or dispatch.
-QC_STATUSES = ["Approved", "Pending Approval", "Rejected", "Rework"]
+#: "Partially Approved" -- QC passed part of the goods and routed the rest
+#: (second quality / reprocess / reject) to their own locations.
+QC_STATUSES = ["Approved", "Partially Approved", "Pending Approval", "Rejected", "Rework"]
 # The strings the UI's <select> actually emits (api.md §0: where code and
 # spec disagree, the frontend code is the fact). PaymentInPage, PaymentOutPage,
 # PurchaseBillsPage and SalesInvoicesView between them offer all of these.
@@ -180,7 +182,9 @@ class PurchaseBillLine(DocumentLine):
 # Goods receipts and QC (db.md §6.1)
 # ---------------------------------------------------------------------------
 class GoodsReceipt(TenantModel, LegacyIdMixin):
-    GRN_QC_STATUSES = ["Pending", "Approved", "Rejected", "On Hold"]
+    GRN_QC_STATUSES = [
+        "Pending", "Approved", "Partially Approved", "Rework", "Rejected", "On Hold",
+    ]
 
     grn_number = models.TextField()
     purchase_order = models.ForeignKey(
@@ -191,6 +195,8 @@ class GoodsReceipt(TenantModel, LegacyIdMixin):
     )
     party = models.ForeignKey("masters.Party", on_delete=models.PROTECT, related_name="receipts")
     receipt_date = models.DateField()
+    supplier_challan_no = models.TextField(null=True, blank=True)
+    supplier_challan_date = models.DateField(null=True, blank=True)
     location = models.ForeignKey(
         "masters.Location", on_delete=models.PROTECT, related_name="receipts"
     )
@@ -241,6 +247,12 @@ class GoodsReceiptLine(TenantModel):
     #: prefers it, and the movement must record the same number the UI showed.
     weighed_qty = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
     rejected_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    shortage_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    excess_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    roll_count = models.IntegerField(default=1)
+    weight_kg = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    fabric_width = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    remarks = models.TextField(null=True, blank=True)
     batch_number = models.TextField(null=True, blank=True)
     unit_cost = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     variation_pct = models.DecimalField(max_digits=9, decimal_places=4, null=True, blank=True)

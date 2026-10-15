@@ -17,6 +17,7 @@ def make_user(client):
             email="pending-register@example.com",
             password="pass",
             client=client,
+            is_superuser=True,
         )
     return user
 
@@ -305,7 +306,7 @@ class VendorReconciliationTests(TestCase):
 
 
 class ReprocessTests(TestCase):
-    """Reprocess lines nest under the JWO like outwards/inwards."""
+    """Reprocess lines nest under the JWO; edited through per-row endpoints."""
 
     def setUp(self):
         self.client_obj, _ = Client.objects.get_or_create(
@@ -318,12 +319,11 @@ class ReprocessTests(TestCase):
         )
         self.api = api
 
-    def _create_jwo(self, reprocesses=None):
+    def _create_jwo(self):
         payload = {
             "process": "Dyeing",
             "vendor": "Vendor B",
             "orderDate": "2026-01-05",
-            "plannedQty": 12000,
             "expectedCompletion": "2026-12-31",
             "materials": [
                 {
@@ -332,97 +332,91 @@ class ReprocessTests(TestCase):
                     "shade": "Navy Blue",
                     "qty": 12000,
                     "rate": 8,
-                    "amount": 96000,
                 }
             ],
-            "outwards": [{"no": "OUT-1", "date": "2026-02-01", "qty": 12000}],
+            "outwards": [{"date": "2026-02-01", "qty": 12000}],
             "inwards": [
                 {
-                    "no": "IN-2026-015",
                     "date": "2026-03-01",
                     "qty": 12000,
                     "accepted": 11800,
                     "rejected": 200,
                 }
             ],
-            "reprocesses": reprocesses or [],
         }
         response = self.api.post("/api/v1/jobwork/orders/", payload, format="json")
         self.assertEqual(response.status_code, 201, response.content[:1000])
         return response.json()
 
-    def test_nested_create_round_trip(self):
-        body = self._create_jwo([
-            {
-                "no": "RP-2026-001",
-                "inwardNo": "IN-2026-015",
-                "date": "2026-10-15",
-                "qty": 2000,
-                "reason": "Shade mismatch",
-                "expectedReturn": "2026-10-25",
-                "status": "Sent to Vendor",
-                "remarks": "Resend for redye",
-            }
-        ])
-        self.assertEqual(len(body["reprocesses"]), 1)
-        line = body["reprocesses"][0]
-        self.assertEqual(line["no"], "RP-2026-001")
-        self.assertEqual(line["inwardNo"], "IN-2026-015")
+    def _add_reprocess(self, order, **extra):
+        body = {
+            "inwardNo": order["inwards"][0]["no"],
+            "date": "2026-10-15",
+            "qty": 2000,
+            "reason": "Shade mismatch",
+            "status": "Pending",
+            **extra,
+        }
+        response = self.api.post(
+            f"/api/v1/jobwork/orders/{order['id']}/reprocesses/", body, format="json"
+        )
+        self.assertEqual(response.status_code, 201, response.content[:1000])
+        return response.json()
+
+    def test_nested_create_numbers_rows_on_server(self):
+        body = self._create_jwo()
+        self.assertTrue(body["jwoNo"].startswith("JWO-"))
+        self.assertTrue(body["outwards"][0]["no"].startswith("JWOUT-"))
+        self.assertTrue(body["inwards"][0]["no"].startswith("JWIN-"))
+        self.assertEqual(float(body["plannedQty"]), 12000)
+        self.assertEqual(float(body["totalAmount"]), 96000)
+
+    def test_reprocess_round_trip(self):
+        order = self._create_jwo()
+        line = self._add_reprocess(
+            order, expectedReturn="2026-10-25", status="Sent to Vendor",
+            remarks="Resend for redye",
+        )
+        self.assertTrue(line["no"].startswith("JWRP-"))
+        self.assertEqual(line["inwardNo"], order["inwards"][0]["no"])
         self.assertEqual(float(line["qty"]), 2000)
-        self.assertEqual(line["reason"], "Shade mismatch")
         self.assertEqual(line["expectedReturn"], "2026-10-25")
         self.assertEqual(line["status"], "Sent to Vendor")
 
-    def test_patch_add_and_edit_reprocess(self):
-        body = self._create_jwo([
-            {
-                "no": "RP-2026-001",
-                "inwardNo": "IN-2026-015",
-                "date": "2026-10-15",
-                "qty": 2000,
-                "reason": "Shade mismatch",
-                "status": "Pending",
-            }
-        ])
-        kept = body["reprocesses"][0]
+    def test_patch_reprocess_row(self):
+        order = self._create_jwo()
+        line = self._add_reprocess(order)
         response = self.api.patch(
-            f"/api/v1/jobwork/orders/{body['id']}/",
-            {
-                "reprocesses": [
-                    {**kept, "qty": 1500, "status": "Sent to Vendor"},
-                    {
-                        "no": "RP-2026-002",
-                        "inwardNo": "IN-2026-015",
-                        "date": "2026-10-18",
-                        "qty": 500,
-                        "reason": "Print defect",
-                        "status": "Pending",
-                    },
-                ]
-            },
+            f"/api/v1/jobwork/orders/{order['id']}/reprocesses/{line['id']}/",
+            {"qty": 1500, "status": "Sent to Vendor"},
             format="json",
         )
         self.assertEqual(response.status_code, 200, response.content[:1000])
-        lines = {line["no"]: line for line in response.json()["reprocesses"]}
-        self.assertEqual(set(lines), {"RP-2026-001", "RP-2026-002"})
-        self.assertEqual(float(lines["RP-2026-001"]["qty"]), 1500)
-        self.assertEqual(lines["RP-2026-001"]["status"], "Sent to Vendor")
+        self.assertEqual(float(response.json()["qty"]), 1500)
+        self.assertEqual(response.json()["status"], "Sent to Vendor")
+        self.assertEqual(response.json()["no"], line["no"])
 
     def test_patch_without_reprocesses_keeps_them(self):
-        body = self._create_jwo([
-            {
-                "no": "RP-2026-001",
-                "inwardNo": "IN-2026-015",
-                "date": "2026-10-15",
-                "qty": 2000,
-                "reason": "Shade mismatch",
-                "status": "Pending",
-            }
-        ])
+        order = self._create_jwo()
+        self._add_reprocess(order)
         response = self.api.patch(
-            f"/api/v1/jobwork/orders/{body['id']}/",
+            f"/api/v1/jobwork/orders/{order['id']}/",
             {"remarks": "just a note"},
             format="json",
         )
         self.assertEqual(response.status_code, 200, response.content[:1000])
         self.assertEqual(len(response.json()["reprocesses"]), 1)
+
+    def test_reprocess_cannot_exceed_received(self):
+        order = self._create_jwo()
+        response = self.api.post(
+            f"/api/v1/jobwork/orders/{order['id']}/reprocesses/",
+            {
+                "inwardNo": order["inwards"][0]["no"],
+                "date": "2026-10-15",
+                "qty": 13000,
+                "reason": "Too much",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.content[:1000])

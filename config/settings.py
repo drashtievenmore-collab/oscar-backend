@@ -72,12 +72,15 @@ INSTALLED_APPS = [
 ]
 
 # --------------------------------------------------------------------------
-# Module toggle (HRMS-only dev mode)
-# --------------------------------------------------------------------------
-#: HRMS_ONLY=True exposes only auth/admin/hrms (+ core platform) routes.
-#: HRMS_ONLY=False exposes the full ERP. Flip in `.env`, no code edits.
-#: Optionally override the exact route set with ENABLED_MODULES (comma-separated).
-HRMS_ONLY = env_bool("HRMS_ONLY", True)
+# Module toggle: False exposes the full Oscar ERP. Flip in `.env`, no code edits.
+# Optionally override the exact route set with ENABLED_MODULES (comma-separated).
+#
+# PRODUCTION: the deployed `.env` MUST set ``HRMS_ONLY=False`` (and leave
+# ENABLED_MODULES empty, or list every module). With HRMS_ONLY=True only the
+# HRMS + production routes are mounted and every Sales / Purchase / Inventory /
+# Accounts / Job Work screen returns 404. The enabled set is logged on startup
+# ("Enabled modules: ...", see apps.core.apps.CoreConfig.ready).
+HRMS_ONLY = env_bool("HRMS_ONLY", False)
 
 #: Route keys used by config/urls.py. "auth"/"admin" (accounts) and "core"
 #: platform routes are always on -- HRMS needs login, users and files.
@@ -106,6 +109,7 @@ elif HRMS_ONLY:
     ENABLED_MODULES = list(HRMS_ONLY_MODULES)
 else:
     ENABLED_MODULES = list(FULL_MODULES)
+
 
 
 def module_enabled(name):
@@ -156,6 +160,8 @@ DATABASES = {
         # The development server creates short-lived request threads; keeping
         # their connections open can exhaust PostgreSQL's connection limit.
         "CONN_MAX_AGE": int(env("DB_CONN_MAX_AGE", "0" if DEBUG else "60")),
+        # Optional override so parallel test runs can use separate databases.
+        "TEST": {"NAME": env("DB_TEST_NAME", None)},
     }
 }
 
@@ -313,3 +319,8 @@ LOGGING = {
         },
     },
 }
+
+# Stock adjustments whose value (qty x cost) exceeds this need approval.
+# Placeholder until the Phase 4 approval engine exists: the adjustment API only
+# reports ``exceedsApprovalLimit``. Unset (empty) means no limit.
+STOCK_ADJUSTMENT_APPROVAL_LIMIT = env("STOCK_ADJUSTMENT_APPROVAL_LIMIT", None) or None

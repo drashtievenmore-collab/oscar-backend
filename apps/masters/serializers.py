@@ -14,8 +14,11 @@ from apps.core.serializers import (
 )
 
 from .models import (
+    Agency,
+    Broker,
     CategoryCustomField,
     CategoryPart,
+    DefectMaster,
     Design,
     Fabric,
     FabricQuality,
@@ -25,10 +28,15 @@ from .models import (
     ItemCategory,
     ItemPart,
     ItemSerial,
+    JobWorkRateMaster,
     Location,
+    LossReasonMaster,
     Party,
     PartyContact,
+    ProcessMaster,
+    ReturnReasonMaster,
     Shade,
+    Transporter,
     Unit,
 )
 
@@ -64,6 +72,18 @@ class PartySerializer(BaseModelSerializer):
     ledgerAccountId = TenantPrimaryKeyRelatedField(
         source="ledger_account", model="accounting.Account", required=False, allow_null=True
     )
+    creditDays = serializers.IntegerField(source="credit_days", required=False, default=30)
+    defaultDiscountPct = serializers.DecimalField(
+        source="default_discount_pct", max_digits=7, decimal_places=4, required=False, default=0
+    )
+    defaultBrokerId = TenantPrimaryKeyRelatedField(
+        source="default_broker", model="masters.Broker", required=False, allow_null=True
+    )
+    defaultSalespersonId = TenantPrimaryKeyRelatedField(
+        source="default_salesperson", model="hrms.Employee", required=False, allow_null=True
+    )
+    defaultBrokerName = serializers.CharField(source="default_broker.name", read_only=True)
+    defaultSalespersonName = serializers.CharField(source="default_salesperson.name", read_only=True)
     #: How many CRM leads were converted into this party. Lets the admin
     #: customer list show which accounts came from a lead conversion and which
     #: were entered by hand, without a second round trip. Annotated by
@@ -73,13 +93,17 @@ class PartySerializer(BaseModelSerializer):
     class Meta:
         model = Party
         fields = [
-            "id", "code", "type", "vendor_type",
+            "id", "code", "type", "vendor_type", "is_processor",
             "vehicle_number", "vehicle_type", "vehicle_capacity", "vehicle_capacity_unit",
             "name", "phone", "email",
             "gst_treatment", "gstin", "gst_notes", "place_of_supply",
             "tds_applicable", "tds_section", "tds_rate",
             "tcs_applicable", "tcs_rate",
-            "ledgerAccount", "ledgerAccountId", "credit_limit", "payment_terms",
+            "ledgerAccount", "ledgerAccountId", "credit_limit", "credit_days", "creditDays",
+            "default_discount_pct", "defaultDiscountPct",
+            "default_broker", "defaultBrokerId", "defaultBrokerName",
+            "default_salesperson", "defaultSalespersonId", "defaultSalespersonName",
+            "payment_terms",
             "bank_account_number", "ifsc_code", "bank_name", "account_holder_name",
             "opening_balance", "balance", "leadCount",
             "billing_address", "shipping_address", "contacts", "status",
@@ -928,6 +952,7 @@ class ItemSerializer(BaseModelSerializer):
     JSON contract is unchanged while the source of truth moved.
     """
 
+    sku = serializers.CharField(required=False, allow_blank=True)
     category = serializers.CharField(source="category.name", read_only=True)
     categoryId = TenantPrimaryKeyRelatedField(
         source="category", queryset=ItemCategory.objects.all(), required=False, allow_null=True
@@ -963,7 +988,7 @@ class ItemSerializer(BaseModelSerializer):
             "availableQty", "reservedQty", "onHandQty", "damagedQty",
             "reorder_level", "location", "locationId", "status", "lifecycle_status",
             "cost_price", "selling_price", "hsn_code", "tax_pct",
-            "tracking_mode", "serialNumbers",
+            "tracking_mode", "tracking_type", "serialNumbers",
             "is_weight_item", "theoretical_weight", "weight_unit", "tolerance_pct",
             "has_sheet_spec", "sheet_height", "sheet_height_unit",
             "sheet_width", "sheet_width_unit", "sheet_length", "sheet_length_unit",
@@ -977,6 +1002,14 @@ class ItemSerializer(BaseModelSerializer):
 
     def get_availableQty(self, item):
         return getattr(item, "available_qty", None)
+
+    def create(self, validated_data):
+        # The server owns document numbers: a blank SKU gets the next ITM number.
+        if not validated_data.get("sku"):
+            from apps.core.numbering import allocate_number
+
+            validated_data["sku"] = allocate_number(self.context.get("client_id"), "ITM")
+        return super().create(validated_data)
 
     def get_reservedQty(self, item):
         return getattr(item, "reserved_qty", None)
@@ -1005,6 +1038,11 @@ class ItemSerializer(BaseModelSerializer):
         )
 
     def validate_sku(self, value):
+        value = (value or "").strip()
+        if not value:
+            if self.instance is not None:
+                raise serializers.ValidationError("SKU cannot be blank.")
+            return value  # allocated by the server in create()
         client_id = self.context.get("client_id")
         existing = Item.objects.filter(client_id=client_id, sku=value, deleted_at__isnull=True)
         if self.instance is not None:
@@ -1114,3 +1152,139 @@ class ImportRowsSerializer(BaseSerializer):
 
     rows = serializers.ListField(child=serializers.DictField(), allow_empty=False)
     dryRun = serializers.BooleanField(required=False, default=False)
+
+
+# ---------------------------------------------------------------------------
+# Textile & Job Work Masters (Phase 2.1)
+# ---------------------------------------------------------------------------
+class AgencySerializer(BaseModelSerializer):
+    class Meta:
+        model = Agency
+        fields = [
+            "id", "code", "name", "contact_person", "phone", "email",
+            "gstin", "address", "default_rate", "rate_uom", "is_active",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+    def validate_code(self, value):
+        client_id = self.context.get("client_id")
+        if not value:
+            return value
+        existing = Agency.objects.filter(
+            client_id=client_id, code__iexact=value, deleted_at__isnull=True
+        )
+        if self.instance:
+            existing = existing.exclude(pk=self.instance.pk)
+        if existing.exists():
+            raise serializers.ValidationError("An agency with this code already exists.")
+        return value
+
+
+class BrokerSerializer(BaseModelSerializer):
+    class Meta:
+        model = Broker
+        fields = [
+            "id", "code", "name", "contact_person", "phone", "email",
+            "pan", "gstin", "commission_type", "default_value", "is_active",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+    def validate_code(self, value):
+        client_id = self.context.get("client_id")
+        if not value:
+            return value
+        existing = Broker.objects.filter(
+            client_id=client_id, code__iexact=value, deleted_at__isnull=True
+        )
+        if self.instance:
+            existing = existing.exclude(pk=self.instance.pk)
+        if existing.exists():
+            raise serializers.ValidationError("A broker with this code already exists.")
+        return value
+
+
+class ProcessMasterSerializer(BaseModelSerializer):
+    class Meta:
+        model = ProcessMaster
+        fields = [
+            "id", "code", "name", "category", "expected_loss_pct",
+            "tolerance_pct", "is_active", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+
+class JobWorkRateMasterSerializer(BaseModelSerializer):
+    processorName = serializers.CharField(source="processor.name", read_only=True)
+    processName = serializers.CharField(source="process.name", read_only=True)
+    fabricQualityName = serializers.CharField(source="fabric_quality.name", read_only=True, allow_null=True)
+
+    processorId = TenantPrimaryKeyRelatedField(
+        source="processor", queryset=Party.objects.all()
+    )
+    processId = TenantPrimaryKeyRelatedField(
+        source="process", queryset=ProcessMaster.objects.all()
+    )
+    fabricQualityId = TenantPrimaryKeyRelatedField(
+        source="fabric_quality", queryset=FabricQuality.objects.all(), required=False, allow_null=True
+    )
+
+    class Meta:
+        model = JobWorkRateMaster
+        fields = [
+            "id", "processorId", "processorName", "processId", "processName",
+            "fabricQualityId", "fabricQualityName", "rate", "rate_uom",
+            "effective_from", "effective_to", "is_active", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class DefectMasterSerializer(BaseModelSerializer):
+    class Meta:
+        model = DefectMaster
+        fields = [
+            "id", "code", "name", "category", "severity", "is_active",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+
+class LossReasonMasterSerializer(BaseModelSerializer):
+    class Meta:
+        model = LossReasonMaster
+        fields = [
+            "id", "code", "name", "description", "is_active",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+
+class ReturnReasonMasterSerializer(BaseModelSerializer):
+    class Meta:
+        model = ReturnReasonMaster
+        fields = [
+            "id", "code", "name", "description", "is_active",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+
+class TransporterSerializer(BaseModelSerializer):
+    class Meta:
+        model = Transporter
+        fields = [
+            "id", "code", "name", "contact_person", "phone", "email",
+            "gstin", "pan", "address", "vehicles", "is_active",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+

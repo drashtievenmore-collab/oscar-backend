@@ -42,6 +42,9 @@ REPORT_CATALOGUE = [
     ("profit-and-loss", "Profit and Loss", "Accounts", ["date_from", "date_to"]),
     ("balance-sheet", "Balance Sheet", "Accounts", ["asOf"]),
     ("gst-summary", "GST Summary", "Accounts", ["date_from", "date_to"]),
+    ("cash-flow", "Cash Flow", "Accounts", ["date_from", "date_to"]),
+    ("trial-balance", "Trial Balance", "Accounts", ["asOf"]),
+    ("sales-dashboard", "Sales Dashboard", "Sales", ["date_from", "date_to"]),
     ("crm-pipeline", "CRM Pipeline", "CRM", ["date_from", "date_to"]),
     ("crm-conversion", "CRM Conversion", "CRM", ["date_from", "date_to"]),
     ("on-time-velocity", "On-time Velocity", "PMS", ["date_from", "date_to"]),
@@ -54,24 +57,112 @@ REPORT_CATALOGUE = [
 ]
 
 
+#: Financial statements: always gated by ``view_financial_reports``, on every
+#: path that serves them (here, ``/accounts/reports/`` and exports).
+FINANCIAL_REPORTS = {
+    "ar-ap-ageing", "ageing", "profit-and-loss", "balance-sheet", "gst-summary",
+    "cash-flow", "trial-balance",
+}
+
+#: Per-report permission: each operational report needs its own module's view
+#: permission instead of the blanket financial one.
+REPORT_PERMISSIONS = {
+    "inventory-valuation": ["view_inventory"],
+    "stock-summary": ["view_inventory"],
+    "stock-movement": ["view_inventory"],
+    "customer-revenue": ["view_sales"],
+    "sales-register": ["view_sales"],
+    "sales-dashboard": ["view_sales"],
+    "vendor-allocation": ["view_purchase"],
+    "purchase-register": ["view_purchase"],
+    "crm-pipeline": ["view_lead"],
+    "crm-conversion": ["view_lead"],
+    "on-time-velocity": ["view_pms"],
+    "stage-bottleneck": ["view_pms"],
+    "delay-reason-pareto": ["view_pms"],
+    "department-efficiency": ["view_pms"],
+    "hrms-attendance": ["view_team_attendance"],
+    "hrms-payroll-summary": ["generate_payroll"],
+    "hrms-attrition": ["view_staff"],
+    **{key: ["view_financial_reports"] for key in FINANCIAL_REPORTS},
+}
+
+
+def permissions_for_report(report_key):
+    """Unknown keys fall back to the strictest gate (and then 404)."""
+    return REPORT_PERMISSIONS.get(report_key, ["view_financial_reports"])
+
+
+def _user_has(user, permission_ids):
+    from apps.core.permissions import has_permission
+
+    return all(has_permission(user, permission) for permission in permission_ids)
+
+
+class HasAnyListedPermission(HasModulePermission):
+    """Passes when the user holds *any* of ``required_permissions``.
+
+    For screens that aggregate several modules (the report catalogue, the main
+    dashboard): each section is then filtered by its own permission.
+    """
+
+    def has_permission(self, request, view):
+        from apps.core.exceptions import PermissionDenied
+        from apps.core.permissions import IsAuthenticatedInTenant, has_permission
+
+        IsAuthenticatedInTenant.has_permission(self, request, view)
+        required = list(getattr(view, "required_permissions", None) or [])
+        if not required:
+            return True
+        if any(has_permission(request.user, permission) for permission in required):
+            return True
+        raise PermissionDenied(
+            "You don't have permission to do that.",
+            code=required[0],
+            detail=f"Requires one of: {', '.join(required)}.",
+        )
+
+
+ALL_REPORT_PERMISSIONS = sorted({p for perms in REPORT_PERMISSIONS.values() for p in perms})
+
+
 class ReportCatalogueView(APIView):
-    permission_classes = [HasModulePermission]
+    """Lists only the reports the caller may run."""
+
+    permission_classes = [HasAnyListedPermission]
+    required_permissions = ALL_REPORT_PERMISSIONS
 
     def get(self, request):
         return Response(
             envelope(
                 [
-                    {"key": key, "name": name, "module": module, "parameters": params}
+                    {
+                        "key": key,
+                        "name": name,
+                        "module": module,
+                        "parameters": params,
+                        "requiredPermissions": permissions_for_report(key),
+                    }
                     for key, name, module, params in REPORT_CATALOGUE
+                    if _user_has(request.user, permissions_for_report(key))
                 ]
             )
         )
 
 
 class ReportView(APIView):
-    """``GET /reports/{reportKey}/``."""
+    """``GET /reports/{reportKey}/``.
+
+    ``required_permissions`` is resolved per report key (DRF sets
+    ``self.kwargs`` before the permission check runs).
+    """
 
     permission_classes = [HasModulePermission]
+
+    @property
+    def required_permissions(self):
+        report_key = (getattr(self, "kwargs", None) or {}).get("report_key")
+        return permissions_for_report(report_key)
 
     def get(self, request, report_key):
         client_id = request.client_id
@@ -105,6 +196,18 @@ class ReportView(APIView):
             return CrmReportView().get(request, report_key)
 
         raise NotFound(f"Unknown report '{report_key}'.")
+
+    def _report_sales_dashboard(self, request, client_id, date_from, date_to, as_of):
+        """The business-position dashboard, every figure computed server-side."""
+        from .dashboard import business_dashboard
+
+        day = request.query_params.get("date") or as_of
+        try:
+            return Response(business_dashboard(client_id, day=day))
+        except ValueError:
+            raise ValidationFailed(
+                "Date must be YYYY-MM-DD.", field_errors={"date": ["Expected YYYY-MM-DD."]}
+            )
 
     # -- the five the frontend computes today -------------------------------
     def _report_inventory_valuation(self, request, client_id, *args):
@@ -390,6 +493,13 @@ class ReportExportView(APIView):
         import csv
         import io
 
+        from apps.core.permissions import require_permission
+
+        # The export reuses ReportView.get directly, so the per-report gate
+        # must be applied here as well.
+        for permission in permissions_for_report(report_key):
+            require_permission(request.user, permission)
+
         from apps.core.files import build_storage_key, public_url, write_bytes
         from apps.core.models import ExportJob, File
 
@@ -477,20 +587,30 @@ class ReportExportView(APIView):
 
 
 class MainDashboardView(APIView):
-    """``GET /dashboard/`` -- the main screen payload (api.md §12)."""
+    """``GET /dashboard/`` -- the main screen payload (api.md §12).
 
-    permission_classes = [HasModulePermission]
+    Open to anyone holding one of the module view permissions; each section
+    is included only when the caller holds that section's permission.
+    """
+
+    permission_classes = [HasAnyListedPermission]
+    required_permissions = [
+        "view_sales", "view_purchase", "view_inventory", "view_financial_reports", "view_lead",
+    ]
 
     def get(self, request):
         from apps.accounting.services import account_balances
+        from apps.core.permissions import has_permission
         from apps.crm.models import Lead
         from apps.masters.models import Item
         from apps.purchase.models import PurchaseBill, PurchaseOrder
         from apps.sales.models import SalesInvoice, SalesOrder
 
+        user = request.user
         client_id = request.client_id
         today = timezone.localdate()
         month_start = today.replace(day=1)
+        payload = {"sections": []}
 
         invoices = SalesInvoice.objects.filter(
             client_id=client_id, deleted_at__isnull=True
@@ -499,104 +619,104 @@ class MainDashboardView(APIView):
             client_id=client_id, deleted_at__isnull=True
         ).exclude(status__in=["Cancelled", "Draft"])
 
-        sales_month = invoices.filter(doc_date__gte=month_start).aggregate(
-            value=money_sum("total"), count=Count("id")
-        )
-        purchase_month = bills.filter(doc_date__gte=month_start).aggregate(
-            value=money_sum("total"), count=Count("id")
-        )
-        receivable = invoices.aggregate(
-            total=money_sum("total"), paid=money_sum("amount_paid")
-        )
-        payable = bills.aggregate(total=money_sum("total"), paid=money_sum("amount_paid"))
-
-        items = list(
-            Item.objects.filter(client_id=client_id, deleted_at__isnull=True)
-            .exclude(item_kind="Service")
-            .only("id", "sku", "name", "reorder_level", "cost_price")
-        )
-        stock.annotate_items_with_stock(client_id, items)
-        alerts = [
-            {
-                "itemId": str(item.id),
-                "sku": item.sku,
-                "name": item.name,
-                "available": round4(item.available_qty),
-                "reorderLevel": round4(item.reorder_level),
-                "status": item.stock_status,
-            }
-            for item in items
-            if item.stock_status in ("Low Stock", "Critical")
-        ][:20]
-
-        recent_invoices = invoices.order_by("-doc_date")[:5]
-        recent_orders = SalesOrder.objects.filter(
-            client_id=client_id, deleted_at__isnull=True
-        ).order_by("-doc_date")[:5]
-
-        monthly = (
-            invoices.filter(doc_date__gte=today - timedelta(days=365))
-            .annotate(month=TruncMonth("doc_date"))
-            .values("month")
-            .annotate(value=money_sum("total"))
-            .order_by("month")
-        )
-
-        return Response(
-            {
-                "sales": {
-                    "monthToDate": round2(sales_month["value"]),
-                    "invoiceCount": sales_month["count"],
-                    "openOrders": SalesOrder.objects.filter(
-                        client_id=client_id, deleted_at__isnull=True
-                    ).exclude(stage__in=["Invoiced", "Cancelled"]).count(),
-                    "monthly": [
-                        {"month": row["month"], "value": round2(row["value"])}
-                        for row in monthly
-                    ],
-                },
-                "purchase": {
-                    "monthToDate": round2(purchase_month["value"]),
-                    "billCount": purchase_month["count"],
-                    "openOrders": PurchaseOrder.objects.filter(
-                        client_id=client_id, deleted_at__isnull=True
-                    ).exclude(status__in=["Received", "Cancelled"]).count(),
-                    "awaitingReceipt": bills.filter(goods_received=False).count(),
-                },
-                "cash": {
-                    "receivable": round2(receivable["total"] - receivable["paid"]),
-                    "payable": round2(payable["total"] - payable["paid"]),
-                    "bankAccounts": account_balances(client_id),
-                },
-                "inventoryAlerts": alerts,
-                "crm": {
-                    "openLeads": Lead.objects.filter(
-                        client_id=client_id, deleted_at__isnull=True
-                    ).exclude(stage__is_won=True).exclude(stage__is_lost=True).count(),
-                },
-                "recentDocuments": [
-                    {
-                        "type": "SalesInvoice",
-                        "id": str(row.id),
-                        "number": row.invoice_number,
-                        "party": row.party_name,
-                        "date": row.doc_date,
-                        "total": round2(row.total),
-                        "status": row.status,
-                    }
-                    for row in recent_invoices
-                ]
-                + [
-                    {
-                        "type": "SalesOrder",
-                        "id": str(row.id),
-                        "number": row.order_number,
-                        "party": row.party_name,
-                        "date": row.doc_date,
-                        "total": round2(row.total),
-                        "status": row.stage,
-                    }
-                    for row in recent_orders
+        if has_permission(user, "view_sales"):
+            sales_month = invoices.filter(doc_date__gte=month_start).aggregate(
+                value=money_sum("total"), count=Count("id")
+            )
+            monthly = (
+                invoices.filter(doc_date__gte=today - timedelta(days=365))
+                .annotate(month=TruncMonth("doc_date"))
+                .values("month")
+                .annotate(value=money_sum("total"))
+                .order_by("month")
+            )
+            orders = SalesOrder.objects.filter(client_id=client_id, deleted_at__isnull=True)
+            payload["sales"] = {
+                "monthToDate": round2(sales_month["value"]),
+                "invoiceCount": sales_month["count"],
+                "openOrders": orders.exclude(
+                    stage__in=["Invoiced", "Closed", "Cancelled"]
+                ).count(),
+                "monthly": [
+                    {"month": row["month"], "value": round2(row["value"])} for row in monthly
                 ],
             }
-        )
+            payload["recentDocuments"] = [
+                {
+                    "type": "SalesInvoice",
+                    "id": str(row.id),
+                    "number": row.invoice_number,
+                    "party": row.party_name,
+                    "date": row.doc_date,
+                    "total": round2(row.total),
+                    "status": row.status,
+                }
+                for row in invoices.order_by("-doc_date")[:5]
+            ] + [
+                {
+                    "type": "SalesOrder",
+                    "id": str(row.id),
+                    "number": row.order_number,
+                    "party": row.party_name,
+                    "date": row.doc_date,
+                    "total": round2(row.total),
+                    "status": row.stage,
+                }
+                for row in orders.order_by("-doc_date")[:5]
+            ]
+            payload["sections"].append("sales")
+
+        if has_permission(user, "view_purchase"):
+            purchase_month = bills.filter(doc_date__gte=month_start).aggregate(
+                value=money_sum("total"), count=Count("id")
+            )
+            payload["purchase"] = {
+                "monthToDate": round2(purchase_month["value"]),
+                "billCount": purchase_month["count"],
+                "openOrders": PurchaseOrder.objects.filter(
+                    client_id=client_id, deleted_at__isnull=True
+                ).exclude(status__in=["Received", "Cancelled"]).count(),
+                "awaitingReceipt": bills.filter(goods_received=False).count(),
+            }
+            payload["sections"].append("purchase")
+
+        if has_permission(user, "view_financial_reports"):
+            receivable = financial.ageing(client_id, "receivable", today)
+            payable = financial.ageing(client_id, "payable", today)
+            payload["cash"] = {
+                "receivable": receivable["total"],
+                "payable": payable["total"],
+                "bankAccounts": account_balances(client_id),
+            }
+            payload["sections"].append("cash")
+
+        if has_permission(user, "view_inventory"):
+            items = list(
+                Item.objects.filter(client_id=client_id, deleted_at__isnull=True)
+                .exclude(item_kind="Service")
+                .only("id", "sku", "name", "reorder_level", "cost_price")
+            )
+            stock.annotate_items_with_stock(client_id, items)
+            payload["inventoryAlerts"] = [
+                {
+                    "itemId": str(item.id),
+                    "sku": item.sku,
+                    "name": item.name,
+                    "available": round4(item.available_qty),
+                    "reorderLevel": round4(item.reorder_level),
+                    "status": item.stock_status,
+                }
+                for item in items
+                if item.stock_status in ("Low Stock", "Critical")
+            ][:20]
+            payload["sections"].append("inventory")
+
+        if has_permission(user, "view_lead"):
+            payload["crm"] = {
+                "openLeads": Lead.objects.filter(
+                    client_id=client_id, deleted_at__isnull=True
+                ).exclude(stage__is_won=True).exclude(stage__is_lost=True).count(),
+            }
+            payload["sections"].append("crm")
+
+        return Response(payload)

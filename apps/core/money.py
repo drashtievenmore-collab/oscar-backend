@@ -226,18 +226,49 @@ def derive_payment_status(total, amount_paid, *, finalized=True):
     return "Partially Paid"
 
 
+#: The single AR/AP ageing bucket set used everywhere (backend + frontend).
+#: Days are counted past the due date; a not-yet-due document sits in "0-30".
+AGEING_BUCKETS = ["0-30", "31-60", "61-90", "91-120", "120+"]
+
+
 def ageing_bucket(days_overdue):
-    """api.md §12 -- 0-30 / 31-60 / 61-90 / 90+ buckets for AR/AP ageing."""
+    """0-30 / 31-60 / 61-90 / 91-120 / 120+ -- computed on outstanding amounts.
+
+    ``days_overdue`` <= 0 (not yet due) falls in ``0-30``.
+    """
     days = int(days_overdue or 0)
-    if days <= 0:
-        return "Current"
     if days <= 30:
         return "0-30"
     if days <= 60:
         return "31-60"
     if days <= 90:
         return "61-90"
-    return "90+"
+    if days <= 120:
+        return "91-120"
+    return "120+"
+
+
+def effective_due_date(doc_date, due_date=None, credit_days=None):
+    """Due date for ageing: the stored due date, else document date + credit days."""
+    if due_date:
+        return due_date
+    if doc_date is None:
+        return None
+    from datetime import timedelta
+
+    return doc_date + timedelta(days=int(credit_days or 0))
+
+
+def days_overdue(as_of, doc_date, due_date=None, credit_days=None):
+    """Whole days past the effective due date (never negative)."""
+    effective = effective_due_date(doc_date, due_date, credit_days)
+    if effective is None or as_of is None:
+        return 0
+    return max((as_of - effective).days, 0)
+
+
+def empty_ageing_buckets():
+    return {bucket: ZERO for bucket in AGEING_BUCKETS}
 
 
 _ONES = [

@@ -7,6 +7,7 @@ build a parallel ``party_ledger`` table -- two sources of truth for money is
 where reconciliation bugs come from.
 """
 from django.db import models
+from django.utils import timezone
 
 from apps.core.models import LegacyIdMixin, TenantModel
 
@@ -234,3 +235,70 @@ class ExpenseCategory(TenantModel):
 
     def __str__(self):
         return self.name
+
+
+class StandaloneNote(TenantModel, LegacyIdMixin):
+    """Standalone Debit and Credit Notes with approval workflow (PDF §14)."""
+
+    NOTE_TYPES = [
+        ("DEBIT_NOTE", "Debit Note"),
+        ("CREDIT_NOTE", "Credit Note"),
+    ]
+    STATUSES = [
+        ("Draft", "Draft"),
+        ("Pending Approval", "Pending Approval"),
+        ("Approved", "Approved"),
+        ("Posted", "Posted"),
+        ("Cancelled", "Cancelled"),
+    ]
+    AGAINST_DOC_TYPES = [
+        ("INVOICE", "Sales Invoice"),
+        ("BILL", "Purchase Bill"),
+        ("JWO", "Job Work Order"),
+        ("SALES_RETURN", "Sales Return"),
+        ("PURCHASE_RETURN", "Purchase Return"),
+        ("MANUAL", "Manual / Direct"),
+    ]
+
+    note_type = models.TextField(choices=NOTE_TYPES, default="CREDIT_NOTE")
+    note_number = models.TextField(db_index=True)
+    note_date = models.DateField(default=timezone.localdate)
+    party = models.ForeignKey(
+        "masters.Party", on_delete=models.PROTECT, related_name="standalone_notes"
+    )
+    against_document_type = models.TextField(choices=AGAINST_DOC_TYPES, default="INVOICE")
+    against_document_id = models.UUIDField(null=True, blank=True)
+    against_document_number = models.TextField(null=True, blank=True)
+    return_reason = models.ForeignKey(
+        "masters.ReturnReasonMaster", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    reason_notes = models.TextField(null=True, blank=True)
+    taxable_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    cgst = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    sgst = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    igst = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    total_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    status = models.TextField(choices=STATUSES, default="Draft")
+    approved_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    journal_entry = models.ForeignKey(
+        JournalEntry, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    notes = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "standalone_notes"
+        ordering = ["-note_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "note_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_standalone_note_number",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.note_type} {self.note_number} ({self.status}): {self.total_amount}"
+
