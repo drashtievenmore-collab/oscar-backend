@@ -23,6 +23,7 @@ LINE_FIELDS = [
 HEADER_FIELDS = [
     "id", "partyId", "partyName", "party_gstin", "billing_address",
     "shipping_address", "place_of_supply", "date", "notes", "terms",
+    "salesperson", "broker", "payment_terms", "credit_days",
     "subtotal", "total_discount", "taxable_value", "cgst", "sgst", "igst", "cess",
     "total_tax", "freight_charges", "other_charges", "round_off", "total",
     "amount_paid", "balance_due", "discount_override",
@@ -98,6 +99,8 @@ class DocumentSerializer(BaseModelSerializer):
     partyId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
     partyName = serializers.CharField(source="party_name", read_only=True)
     date = serializers.DateField(source="doc_date")
+    paymentTerms = serializers.CharField(source="payment_terms", required=False, allow_blank=True, allow_null=True)
+    creditDays = serializers.IntegerField(source="credit_days", required=False, allow_null=True)
     balance_due = serializers.SerializerMethodField()
     lineItems = serializers.ListField(
         child=serializers.DictField(), required=False, write_only=True

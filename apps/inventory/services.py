@@ -56,6 +56,7 @@ def post_movement(
     user=None,
     original_movement=None,
     uom=None,
+    lot_taka=None,
 ):
     """Append one movement and update the balance in the same transaction.
 
@@ -80,6 +81,24 @@ def post_movement(
             field_errors={"locationId": ["Required."]},
         )
 
+    from apps.masters.models import Item
+    from apps.inventory.models import LotTaka
+
+    # Resolve Item to check tracking_type
+    item_obj = item if hasattr(item, "tracking_type") else Item.objects.filter(pk=item_id).first()
+    item_tracking = getattr(item_obj, "tracking_type", "NONE")
+
+    lot_taka_obj = None
+    if lot_taka is not None:
+        lot_taka_id = getattr(lot_taka, "id", lot_taka)
+        lot_taka_obj = LotTaka.objects.filter(client_id=client_id, id=lot_taka_id).first()
+
+    if lot_taka_obj is None and item_tracking not in ("NONE", None, "Quantity"):
+        raise ValidationFailed(
+            f"Item '{getattr(item_obj, 'name', item_id)}' requires lot/taka tracking.",
+            field_errors={"lotTaka": ["Lot/Taka is required for this item."]},
+        )
+
     # api.md §7.2 -- orphan movements are only allowed for ADJUSTMENT, and only
     # with a reason. The database enforces it too; this is the friendly half.
     if reference_id is None and type != "ADJUSTMENT":
@@ -97,9 +116,7 @@ def post_movement(
         # ``quantity`` is in the item's stock unit; record which one that is.
         uom = getattr(item, "uom", None)
         if uom is None:
-            from apps.masters.models import Item
-
-            uom = Item.objects.filter(pk=item_id).values_list("uom", flat=True).first()
+            uom = item_obj.uom if item_obj else None
 
     movement = StockMovement.objects.create(
         client_id=client_id,
@@ -116,11 +133,17 @@ def post_movement(
         source_document_type=source_document_type or reference_type,
         source_document_id=source_document_id or reference_id,
         batch_number=batch_number,
+        lot_taka=lot_taka_obj,
         movement_date=movement_date or timezone.localdate(),
         notes=notes,
         created_by=user if getattr(user, "is_authenticated", False) else None,
         original_movement=original_movement,
     )
+
+    if lot_taka_obj is not None:
+        new_avail = round4(D(lot_taka_obj.available_quantity) + quantity)
+        lot_taka_obj.available_quantity = new_avail if new_avail > ZERO else ZERO
+        lot_taka_obj.save(update_fields=["available_quantity", "updated_at"])
 
     if original_movement is not None:
         # The one write that must survive the append-only rule: back-filling

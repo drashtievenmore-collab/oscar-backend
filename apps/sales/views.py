@@ -867,6 +867,23 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
         challan = self.get_object()
         if challan.status == "Cancelled":
             raise Conflict("This challan is cancelled.", code=Codes.ALREADY_CANCELLED)
+        if challan.status != "Dispatched":
+            raise ValidationFailed("Only dispatched delivery challans can be converted to an invoice.")
+
+        existing_invoice = (
+            SalesInvoice.objects.filter(
+                client_id=challan.client_id,
+                delivery_challan=challan,
+                deleted_at__isnull=True,
+            )
+            .exclude(status="Cancelled")
+            .first()
+        )
+        if existing_invoice:
+            raise Conflict(
+                f"An invoice ({existing_invoice.invoice_number or existing_invoice.id}) already exists for this challan.",
+                code=Codes.OVER_INVOICE,
+            )
 
         invoice = SalesInvoice.objects.create(
             client_id=challan.client_id,

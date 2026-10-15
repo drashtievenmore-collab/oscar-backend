@@ -339,7 +339,20 @@ def _create_goods_receipt(bill, lines, location_id, qc_status, *, user=None):
 
 
 def _post_receipt_stock(bill, lines, location_id, overrides, receipt, *, user=None):
-    """Posts ``PURCHASE`` movements carrying ``weighedQty`` for weight items."""
+    """Posts ``PURCHASE`` movements carrying ``weighedQty`` for weight items.
+    Goods received with QC status 'Pending' / 'On Hold' go to 'QC Hold' virtual location.
+    """
+    effective_location_id = location_id
+    if receipt.qc_status in ("Pending", "Pending Approval", "On Hold", "Hold"):
+        from apps.masters.models import Location
+        qc_hold_loc, _ = Location.objects.get_or_create(
+            client_id=bill.client_id,
+            name="QC Hold",
+            deleted_at__isnull=True,
+            defaults={"type": "Virtual", "address": "QC Quarantine Area"},
+        )
+        effective_location_id = qc_hold_loc.id
+
     for line in lines:
         if line.item_id is None or not line.item.holds_stock:
             continue
@@ -352,7 +365,7 @@ def _post_receipt_stock(bill, lines, location_id, overrides, receipt, *, user=No
         movement = stock.post_movement(
             client_id=bill.client_id,
             item=line.item,
-            location=location_id,
+            location=effective_location_id,
             type="PURCHASE",
             quantity=quantity,
             weighed_qty=line.received_weight if line.is_weight_item else None,
@@ -374,12 +387,12 @@ def _post_receipt_stock(bill, lines, location_id, overrides, receipt, *, user=No
         serial_numbers = override.get("serials") or []
         if serial_numbers and line.item.tracking_mode == "Serial":
             _register_serials(
-                bill.client_id, line.item, serial_numbers, location_id, movement,
+                bill.client_id, line.item, serial_numbers, effective_location_id, movement,
                 line.batch_number,
             )
 
         # Auto-create or link Lot / Taka record for received fabric or batch items
-        _register_lot_taka_on_receipt(bill, line, location_id, receipt, movement, override=override)
+        _register_lot_taka_on_receipt(bill, line, effective_location_id, receipt, movement, override=override)
 
 
 def _register_lot_taka_on_receipt(bill, line, location_id, receipt, movement, override=None):

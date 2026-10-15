@@ -5,22 +5,35 @@ from django.db import transaction
 from django.db.models import Count, Sum
 from django.db.models.functions import Coalesce
 from django.db.models import DecimalField, Value
+from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from apps.core.money import D, ZERO, round2
 from apps.core.numbering import allocate_number
+from apps.core.permissions import HasModulePermission
 from apps.core.viewsets import TenantModelViewSet
 
 from .models import (
     JobWorkOrder,
+    JWOCharge,
+    JWOInward,
+    JWOMaterial,
     JWOOutward,
+    JWOReprocess,
+    PlanCharge,
     ProcessPlan,
     VendorProcessInstruction,
     VPIProgressEntry,
 )
 from .serializers import (
     JobWorkOrderSerializer,
+    JWOChargeSerializer,
+    JWOInwardSerializer,
+    JWOMaterialSerializer,
+    JWOOutwardSerializer,
+    JWOReprocessSerializer,
+    PlanChargeSerializer,
     ProcessPlanSerializer,
     VendorProcessInstructionSerializer,
     VPIProgressEntrySerializer,
@@ -28,6 +41,11 @@ from .serializers import (
 
 
 class ProcessPlanViewSet(TenantModelViewSet):
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_jobwork"]
+    permission_map = {
+        "write": ["manage_jobwork"],
+    }
     queryset = ProcessPlan.objects.prefetch_related("charges")
     serializer_class = ProcessPlanSerializer
     audit_entity_type = "ProcessPlan"
@@ -75,6 +93,11 @@ class ProcessPlanViewSet(TenantModelViewSet):
 
 
 class JobWorkOrderViewSet(TenantModelViewSet):
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_jobwork"]
+    permission_map = {
+        "write": ["manage_jobwork"],
+    }
     queryset = (
         JobWorkOrder.objects.select_related("process_plan")
         .prefetch_related("materials", "outwards", "inwards", "charges", "reprocesses")
@@ -278,25 +301,25 @@ class JobWorkOrderViewSet(TenantModelViewSet):
         order = super().perform_update(serializer)
         client_id = self.get_client_id()
 
-        def replace(manager, model, rows):
+        def update_or_add(manager, model, rows):
             if rows is None:
                 return
-            keep_ids = {str(r.get("id")) for r in rows if r.get("id")}
-            manager.exclude(pk__in=[i for i in keep_ids if i]).delete()
             for row in rows:
                 rid = row.pop("id", None)
-                if rid:
+                if rid and manager.filter(pk=rid).exists():
                     manager.filter(pk=rid).update(**row)
+                elif row.get("no") and manager.filter(no=row["no"]).exists():
+                    manager.filter(no=row["no"]).update(**row)
                 else:
                     model.objects.create(
                         client_id=client_id, job_work_order=order, **row
                     )
 
-        replace(order.materials, JWOMaterial, materials)
-        replace(order.outwards, JWOOutward, outwards)
-        replace(order.inwards, JWOInward, inwards)
-        replace(order.charges, JWOCharge, charges)
-        replace(order.reprocesses, JWOReprocess, reprocesses)
+        update_or_add(order.materials, JWOMaterial, materials)
+        update_or_add(order.outwards, JWOOutward, outwards)
+        update_or_add(order.inwards, JWOInward, inwards)
+        update_or_add(order.charges, JWOCharge, charges)
+        update_or_add(order.reprocesses, JWOReprocess, reprocesses)
         if materials is not None:
             mats = list(order.materials.all())
             order.planned_qty = sum((m.qty or ZERO for m in mats), ZERO)
@@ -306,8 +329,87 @@ class JobWorkOrderViewSet(TenantModelViewSet):
             order.save(update_fields=["planned_qty", "total_amount", "updated_at"])
         return order
 
+    @action(detail=True, methods=["post"], url_path="materials")
+    @transaction.atomic
+    def add_material(self, request, pk=None):
+        order = self.get_object()
+        serializer = JWOMaterialSerializer(data=request.data, context=self.get_serializer_context())
+        serializer.is_valid(raise_exception=True)
+        from .models import JWOMaterial
+        mat = JWOMaterial.objects.create(
+            client_id=self.get_client_id(),
+            job_work_order=order,
+            **serializer.validated_data,
+        )
+        mats = list(order.materials.all())
+        order.planned_qty = sum((m.qty or ZERO for m in mats), ZERO)
+        order.total_amount = round2(sum((m.amount or ZERO for m in mats), ZERO))
+        order.save(update_fields=["planned_qty", "total_amount", "updated_at"])
+        return Response(JWOMaterialSerializer(mat).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="outwards")
+    @transaction.atomic
+    def add_outward(self, request, pk=None):
+        order = self.get_object()
+        serializer = JWOOutwardSerializer(data=request.data, context=self.get_serializer_context())
+        serializer.is_valid(raise_exception=True)
+        from .models import JWOOutward
+        outward = JWOOutward.objects.create(
+            client_id=self.get_client_id(),
+            job_work_order=order,
+            **serializer.validated_data,
+        )
+        return Response(JWOOutwardSerializer(outward).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="inwards")
+    @transaction.atomic
+    def add_inward(self, request, pk=None):
+        order = self.get_object()
+        serializer = JWOInwardSerializer(data=request.data, context=self.get_serializer_context())
+        serializer.is_valid(raise_exception=True)
+        from .models import JWOInward
+        inward = JWOInward.objects.create(
+            client_id=self.get_client_id(),
+            job_work_order=order,
+            **serializer.validated_data,
+        )
+        return Response(JWOInwardSerializer(inward).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="charges")
+    @transaction.atomic
+    def add_charge(self, request, pk=None):
+        order = self.get_object()
+        serializer = JWOChargeSerializer(data=request.data, context=self.get_serializer_context())
+        serializer.is_valid(raise_exception=True)
+        from .models import JWOCharge
+        charge = JWOCharge.objects.create(
+            client_id=self.get_client_id(),
+            job_work_order=order,
+            **serializer.validated_data,
+        )
+        return Response(JWOChargeSerializer(charge).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="reprocesses")
+    @transaction.atomic
+    def add_reprocess(self, request, pk=None):
+        order = self.get_object()
+        serializer = JWOReprocessSerializer(data=request.data, context=self.get_serializer_context())
+        serializer.is_valid(raise_exception=True)
+        from .models import JWOReprocess
+        reprocess = JWOReprocess.objects.create(
+            client_id=self.get_client_id(),
+            job_work_order=order,
+            **serializer.validated_data,
+        )
+        return Response(JWOReprocessSerializer(reprocess).data, status=status.HTTP_201_CREATED)
+
 
 class VendorProcessInstructionViewSet(TenantModelViewSet):
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_jobwork"]
+    permission_map = {
+        "write": ["manage_jobwork"],
+    }
     queryset = VendorProcessInstruction.objects.prefetch_related("entries")
     serializer_class = VendorProcessInstructionSerializer
     audit_entity_type = "VendorProcessInstruction"
@@ -327,6 +429,11 @@ class VendorProcessInstructionViewSet(TenantModelViewSet):
 
 
 class VPIProgressEntryViewSet(TenantModelViewSet):
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_jobwork"]
+    permission_map = {
+        "write": ["manage_jobwork"],
+    }
     queryset = VPIProgressEntry.objects.select_related("instruction")
     serializer_class = VPIProgressEntrySerializer
     audit_entity_type = "VPIProgressEntry"

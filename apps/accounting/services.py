@@ -224,21 +224,33 @@ def reverse_document_entries(*, client_id, source_document_type, source_document
 # api.md §8.1 -- the auto-posting matrix
 # ---------------------------------------------------------------------------
 def post_sales_invoice(invoice, *, user=None):
-    """Dr Debtors | Cr Sales, Cr GST Output."""
+    """Dr Debtors | Cr Sales, Cr GST Output. Dr COGS | Cr Inventory."""
     client_id = invoice.client_id
     tax = round2((invoice.cgst or ZERO) + (invoice.sgst or ZERO) + (invoice.igst or ZERO) + (invoice.cess or ZERO))
     if tax == ZERO:
         tax = round2(invoice.total_tax)
     revenue = round2(invoice.total - tax)
 
+    postings = [
+        debit(system_account(client_id, "debtors"), invoice.total, party=invoice.party,
+              description=f"Invoice {invoice.invoice_number}"),
+        credit(system_account(client_id, "sales"), revenue),
+        credit(system_account(client_id, "gst_output"), tax),
+    ]
+
+    cogs_total = ZERO
+    for line in invoice.line_items.filter(deleted_at__isnull=True).select_related("item"):
+        qty = D(line.quantity or 0)
+        cost = D(getattr(line.item, "cost_price", 0) if line.item else 0)
+        cogs_total += qty * cost
+    cogs_total = round2(cogs_total)
+    if cogs_total > ZERO:
+        postings.append(debit(system_account(client_id, "cogs"), cogs_total, description="Cost of Goods Sold"))
+        postings.append(credit(system_account(client_id, "stock"), cogs_total, description="Inventory Depletion"))
+
     return post_entry(
         client=invoice.client,
-        postings=[
-            debit(system_account(client_id, "debtors"), invoice.total, party=invoice.party,
-                  description=f"Invoice {invoice.invoice_number}"),
-            credit(system_account(client_id, "sales"), revenue),
-            credit(system_account(client_id, "gst_output"), tax),
-        ],
+        postings=postings,
         entry_date=invoice.doc_date,
         narration=f"Sales invoice {invoice.invoice_number} - {invoice.party_name}",
         source_document_type="SalesInvoice",
@@ -294,14 +306,45 @@ def post_purchase_bill(bill, *, user=None):
     client_id = bill.client_id
     tax = round2(bill.total_tax)
     goods = round2(bill.total - tax)
+
+    lines = list(bill.line_items.filter(deleted_at__isnull=True).select_related("item"))
+    stock_amt = ZERO
+    non_stock_amt = ZERO
+    if lines:
+        for line in lines:
+            amt = round2(D(getattr(line, "taxable_value", None) or getattr(line, "amount", 0)))
+            if line.item and getattr(line.item, "type", "") == "Service":
+                non_stock_amt += amt
+            elif line.item and getattr(line.item, "item_type", "") in ("Service", "Expense"):
+                non_stock_amt += amt
+            else:
+                stock_amt += amt
+    else:
+        stock_amt = goods
+
+    postings = []
+    goods_posted = stock_amt + non_stock_amt
+    if goods_posted != goods:
+        diff = goods - goods_posted
+        if stock_amt >= non_stock_amt:
+            stock_amt += diff
+        else:
+            non_stock_amt += diff
+
+    if stock_amt > ZERO:
+        postings.append(debit(system_account(client_id, "stock"), stock_amt))
+    if non_stock_amt > ZERO:
+        postings.append(debit(system_account(client_id, "purchases"), non_stock_amt))
+
+    postings.extend([
+        debit(system_account(client_id, "gst_input"), tax),
+        credit(system_account(client_id, "creditors"), bill.total, party=bill.party,
+               description=f"Bill {bill.bill_number}"),
+    ])
+
     return post_entry(
         client=bill.client,
-        postings=[
-            debit(system_account(client_id, "stock"), goods),
-            debit(system_account(client_id, "gst_input"), tax),
-            credit(system_account(client_id, "creditors"), bill.total, party=bill.party,
-                   description=f"Bill {bill.bill_number}"),
-        ],
+        postings=postings,
         entry_date=bill.doc_date,
         narration=f"Purchase bill {bill.bill_number} - {bill.party_name}",
         source_document_type="PurchaseBill",

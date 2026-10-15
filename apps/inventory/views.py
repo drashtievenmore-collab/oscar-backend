@@ -254,11 +254,23 @@ class StockAdjustmentView(APIView):
                 field_errors={"locationId": ["Required."]},
             )
 
+        current = stock.calculate_item_stock(request.client_id, item, location.id)
+        current_on_hand = D(current["onHand"])
         if data.get("isAbsolute"):
-            current = stock.calculate_item_stock(request.client_id, item, location.id)
-            delta = round4(D(data["quantity"]) - D(current["onHand"]))
+            target_qty = round4(D(data["quantity"]))
+            if target_qty < ZERO:
+                raise ValidationFailed(
+                    "Stock quantity cannot be adjusted to a negative value.",
+                    field_errors={"quantity": ["Stock cannot be negative."]},
+                )
+            delta = round4(target_qty - current_on_hand)
         else:
             delta = round4(data["quantity"])
+            if current_on_hand + delta < ZERO:
+                raise ValidationFailed(
+                    f"Adjustment of {delta} would result in negative stock ({current_on_hand + delta}). Current stock: {current_on_hand}.",
+                    field_errors={"quantity": ["Adjustment results in negative stock."]},
+                )
 
         if delta == ZERO:
             raise BusinessRuleViolation(
@@ -397,10 +409,38 @@ class StockTransferViewSet(TenantModelViewSet):
                     for tk in matching_takas:
                         if rem <= 0:
                             break
-                        tk_qty = tk.available_quantity or tk.received_quantity or 0
-                        tk.location_id = transfer.to_location_id
-                        tk.save(update_fields=["location", "updated_at"])
-                        rem -= D(tk_qty)
+                        tk_qty = D(tk.available_quantity or tk.received_quantity or 0)
+                        if tk_qty <= rem:
+                            tk.location_id = transfer.to_location_id
+                            tk.save(update_fields=["location", "updated_at"])
+                            rem -= tk_qty
+                        else:
+                            # Partial taka transfer: split the taka
+                            split_rem = rem
+                            tk.available_quantity = tk_qty - split_rem
+                            tk.save(update_fields=["available_quantity", "updated_at"])
+                            LotTaka.objects.create(
+                                client_id=request.client_id,
+                                item=tk.item,
+                                supplier=tk.supplier,
+                                lot_number=tk.lot_number,
+                                taka_number=f"{tk.taka_number}-TR",
+                                taka_id=f"{tk.taka_id}-TR" if tk.taka_id else None,
+                                location_id=transfer.to_location_id,
+                                received_date=timezone.localdate(),
+                                received_quantity=split_rem,
+                                available_quantity=split_rem,
+                                uom=tk.uom,
+                                qc_status=tk.qc_status,
+                                status="Active",
+                                rate=tk.rate,
+                                width=tk.width,
+                                gsm=tk.gsm,
+                                roll_weight=round4(D(tk.roll_weight or 0) * (split_rem / tk_qty)) if tk.roll_weight else None,
+                                remarks=f"Transferred via {transfer.transfer_number} (split from Taka {tk.taka_number})",
+                            )
+                            rem = ZERO
+                            break
 
             transfer.status = "In Transit"
             transfer.save(update_fields=["status", "updated_at"])
@@ -437,6 +477,13 @@ class StockTransferViewSet(TenantModelViewSet):
                     user=request.user,
                     notes="Transfer cancelled",
                 )
+                # Revert taka locations back to from_location
+                item_ids = list(transfer.items.filter(deleted_at__isnull=True).values_list("item_id", flat=True))
+                LotTaka.objects.filter(
+                    client_id=request.client_id,
+                    location_id=transfer.to_location_id,
+                    item_id__in=item_ids,
+                ).update(location_id=transfer.from_location_id)
             transfer.status = "Cancelled"
             transfer.save(update_fields=["status", "updated_at"])
             self.write_audit("cancel", transfer, description=request.data.get("reason"))
@@ -738,30 +785,96 @@ class ValuationView(APIView):
             .exclude(item__item_kind="Service")
         )
 
+        today = timezone.localdate()
+        # Pre-fetch earliest inward dates for lot/taka and movements
+        lot_inward_dates = {
+            row["item_id"]: row["earliest_date"]
+            for row in LotTaka.objects.filter(
+                client_id=request.client_id, deleted_at__isnull=True, available_quantity__gt=0
+            ).values("item_id").annotate(earliest_date=models.Min("received_date"))
+        }
+        mov_inward_dates = {
+            row["item_id"]: row["earliest_date"]
+            for row in StockMovement.objects.filter(
+                client_id=request.client_id,
+                quantity__gt=0,
+                type__in=["PURCHASE", "TRANSFER_IN", "JOBWORK_INWARD", "ADJUSTMENT"],
+            ).values("item_id").annotate(earliest_date=models.Min("movement_date"))
+        }
+
         rows = []
         total = ZERO
+        total_depreciation = ZERO
+        bucket_totals = {
+            "0-30 Days": ZERO,
+            "31-60 Days": ZERO,
+            "61-90 Days": ZERO,
+            "91-180 Days": ZERO,
+            "180+ Days (Stale)": ZERO,
+        }
+
         for balance in balances:
             if D(balance.on_hand) == ZERO:
                 continue
             unit_cost = balance.weighted_average_cost or D(balance.item.cost_price)
             value = round2(D(balance.on_hand) * D(unit_cost))
             total += value
+
+            inward_d = lot_inward_dates.get(balance.item_id) or mov_inward_dates.get(balance.item_id) or today
+            age_days = max(0, (today - inward_d).days)
+
+            if age_days <= 30:
+                bucket_label = "0-30 Days"
+                reserve_rate = Decimal("0")
+            elif age_days <= 60:
+                bucket_label = "31-60 Days"
+                reserve_rate = Decimal("0.02")
+            elif age_days <= 90:
+                bucket_label = "61-90 Days"
+                reserve_rate = Decimal("0.10")
+            elif age_days <= 180:
+                bucket_label = "91-180 Days"
+                reserve_rate = Decimal("0.15")
+            else:
+                bucket_label = "180+ Days (Stale)"
+                reserve_rate = Decimal("0.25")
+
+            dep_reserve = round2(value * reserve_rate)
+            total_depreciation += dep_reserve
+            bucket_totals[bucket_label] += value
+
             rows.append(
                 {
+                    "id": str(balance.item_id),
                     "itemId": str(balance.item_id),
                     "sku": balance.item.sku,
                     "name": balance.item.name,
-                    "category": balance.item.category.name if balance.item.category_id else None,
+                    "category": balance.item.category.name if balance.item.category_id else "Fabric",
                     "location": balance.location.name,
+                    "qty": float(balance.on_hand),
                     "quantity": balance.on_hand,
                     "unitCost": round4(unit_cost),
                     "value": value,
+                    "totalValuation": value,
+                    "ageDays": age_days,
+                    "agingBucket": bucket_label,
+                    "depreciationReserve": dep_reserve,
                 }
             )
 
         rows.sort(key=lambda row: row["value"], reverse=True)
         return Response(
-            envelope(rows, aggregates={"method": "WAC", "totalValuation": round2(total)})
+            envelope(
+                rows,
+                aggregates={
+                    "method": "WAC",
+                    "totalValuation": round2(total),
+                    "totalDepreciation": round2(total_depreciation),
+                    "currentStockValue": round2(bucket_totals["0-30 Days"]),
+                    "staleValuation": round2(bucket_totals["91-180 Days"] + bucket_totals["180+ Days (Stale)"]),
+                    "buckets": {k: round2(v) for k, v in bucket_totals.items()},
+                },
+            )
         )
 
 
@@ -952,13 +1065,13 @@ class InventoryDashboardView(APIView):
             val=Coalesce(Sum((Coalesce("weighed_qty", "received_qty") - F("rejected_qty")) * F("unit_cost")), Value(Decimal("0.00")), output_field=MONEY)
         )["val"]
 
-        # Good Fabric Stock
-        good_qty = max(ZERO, total_on_hand - sample_qty - customer_return_qty)
+        # Good Fabric Stock (Available finished stock = total on hand minus non-available subsets)
+        good_qty = max(ZERO, total_on_hand - sample_qty - customer_return_qty - grey_wip_qty - reprocess_qty)
         good_val = sum(
             (D(b.on_hand) * (b.weighted_average_cost or get_item_cost(b.item_id)) for b in balance_rows if D(b.on_hand) > ZERO),
             ZERO,
         )
-        good_val = max(ZERO, good_val - sample_val - customer_return_val)
+        good_val = max(ZERO, good_val - sample_val - customer_return_val - grey_wip_val - reprocess_val)
 
         # Total Fabric Stock
         total_stock_qty = good_qty + sample_qty + wastage_qty + reprocess_qty + customer_return_qty + grey_wip_qty
@@ -2098,15 +2211,36 @@ class QCDashboardView(APIView):
         )["q"]
         on_hold_lots = on_hold_lines.values("goods_receipt_id").distinct().count()
 
+        reason_map = {}
+        for l in on_hold_lines.select_related("goods_receipt"):
+            reason = l.goods_receipt.notes or l.notes or "Pending QC Review"
+            if reason not in reason_map:
+                reason_map[reason] = {"qty": Decimal("0"), "lots": set()}
+            reason_map[reason]["qty"] += D(l.weighed_qty or l.received_qty or 0)
+            reason_map[reason]["lots"].add(l.goods_receipt_id)
+
+        for inw in inwards_qs.filter(status="On Hold"):
+            reason = getattr(inw, "notes", None) or inw.challan_no or "Job Work Inward Hold"
+            if reason not in reason_map:
+                reason_map[reason] = {"qty": Decimal("0"), "lots": set()}
+            reason_map[reason]["qty"] += D(inw.qty or 0)
+            reason_map[reason]["lots"].add(inw.id)
+
+        hold_breakdown = [
+            {"reason": r, "qty": float(round2(data["qty"])), "lots": len(data["lots"])}
+            for r, data in reason_map.items()
+        ]
+        if not hold_breakdown and (on_hold_qty > 0 or jwo_hold_qty > 0):
+            hold_breakdown = [{
+                "reason": "On Hold Review",
+                "qty": float(round2(D(on_hold_qty) + D(jwo_hold_qty))),
+                "lots": on_hold_lots + inwards_qs.filter(status="On Hold").count(),
+            }]
+
         on_hold_review = {
             "totalQty": float(on_hold_qty) + float(jwo_hold_qty),
             "totalLots": on_hold_lots + inwards_qs.filter(status="On Hold").count(),
-            "breakdown": [
-                {"reason": "Shade Variation", "qty": round((float(on_hold_qty) + float(jwo_hold_qty)) * 0.4, 2) if (on_hold_lots or jwo_hold_qty) else 0.0, "lots": max(1, round(on_hold_lots * 0.4)) if on_hold_lots else 0},
-                {"reason": "Defect Issue", "qty": round((float(on_hold_qty) + float(jwo_hold_qty)) * 0.35, 2) if (on_hold_lots or jwo_hold_qty) else 0.0, "lots": max(1, round(on_hold_lots * 0.35)) if on_hold_lots else 0},
-                {"reason": "Measurement Issue", "qty": round((float(on_hold_qty) + float(jwo_hold_qty)) * 0.15, 2) if (on_hold_lots or jwo_hold_qty) else 0.0, "lots": max(1, round(on_hold_lots * 0.15)) if on_hold_lots else 0},
-                {"reason": "Other", "qty": round((float(on_hold_qty) + float(jwo_hold_qty)) * 0.1, 2) if (on_hold_lots or jwo_hold_qty) else 0.0, "lots": max(1, round(on_hold_lots * 0.1)) if on_hold_lots else 0},
-            ],
+            "breakdown": hold_breakdown,
         }
 
         # Live inspection records (Purchase GRNs + Job Work Inwards)
@@ -2630,13 +2764,14 @@ class QCRegisterView(APIView):
             measurements = meta.get("measurements") or []
             if not measurements and r_lines:
                 for idx, l in enumerate(r_lines):
+                    l_item = l.item
                     l_rec = float(l.weighed_qty or l.received_qty or 0)
                     measurements.append({
                         "srNo": idx + 1,
                         "takaNo": idx + 1,
                         "actualQty": l_rec,
-                        "width": 150,
-                        "weight": 25,
+                        "width": float(l_item.fabric_width) if (l_item and getattr(l_item, "fabric_width", None)) else None,
+                        "weight": float(l.weighed_qty) if l.weighed_qty else None,
                         "good": l_rec if display_status == "Completed" else 0,
                         "hold": l_rec if display_status == "On Hold" else 0,
                         "reprocess": l_rec if display_status in ["Reprocess", "Rework"] else 0,
@@ -2740,8 +2875,8 @@ class QCRegisterView(APIView):
                     "srNo": 1,
                     "takaNo": 1,
                     "actualQty": rec_q,
-                    "width": 150,
-                    "weight": 25,
+                    "width": float(plan.width) if (plan and getattr(plan, "width", None)) else None,
+                    "weight": float(plan.weight_kg) if (plan and getattr(plan, "weight_kg", None)) else None,
                     "good": good_q,
                     "hold": hold_q,
                     "reprocess": rep_q,
@@ -2981,8 +3116,8 @@ class QCDispositionView(APIView):
                         "srNo": idx + 1,
                         "takaNo": idx + 1,
                         "actualQty": float(l.weighed_qty or l.received_qty or 0),
-                        "width": 150,
-                        "weight": 25,
+                        "width": float(l.item.fabric_width) if (l.item and getattr(l.item, "fabric_width", None)) else None,
+                        "weight": float(l.weighed_qty) if l.weighed_qty else None,
                         "remarks": "-",
                     }
                     for idx, l in enumerate(r_lines)
@@ -3019,8 +3154,8 @@ class QCDispositionView(APIView):
                 "itemCode": it_code,
                 "itemName": it_name,
                 "quality": getattr(plan, "fabric_quality", "") or it_name,
-                "design": "Plain",
-                "shade": getattr(plan, "shade", "") or "Default",
+                "design": getattr(plan, "design", "") or getattr(plan, "fabric_design", "") or "Plain",
+                "shade": getattr(plan, "shade", "") or getattr(plan, "fabric_color", "") or "Default",
                 "lotNo": plan.grey_lot_no if plan and plan.grey_lot_no else f"LOT-{inw.no}",
                 "takaRoll": 1,
                 "inspectedQty": rec_q,
@@ -3035,8 +3170,8 @@ class QCDispositionView(APIView):
                         "srNo": 1,
                         "takaNo": 1,
                         "actualQty": rec_q,
-                        "width": 150,
-                        "weight": 25,
+                        "width": float(plan.width) if (plan and getattr(plan, "width", None)) else None,
+                        "weight": float(plan.weight_kg) if (plan and getattr(plan, "weight_kg", None)) else None,
                         "remarks": inw.challan_no or "-",
                     }
                 ],
@@ -3340,11 +3475,12 @@ class QCReportsView(APIView):
         supplier_map = {}
         for r in receipts_qs:
             s_name = r.party.name if r.party else "Direct Purchase"
+            top_def = r.qc_note if r.qc_note else "—"
             if s_name not in supplier_map:
                 supplier_map[s_name] = {
                     "supplier": s_name, "receiptsCount": 0, "receivedQty": 0.0,
                     "inspectedQty": 0.0, "goodQty": 0.0, "holdQty": 0.0,
-                    "reprocessQty": 0.0, "rejectedQty": 0.0, "topDefect": "Minor Defect",
+                    "reprocessQty": 0.0, "rejectedQty": 0.0, "topDefect": top_def,
                 }
             r_lines = list(r.lines.all())
             rec_q = sum(float(l.weighed_qty or l.received_qty or 0) for l in r_lines)
@@ -3368,7 +3504,7 @@ class QCReportsView(APIView):
                 supplier_map[v_name] = {
                     "supplier": v_name, "receiptsCount": 0, "receivedQty": 0.0,
                     "inspectedQty": 0.0, "goodQty": 0.0, "holdQty": 0.0,
-                    "reprocessQty": 0.0, "rejectedQty": 0.0, "topDefect": "Processing Defect",
+                    "reprocessQty": 0.0, "rejectedQty": 0.0, "topDefect": inw.challan_no or "—",
                 }
             rec_q = float(inw.qty or 0)
             supplier_map[v_name]["receiptsCount"] += 1
@@ -3409,7 +3545,7 @@ class QCReportsView(APIView):
                     quality_map[q_name] = {
                         "quality": q_name, "itemCode": sku, "inspectedQty": 0.0,
                         "goodQty": 0.0, "defectiveQty": 0.0, "lotsCount": 0,
-                        "primaryDefect": "Shade Variation",
+                        "primaryDefect": "—",
                     }
                 rec_q = float(l.weighed_qty or l.received_qty or 0)
                 rej_q = float(l.rejected_qty or 0)
@@ -3430,7 +3566,7 @@ class QCReportsView(APIView):
                 quality_map[q_name] = {
                     "quality": q_name, "itemCode": sku, "inspectedQty": 0.0,
                     "goodQty": 0.0, "defectiveQty": 0.0, "lotsCount": 0,
-                    "primaryDefect": "Weaving Fault",
+                    "primaryDefect": "—",
                 }
             rec_q = float(inw.qty or 0)
             quality_map[q_name]["inspectedQty"] += rec_q
@@ -3757,7 +3893,7 @@ class QCReinspectionView(APIView):
             rep_q = meta.get("reprocessQty", 0.0)
             rej_q = meta.get("rejectedQty", 0.0)
             meas = meta.get("measurements") or [
-                {"srNo": 1, "takaNo": 1, "actualQty": sent_q, "width": 150, "remarks": "-"}
+                {"srNo": 1, "takaNo": 1, "actualQty": sent_q, "width": float(plan.width) if (plan and getattr(plan, "width", None)) else None, "remarks": "-"}
             ]
 
             records.append({
@@ -3871,34 +4007,41 @@ class QCReinspectionView(APIView):
                 "message": msg,
             })
 
-        # Create new reinspection entry
-        source_qc_no = request.data.get("sourceQcNo") or "QC-001"
-        vendor_name = request.data.get("vendor") or "Outside Processor"
-        item_code = request.data.get("itemCode") or "FAB-01"
-        sent_qty = Decimal(str(request.data.get("sentQty") or "10"))
+        # Create new reinspection entry — requires explicit inputs
+        jwo_id = request.data.get("jwo_id") or request.data.get("jwoId") or request.data.get("jobWorkOrderId")
+        challan_no = request.data.get("challan_no") or request.data.get("challanNo")
+        meters_raw = request.data.get("meters") or request.data.get("sentQty") or request.data.get("qty")
         date_str = request.data.get("date") or timezone.localdate().isoformat()
         reason = request.data.get("reason") or "Reprocessed fabric reinspection"
 
-        jwo = JobWorkOrder.objects.filter(client_id=client_id, jwo_no=source_qc_no).first()
+        field_errors = {}
+        if not jwo_id:
+            field_errors["jwo_id"] = ["Job Work Order ID is required."]
+        if not challan_no:
+            field_errors["challan_no"] = ["Challan number is required."]
+        if not meters_raw or D(meters_raw) <= ZERO:
+            field_errors["meters"] = ["Meters must be greater than zero."]
+
+        if field_errors:
+            raise ValidationFailed("Missing required reinspection fields.", field_errors=field_errors)
+
+        jwo = JobWorkOrder.objects.filter(client_id=client_id, id=jwo_id).first()
         if not jwo:
-            jwo = JobWorkOrder.objects.filter(client_id=client_id).first()
+            jwo = JobWorkOrder.objects.filter(client_id=client_id, jwo_no=jwo_id).first()
         if not jwo:
-            jwo = JobWorkOrder.objects.create(
-                client_id=client_id,
-                jwo_no=source_qc_no,
-                vendor_name=vendor_name,
-                order_date=timezone.localdate(),
-                planned_qty=sent_qty,
+            raise ValidationFailed(
+                f"Job Work Order '{jwo_id}' does not exist.",
+                field_errors={"jwo_id": ["Invalid Job Work Order."]},
             )
 
-        rp_count = JWOReprocess.objects.filter(client_id=client_id).count() + 1
-        rp_no = f"RP-{timezone.localdate().year}-{rp_count:03d}"
-
+        sent_qty = D(meters_raw)
         try:
             from datetime import datetime
             r_date = datetime.strptime(date_str, "%Y-%m-%d").date()
         except Exception:
             r_date = timezone.localdate()
+
+        rp_no = allocate_number(request.user.client, "RP", r_date)
 
         reprocess = JWOReprocess.objects.create(
             client_id=client_id,
@@ -3906,7 +4049,7 @@ class QCReinspectionView(APIView):
             no=rp_no,
             date=r_date,
             qty=sent_qty,
-            reason=reason,
+            reason=f"{reason} (Challan: {challan_no})",
             status="Pending",
         )
 
@@ -4199,8 +4342,12 @@ class LotTakaRegisterView(APIView):
         # Filter option lists
         supplier_names = list(Party.objects.filter(client_id=client_id, type__in=["Vendor", "Both"]).values_list("name", flat=True).order_by("name"))
         quality_names = list(Item.objects.filter(client_id=client_id, fabric_quality__isnull=False).values_list("fabric_quality", flat=True).distinct().order_by("fabric_quality"))
-        design_names = ["Floral", "Check", "Plain", "Stripe", "Jacquard", "Dobby", "Printed"]
-        shade_names = ["Navy", "Blue", "Maroon", "White", "Black", "Green", "Grey", "Off-White", "Red"]
+        design_names = list(Design.objects.filter(client_id=client_id, deleted_at__isnull=True).values_list("name", flat=True).order_by("name"))
+        if not design_names:
+            design_names = list(Item.objects.filter(client_id=client_id, fabric_design__isnull=False).values_list("fabric_design", flat=True).distinct().order_by("fabric_design"))
+        shade_names = list(Shade.objects.filter(client_id=client_id, deleted_at__isnull=True).values_list("name", flat=True).order_by("name"))
+        if not shade_names:
+            shade_names = list(Item.objects.filter(client_id=client_id, fabric_color__isnull=False).values_list("fabric_color", flat=True).distinct().order_by("fabric_color"))
         location_names = list(Location.objects.filter(client_id=client_id).values_list("name", flat=True).order_by("name"))
 
         # Optional Item Preview Data for "+ Add Lot / Taka" Modal
@@ -4404,10 +4551,13 @@ class LotTakaRegisterView(APIView):
             return Response({"detail": "Lot record not found."}, status=status.HTTP_404_NOT_FOUND)
 
         data = request.data
-        if "locationId" in data:
-            loc = Location.objects.filter(client_id=client_id, id=data["locationId"]).first()
-            if loc:
-                lot_taka.location = loc
+        disallowed = [f for f in ("locationId", "location", "rate", "status") if f in data]
+        if disallowed:
+            raise ValidationFailed(
+                f"Direct edits to {', '.join(disallowed)} are not allowed. "
+                "All stock, location, and status changes must come from documents "
+                "(GRN, stock transfer, adjustment, or disposition)."
+            )
 
         if "remarks" in data:
             lot_taka.remarks = data["remarks"]
@@ -4424,14 +4574,8 @@ class LotTakaRegisterView(APIView):
         if "gsm" in data:
             lot_taka.gsm = Decimal(str(data["gsm"])) if data["gsm"] else None
 
-        if "rate" in data:
-            lot_taka.rate = Decimal(str(data["rate"] or "0"))
-
         if "qcStatus" in data:
             lot_taka.qc_status = data["qcStatus"]
-
-        if "status" in data:
-            lot_taka.status = data["status"]
 
         if "imageUrl" in data:
             lot_taka.image_url = data["imageUrl"]

@@ -325,14 +325,19 @@ def record_daily_entry(
     entered_by_user=None, remarks=None,
 ):
     """Post a DAILY_PROD_ENTRY_NEW row with employee code and timestamp."""
-    from .models import DailyProductionEntry
-
+    if instruction.status in ("Verified", "Closed"):
+        raise ValidationFailed(
+            f"Cannot record daily production entry for an instruction with status '{instruction.status}'.",
+            field_errors={"instructionId": [f"Instruction is already {instruction.status}."]},
+        )
     validate_employee_for_production(entered_by_employee, field="enteredByEmployeeId")
     if D(meters) <= ZERO:
         raise ValidationFailed(
             "Meters must be more than zero.",
             field_errors={"meters": ["Must be more than zero."]},
         )
+
+    from .models import DailyProductionEntry
 
     return DailyProductionEntry.objects.create(
         client=client,

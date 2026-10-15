@@ -26,6 +26,20 @@ MOVEMENT_TYPES = [
     ("FAULTY", "FAULTY"),
     ("SERVICE_USAGE", "SERVICE_USAGE"),
     ("ZONE_ISSUE", "ZONE_ISSUE"),
+    ("SAMPLE_ISSUE", "SAMPLE_ISSUE"),
+    ("SAMPLE_RETURN", "SAMPLE_RETURN"),
+    ("JOBWORK_OUTWARD", "JOBWORK_OUTWARD"),
+    ("JOBWORK_INWARD", "JOBWORK_INWARD"),
+    ("QC_PASS", "QC_PASS"),
+    ("QC_HOLD", "QC_HOLD"),
+    ("QC_REPROCESS", "QC_REPROCESS"),
+    ("QC_REJECT", "QC_REJECT"),
+    ("QC_SECOND_QUALITY", "QC_SECOND_QUALITY"),
+    ("SALES_RETURN_GOOD", "SALES_RETURN_GOOD"),
+    ("SALES_RETURN_HOLD", "SALES_RETURN_HOLD"),
+    ("SALES_RETURN_REPROCESS", "SALES_RETURN_REPROCESS"),
+    ("SALES_RETURN_SECOND_QUALITY", "SALES_RETURN_SECOND_QUALITY"),
+    ("SALES_RETURN_REJECT", "SALES_RETURN_REJECT"),
 ]
 
 #: Movements that reverse an earlier one, keyed to what they reverse.
@@ -75,6 +89,9 @@ class StockMovement(TenantModel, LegacyIdMixin):
     )
 
     batch_number = models.TextField(null=True, blank=True)
+    lot_taka = models.ForeignKey(
+        "inventory.LotTaka", null=True, blank=True, on_delete=models.SET_NULL, related_name="movements"
+    )
     movement_date = models.DateField()
     notes = models.TextField(null=True, blank=True)
 

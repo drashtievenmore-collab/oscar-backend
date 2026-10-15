@@ -55,6 +55,11 @@ class DocumentHeader(TenantModel, LegacyIdMixin):
     notes = models.TextField(null=True, blank=True)
     terms = models.TextField(null=True, blank=True)
 
+    salesperson = models.TextField(null=True, blank=True)
+    broker = models.TextField(null=True, blank=True)
+    payment_terms = models.TextField(null=True, blank=True)
+    credit_days = models.IntegerField(null=True, blank=True, default=0)
+
     posted_at = models.DateTimeField(null=True, blank=True)
     posted_by = models.ForeignKey(
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"

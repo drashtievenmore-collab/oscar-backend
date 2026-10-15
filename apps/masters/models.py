@@ -581,6 +581,10 @@ class Item(TenantModel, LegacyIdMixin):
     tolerance_pct = models.DecimalField(max_digits=7, decimal_places=4, default=2)
 
     tracking_mode = models.TextField(choices=TRACKING_MODES, default="Quantity")
+    tracking_type = models.TextField(
+        choices=[("NONE", "NONE"), ("LOT", "LOT"), ("TAKA", "TAKA"), ("SERIAL", "SERIAL")],
+        default="NONE",
+    )
     reorder_level = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     cost_price = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     selling_price = models.DecimalField(max_digits=18, decimal_places=4, default=0)

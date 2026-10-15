@@ -56,6 +56,7 @@ REPORT_CATALOGUE = [
 
 class ReportCatalogueView(APIView):
     permission_classes = [HasModulePermission]
+    required_permissions = ["view_financial_reports"]
 
     def get(self, request):
         return Response(
@@ -72,6 +73,7 @@ class ReportView(APIView):
     """``GET /reports/{reportKey}/``."""
 
     permission_classes = [HasModulePermission]
+    required_permissions = ["view_financial_reports"]
 
     def get(self, request, report_key):
         client_id = request.client_id
@@ -480,6 +482,7 @@ class MainDashboardView(APIView):
     """``GET /dashboard/`` -- the main screen payload (api.md §12)."""
 
     permission_classes = [HasModulePermission]
+    required_permissions = ["view_financial_reports"]
 
     def get(self, request):
         from apps.accounting.services import account_balances

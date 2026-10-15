@@ -17,6 +17,7 @@ def make_user(client):
             email="pending-register@example.com",
             password="pass",
             client=client,
+            is_superuser=True,
         )
     return user
 

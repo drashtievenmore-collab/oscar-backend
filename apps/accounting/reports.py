@@ -249,7 +249,8 @@ def gst_summary(client_id, date_from=None, date_to=None):
 
 
 def ageing(client_id, kind="receivable", as_of=None):
-    """``?type=receivable|payable``, bucketed 0-30 / 31-60 / 61-90 / 90+."""
+    """``?type=receivable|payable``, bucketed Current / 0-30 / 31-60 / 61-90 / 91-120 / 120+."""
+    from datetime import timedelta
     from apps.purchase.models import PurchaseBill
     from apps.sales.models import SalesInvoice
 
@@ -266,23 +267,40 @@ def ageing(client_id, kind="receivable", as_of=None):
         ).exclude(status__in=["Cancelled", "Draft", "Paid"]).select_related("party")
         number_field = "invoice_number"
 
-    buckets = {"Current": ZERO, "0-30": ZERO, "31-60": ZERO, "61-90": ZERO, "90+": ZERO}
+    buckets = {"Current": ZERO, "0-30": ZERO, "31-60": ZERO, "61-90": ZERO, "91-120": ZERO, "120+": ZERO}
     rows = []
     for document in documents:
         outstanding = round2(D(document.total) - D(document.amount_paid))
         if outstanding <= ZERO:
             continue
-        days = (as_of - document.due_date).days if document.due_date else 0
-        bucket = ageing_bucket(days)
+        due_date = document.due_date
+        if not due_date and document.doc_date:
+            credit_days = getattr(document, "credit_days", 0) or 0
+            due_date = document.doc_date + timedelta(days=int(credit_days))
+
+        days = (as_of - due_date).days if due_date else 0
+        if days <= 0:
+            bucket = "Current"
+        elif days <= 30:
+            bucket = "0-30"
+        elif days <= 60:
+            bucket = "31-60"
+        elif days <= 90:
+            bucket = "61-90"
+        elif days <= 120:
+            bucket = "91-120"
+        else:
+            bucket = "120+"
+
         buckets[bucket] = round2(buckets[bucket] + outstanding)
         rows.append(
             {
                 "documentId": str(document.id),
                 "documentNumber": getattr(document, number_field),
                 "partyId": str(document.party_id),
-                "partyName": document.party_name or document.party.name,
+                "partyName": document.party_name or (document.party.name if document.party else ""),
                 "date": document.doc_date,
-                "dueDate": document.due_date,
+                "dueDate": due_date,
                 "total": round2(document.total),
                 "outstanding": outstanding,
                 "daysOverdue": max(days, 0),

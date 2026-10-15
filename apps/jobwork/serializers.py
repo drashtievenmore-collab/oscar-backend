@@ -83,6 +83,7 @@ class ProcessPlanSerializer(BaseModelSerializer):
 
 
 class JWOMaterialSerializer(BaseModelSerializer):
+    id = serializers.UUIDField(required=False, allow_null=True)
     fabricItem = serializers.CharField(source="fabric_item", required=False, allow_blank=True)
     fabricQuality = serializers.CharField(source="fabric_quality", required=False, allow_blank=True)
     lotNo = serializers.CharField(source="lot_no", required=False, allow_blank=True, allow_null=True)
@@ -96,19 +97,19 @@ class JWOMaterialSerializer(BaseModelSerializer):
             "id", "fabricItem", "fabricQuality", "shade", "lotNo",
             "qty", "rate", "amount",
         ]
-        read_only_fields = ["id"]
 
 
 class JWOOutwardSerializer(BaseModelSerializer):
+    id = serializers.UUIDField(required=False, allow_null=True)
     lrNo = serializers.CharField(source="lr_no", required=False, allow_blank=True, allow_null=True)
 
     class Meta:
         model = JWOOutward
         fields = ["id", "no", "date", "qty", "lrNo", "transporter", "status"]
-        read_only_fields = ["id"]
 
 
 class JWOInwardSerializer(BaseModelSerializer):
+    id = serializers.UUIDField(required=False, allow_null=True)
     challanNo = serializers.CharField(
         source="challan_no", required=False, allow_blank=True, allow_null=True
     )
@@ -116,17 +117,18 @@ class JWOInwardSerializer(BaseModelSerializer):
     class Meta:
         model = JWOInward
         fields = ["id", "no", "date", "qty", "accepted", "rejected", "challanNo", "status"]
-        read_only_fields = ["id"]
 
 
 class JWOChargeSerializer(BaseModelSerializer):
+    id = serializers.UUIDField(required=False, allow_null=True)
+
     class Meta:
         model = JWOCharge
         fields = ["id", "type", "description", "rate", "qty", "amount", "status"]
-        read_only_fields = ["id"]
 
 
 class JWOReprocessSerializer(BaseModelSerializer):
+    id = serializers.UUIDField(required=False, allow_null=True)
     inwardNo = serializers.CharField(
         source="inward_no", required=False, allow_blank=True
     )
@@ -140,7 +142,6 @@ class JWOReprocessSerializer(BaseModelSerializer):
             "id", "no", "inwardNo", "date", "qty", "reason",
             "expectedReturn", "status", "remarks",
         ]
-        read_only_fields = ["id"]
 
 
 class JobWorkOrderSerializer(BaseModelSerializer):

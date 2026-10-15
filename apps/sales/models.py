@@ -32,10 +32,10 @@ QUOTATION_STATUSES = [
     "Confirmed", "Converted", "Invoiced", "Cancelled",
 ]
 ORDER_STAGES = [
-    "Draft", "Confirmed", "Packing", "Dispatched", "Delivered", "Invoiced", "Cancelled",
+    "Draft", "Confirmed", "Partially Dispatched", "Fully Dispatched", "Invoiced", "Closed", "Cancelled",
 ]
 #: Stages whose open lines no longer reserve stock (api.md §5.4, db.md §5.2).
-NON_RESERVING_STAGES = ["Delivered", "Invoiced", "Cancelled"]
+NON_RESERVING_STAGES = ["Delivered", "Invoiced", "Closed", "Cancelled"]
 PAYMENT_STATUSES = ["Unpaid", "Partially Paid", "Paid"]
 PROFORMA_STATUSES = ["Draft", "Sent", "Accepted", "Converted", "Expired", "Cancelled"]
 CHALLAN_STATUSES = ["Draft", "Dispatched", "In Transit", "Delivered", "Cancelled"]
@@ -196,6 +196,9 @@ class SalesOrder(DocumentHeader):
         "pms.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     reference_number = models.TextField(null=True, blank=True)
+    dispatch_date = models.DateField(null=True, blank=True)
+    vehicle_number = models.TextField(null=True, blank=True)
+    transporter = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "sales_orders"
@@ -367,6 +370,9 @@ class SalesInvoice(DocumentHeader):
     )
     irn = models.TextField(null=True, blank=True)
     eway_bill_number = models.TextField(null=True, blank=True)
+    dispatch_date = models.DateField(null=True, blank=True)
+    vehicle_number = models.TextField(null=True, blank=True)
+    transporter = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "sales_invoices"

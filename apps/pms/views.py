@@ -1802,6 +1802,10 @@ class PmsDashboardView(APIView):
     def get(self, request, section=None):
         client_id = request.client_id
 
+        if section == "overview":
+            from .dashboard_services import dashboard_overview
+
+            return Response(dashboard_overview(client_id, request.query_params))
         if section == "kpis":
             return Response(services.dashboard_kpis(client_id))
         if section == "pipeline":

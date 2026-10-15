@@ -126,11 +126,15 @@ class SalesOrderSerializer(DocumentSerializer):
     line_fk_name = "sales_order"
     line_table_name = "sales_order_lines"
 
+    vehicleNo = serializers.CharField(source="vehicle_number", required=False, allow_blank=True, allow_null=True)
+    dispatchDate = serializers.DateField(source="dispatch_date", required=False, allow_null=True)
+
     class Meta:
         model = SalesOrder
         fields = HEADER_FIELDS + [
             "order_number", "stage", "payment_status", "delivery_date",
             "quotation", "pms_project", "reference_number",
+            "dispatch_date", "dispatchDate", "vehicle_number", "vehicleNo", "transporter",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["order_number", "payment_status"]
 
@@ -170,11 +174,14 @@ class DeliveryChallanSerializer(DocumentSerializer):
     line_fk_name = "delivery_challan"
     line_table_name = "delivery_challan_lines"
 
+    vehicleNo = serializers.CharField(source="vehicle_number", required=False, allow_blank=True, allow_null=True)
+    dispatchDate = serializers.DateField(source="dispatch_date", required=False, allow_null=True)
+
     class Meta:
         model = DeliveryChallan
         fields = HEADER_FIELDS + [
             "challan_number", "status", "sales_order", "quotation",
-            "dispatch_date", "vehicle_number", "transporter", "lr_number",
+            "dispatch_date", "dispatchDate", "vehicle_number", "vehicleNo", "transporter", "lr_number",
             "delivery_location", "location", "delivered_at",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["challan_number", "delivered_at"]
@@ -189,6 +196,9 @@ class SalesInvoiceSerializer(DocumentSerializer):
     line_fk_name = "sales_invoice"
     line_table_name = "sales_invoice_lines"
 
+    vehicleNo = serializers.CharField(source="vehicle_number", required=False, allow_blank=True, allow_null=True)
+    dispatchDate = serializers.DateField(source="dispatch_date", required=False, allow_null=True)
+
     #: ``Overdue`` is layered on at read time, never stored (db.md §12).
     displayStatus = serializers.SerializerMethodField()
 
@@ -198,6 +208,7 @@ class SalesInvoiceSerializer(DocumentSerializer):
             "invoice_number", "status", "displayStatus", "due_date",
             "sales_order", "delivery_challan", "proforma_invoice", "location",
             "irn", "eway_bill_number",
+            "dispatch_date", "dispatchDate", "vehicle_number", "vehicleNo", "transporter",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["invoice_number", "status"]
 

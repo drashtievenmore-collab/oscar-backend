@@ -72,12 +72,9 @@ INSTALLED_APPS = [
 ]
 
 # --------------------------------------------------------------------------
-# Module toggle (HRMS-only dev mode)
-# --------------------------------------------------------------------------
-#: HRMS_ONLY=True exposes only auth/admin/hrms (+ core platform) routes.
-#: HRMS_ONLY=False exposes the full ERP. Flip in `.env`, no code edits.
-#: Optionally override the exact route set with ENABLED_MODULES (comma-separated).
-HRMS_ONLY = env_bool("HRMS_ONLY", True)
+# Module toggle: False exposes the full Oscar ERP. Flip in `.env`, no code edits.
+# Optionally override the exact route set with ENABLED_MODULES (comma-separated).
+HRMS_ONLY = env_bool("HRMS_ONLY", False)
 
 #: Route keys used by config/urls.py. "auth"/"admin" (accounts) and "core"
 #: platform routes are always on -- HRMS needs login, users and files.
@@ -106,6 +103,10 @@ elif HRMS_ONLY:
     ENABLED_MODULES = list(HRMS_ONLY_MODULES)
 else:
     ENABLED_MODULES = list(FULL_MODULES)
+
+import logging
+logger = logging.getLogger("oscar.config")
+logger.info("Enabled modules: %s", ", ".join(ENABLED_MODULES))
 
 
 def module_enabled(name):
