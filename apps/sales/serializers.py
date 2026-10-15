@@ -177,6 +177,9 @@ class DeliveryChallanSerializer(DocumentSerializer):
 
     vehicleNo = serializers.CharField(source="vehicle_number", required=False, allow_blank=True, allow_null=True)
     dispatchDate = serializers.DateField(source="dispatch_date", required=False, allow_null=True)
+    ewayBillNumber = serializers.CharField(source="eway_bill_number", required=False, allow_blank=True, allow_null=True)
+    ewayBillDate = serializers.DateTimeField(source="eway_bill_date", required=False, allow_null=True)
+    ewayBillValidUntil = serializers.DateTimeField(source="eway_bill_valid_until", required=False, allow_null=True)
 
     class Meta:
         model = DeliveryChallan
@@ -184,6 +187,8 @@ class DeliveryChallanSerializer(DocumentSerializer):
             "challan_number", "status", "sales_order", "quotation",
             "dispatch_date", "dispatchDate", "vehicle_number", "vehicleNo", "transporter", "lr_number",
             "delivery_location", "location", "delivered_at",
+            "eway_bill_number", "ewayBillNumber", "eway_bill_date", "ewayBillDate",
+            "eway_bill_valid_until", "ewayBillValidUntil",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["challan_number", "delivered_at"]
 
@@ -199,6 +204,13 @@ class SalesInvoiceSerializer(DocumentSerializer):
 
     vehicleNo = serializers.CharField(source="vehicle_number", required=False, allow_blank=True, allow_null=True)
     dispatchDate = serializers.DateField(source="dispatch_date", required=False, allow_null=True)
+    ackNo = serializers.CharField(source="ack_no", required=False, allow_blank=True, allow_null=True)
+    ackDate = serializers.DateTimeField(source="ack_date", required=False, allow_null=True)
+    signedQrcode = serializers.CharField(source="signed_qrcode", required=False, allow_blank=True, allow_null=True)
+    einvoiceStatus = serializers.CharField(source="einvoice_status", required=False, allow_blank=True, allow_null=True)
+    ewayBillNumber = serializers.CharField(source="eway_bill_number", required=False, allow_blank=True, allow_null=True)
+    ewayBillDate = serializers.DateTimeField(source="eway_bill_date", required=False, allow_null=True)
+    ewayBillValidUntil = serializers.DateTimeField(source="eway_bill_valid_until", required=False, allow_null=True)
 
     #: ``Overdue`` is layered on at read time, never stored (db.md §12).
     displayStatus = serializers.SerializerMethodField()
@@ -208,7 +220,10 @@ class SalesInvoiceSerializer(DocumentSerializer):
         fields = HEADER_FIELDS + [
             "invoice_number", "status", "displayStatus", "due_date",
             "sales_order", "delivery_challan", "proforma_invoice", "location",
-            "irn", "eway_bill_number",
+            "irn", "eway_bill_number", "ewayBillNumber",
+            "ack_no", "ackNo", "ack_date", "ackDate", "signed_qrcode", "signedQrcode",
+            "einvoice_status", "einvoiceStatus",
+            "eway_bill_date", "ewayBillDate", "eway_bill_valid_until", "ewayBillValidUntil",
             "dispatch_date", "dispatchDate", "vehicle_number", "vehicleNo", "transporter",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["invoice_number", "status"]

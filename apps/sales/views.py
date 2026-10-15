@@ -1097,6 +1097,21 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    @action(detail=True, methods=["post"], url_path="generate-eway-bill")
+    def generate_eway_bill_action(self, request, pk=None):
+        from . import einvoice_service
+
+        challan = self.get_object()
+        data = request.data or {}
+        res = einvoice_service.generate_eway_bill(
+            challan,
+            transporter_id=data.get("transporterId") or data.get("transporter"),
+            vehicle_no=data.get("vehicleNo") or data.get("vehicle_number"),
+            approx_distance_km=int(data.get("distanceKm") or 100),
+        )
+        self.write_audit("generate_eway_bill", challan, description=f"E-Way bill generated: {res['ewayBillNumber']}")
+        return Response(self.get_serializer(challan).data)
+
 
 # ---------------------------------------------------------------------------
 # Sales invoices (api.md §5.7)
@@ -1180,14 +1195,52 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
     def outstanding(self, request, pk=None):
         return Response(services.invoice_outstanding(self.get_object()))
 
+    @action(detail=True, methods=["post"], url_path="generate-irn")
+    def generate_irn(self, request, pk=None):
+        """Generate or simulate IRN and signed QR code (PDF §20)."""
+        from . import einvoice_service
+
+        invoice = self.get_object()
+        if invoice.status == "Draft":
+            raise Conflict("Invoice must be finalized before generating IRN.", code=Codes.NOT_FINALIZED)
+        res = einvoice_service.generate_irn(invoice, user=request.user)
+        self.write_audit("generate_irn", invoice, description=f"IRN generated: {res['irn']}")
+        return Response(self.get_serializer(invoice).data)
+
+    @action(detail=True, methods=["post"], url_path="cancel-irn")
+    def cancel_irn(self, request, pk=None):
+        """Cancel generated IRN within statutory window."""
+        from . import einvoice_service
+
+        invoice = self.get_object()
+        reason = request.data.get("reason", "1")
+        remarks = request.data.get("remarks", "")
+        einvoice_service.cancel_irn(invoice, reason=reason, remarks=remarks)
+        self.write_audit("cancel_irn", invoice, description=f"IRN cancelled: {remarks}")
+        return Response(self.get_serializer(invoice).data)
+
+    @action(detail=True, methods=["post"], url_path="generate-eway-bill")
+    def generate_eway_bill(self, request, pk=None):
+        """Generate or simulate E-Way Bill for invoice (PDF §20)."""
+        from . import einvoice_service
+
+        invoice = self.get_object()
+        if invoice.status == "Draft":
+            raise Conflict("Invoice must be finalized before generating E-Way Bill.", code=Codes.NOT_FINALIZED)
+        data = request.data or {}
+        res = einvoice_service.generate_eway_bill(
+            invoice,
+            transporter_id=data.get("transporterId") or data.get("transporter"),
+            vehicle_no=data.get("vehicleNo") or data.get("vehicle_number"),
+            approx_distance_km=int(data.get("distanceKm") or 100),
+        )
+        self.write_audit("generate_eway_bill", invoice, description=f"E-Way bill generated: {res['ewayBillNumber']}")
+        return Response(self.get_serializer(invoice).data)
+
     @action(detail=True, methods=["post"], url_path="e-invoice")
     def e_invoice(self, request, pk=None):
-        """IRN / e-way bill hook (api.md §5.7, phase 2)."""
-        self.get_object()
-        raise PdfNotAvailable(
-            "E-invoicing is not configured on this workspace.",
-            code="EINVOICE_NOT_CONFIGURED",
-        )
+        """IRN generator compatibility endpoint."""
+        return self.generate_irn(request, pk=pk)
 
 
 # ---------------------------------------------------------------------------

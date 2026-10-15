@@ -11,6 +11,7 @@ router.register(
     "proforma-invoices", views.ProformaInvoiceViewSet, basename="sales-proformas"
 )
 router.register("challans", views.DeliveryChallanViewSet, basename="sales-challans")
+router.register("delivery-challans", views.DeliveryChallanViewSet, basename="sales-delivery-challans")
 router.register("invoices", views.SalesInvoiceViewSet, basename="sales-invoices")
 router.register("payments", views.PaymentInViewSet, basename="sales-payments")
 router.register("returns", views.SalesReturnViewSet, basename="sales-returns")

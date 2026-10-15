@@ -233,6 +233,20 @@ CATALOGUE = [
             ("manage_return_reasons", "Manage return reasons"),
         ],
     ),
+    (
+        "Control & Compliance",
+        "Approvals & Exceptions",
+        [
+            ("view_approvals", "View approval requests"),
+            ("manage_approvals", "Approve or reject requests"),
+            ("manage_approval_rules", "Configure approval rules & limits"),
+            ("view_alerts", "View system alerts & exceptions"),
+            ("manage_alerts", "Acknowledge and configure alerts"),
+            ("view_owner_mis", "View executive and owner MIS dashboards"),
+            ("manage_samples", "Issue, return, and consume samples"),
+            ("manage_logistics", "Dispatch tempo trips and allocate freight"),
+        ],
+    ),
 ]
 
 
@@ -309,39 +323,14 @@ def grouped_catalogue():
     return modules
 
 
-#: Seed roles for a fresh tenant. ``"*"`` means every permission in the
-#: catalogue -- the Administrator role.
+#: Seed roles for a fresh tenant. The 12 core Phase 4 roles (PDF §16).
 DEFAULT_ROLES = [
-    ("AD", "Administrator", "Full access to every module.", ["*"]),
+    ("OWNER", "Owner / Super Admin", "Full uninhibited access to all modules, financial ledgers, settings and approvals.", ["*"]),
+    ("AD", "Admin", "Administrative configuration, user management, and operational workflows.", ["*"]),
     (
-        "SM",
-        "Sales Manager",
-        "Owns the sales pipeline and the CRM.",
-        [
-            "menu_sales", "menu_crm", "menu_inventory",
-            "view_sales", "create_quotation", "create_sales_order", "create_invoice",
-            "finalize_invoice", "cancel_invoice", "record_payment_in",
-            "view_lead", "create_lead", "edit_lead", "move_lead", "manage_pipeline",
-            "view_task", "create_task", "edit_task", "assign_task",
-            "view_inventory", "show_crm_dashboard", "export_excel",
-        ],
-    ),
-    (
-        "AC",
-        "Accountant",
-        "Ledgers, payments and financial reporting.",
-        [
-            "menu_accounts", "menu_sales", "menu_purchase",
-            "view_bank_accounts", "manage_journal_entries", "view_ledger",
-            "view_financial_reports", "reconcile_bank",
-            "view_sales", "view_purchase", "record_payment_in", "record_payment_out",
-            "finalize_invoice", "show_account_dashboard", "export_excel",
-        ],
-    ),
-    (
-        "PU",
-        "Purchase Officer",
-        "Procurement, goods receipt and QC.",
+        "PURCHASE_MGR",
+        "Purchase Manager",
+        "Procurement, goods receipt (GRN), vendor bills, 3-way matching and purchase rate approvals.",
         [
             "menu_purchase", "menu_inventory", "menu_jobwork",
             "view_purchase", "create_purchase_order", "create_bill", "receive_goods",
@@ -350,58 +339,111 @@ DEFAULT_ROLES = [
             "view_jobwork", "manage_jobwork", "approve_jobwork",
             "view_masters", "manage_agencies", "manage_brokers", "manage_processes",
             "manage_jobwork_rates", "manage_defects", "manage_loss_reasons", "manage_return_reasons",
-        ],
-    ),
-    (
-        "ST",
-        "Store Keeper",
-        "Stock position, transfers and audits.",
-        [
-            "menu_inventory", "view_inventory", "adjust_stock", "create_transfer",
-            "approve_zone_request", "perform_audit", "receive_goods", "view_jobwork",
-        ],
-    ),
-    (
-        "PM",
-        "Project Manager",
-        "PMS projects, stages and client approvals.",
-        [
-            "menu_pms", "menu_sales",
-            "view_pms", "create_pms_project", "assign_stage", "handoff_stage",
-            "approve_document", "share_client_proof", "log_delay", "complete_project",
-            "view_projects", "create_project", "edit_project", "manage_milestones",
-            "assign_members", "view_sales",
-        ],
-    ),
-    (
-        "HR",
-        "HR Manager",
-        "Employees, attendance, leave and payroll.",
-        [
-            "menu_hrms",
-            "mark_attendance", "view_team_attendance", "approve_leave",
-            "regularize_attendance", "generate_payroll", "approve_payroll",
-            "edit_salary_structure", "view_staff", "create_staff", "edit_staff",
-            "show_hrm_dashboard", "export_excel",
+            "view_approvals", "manage_approvals", "view_alerts", "export_excel",
         ],
     ),
     (
         "PC",
-        "Production Coordinator",
-        "Grey-fabric monitoring and verification. No payroll write.",
+        "Production Coordinator / Salaried Production Person",
+        "Grey-fabric production work instructions, daily entries, and completion verification.",
         [
             "menu_hrms", "menu_jobwork",
             "view_staff",
             "view_production", "enter_production", "verify_production",
             "view_jobwork", "manage_jobwork", "approve_jobwork",
-            "export_excel",
+            "view_masters", "view_inventory", "view_approvals", "view_alerts", "export_excel",
         ],
     ),
     (
-        "EM",
-        "Employee",
-        "Self-service access only.",
-        ["apply_leave", "view_own_payslip", "mark_attendance", "view_task"],
+        "INV_MGR",
+        "Godown / Inventory Manager",
+        "Lot/taka registry, tag printing, stock transfers, locations, and inventory audits.",
+        [
+            "menu_inventory", "view_inventory", "adjust_stock", "create_transfer",
+            "approve_zone_request", "perform_audit", "receive_goods", "view_jobwork",
+            "manage_samples", "manage_logistics", "view_approvals", "view_alerts", "export_excel",
+        ],
+    ),
+    (
+        "QC_PERSON",
+        "QC Person",
+        "4-Point fabric inspection, defects tracking, disposition, and reinspection.",
+        [
+            "menu_inventory", "view_inventory", "approve_qc",
+            "view_masters", "manage_defects", "manage_loss_reasons", "manage_return_reasons",
+            "view_approvals", "view_alerts",
+        ],
+    ),
+    (
+        "SALES_MGR",
+        "Sales Manager",
+        "Sales pipeline, quotations, orders, credit checks, pricing, broker commission, and discount approvals.",
+        [
+            "menu_sales", "menu_crm", "menu_inventory",
+            "view_sales", "create_quotation", "create_sales_order", "create_invoice",
+            "finalize_invoice", "cancel_invoice", "record_payment_in",
+            "view_lead", "create_lead", "edit_lead", "move_lead", "manage_pipeline",
+            "view_task", "create_task", "edit_task", "assign_task",
+            "view_inventory", "show_crm_dashboard", "manage_samples",
+            "view_approvals", "manage_approvals", "view_alerts", "export_excel",
+        ],
+    ),
+    (
+        "SALES_EXEC",
+        "Sales Executive",
+        "Quotation composer, sales orders, party directory, and limited discount permissions.",
+        [
+            "menu_sales", "menu_crm", "menu_inventory",
+            "view_sales", "create_quotation", "create_sales_order",
+            "view_lead", "create_lead", "edit_lead",
+            "view_task", "create_task", "view_inventory", "export_excel",
+        ],
+    ),
+    (
+        "ACCOUNTS",
+        "Accounts",
+        "Day book, cash & bank summary, general ledger, payment/receipt vouchers, debit/credit notes, and Tally export.",
+        [
+            "menu_accounts", "menu_sales", "menu_purchase",
+            "view_bank_accounts", "manage_journal_entries", "view_ledger",
+            "view_financial_reports", "reconcile_bank",
+            "view_sales", "view_purchase", "record_payment_in", "record_payment_out",
+            "finalize_invoice", "show_account_dashboard", "view_approvals", "manage_approvals",
+            "view_alerts", "view_owner_mis", "export_excel",
+        ],
+    ),
+    (
+        "LOGISTICS",
+        "Dispatch / Logistics",
+        "Delivery challans, warehouse roll picking, trips, tempo freight allocation, and LR tracking.",
+        [
+            "menu_sales", "menu_inventory",
+            "view_sales", "create_sales_order",
+            "view_inventory", "create_transfer", "manage_logistics",
+            "view_approvals", "view_alerts", "export_excel",
+        ],
+    ),
+    (
+        "HR",
+        "HR / Payroll",
+        "Employees, attendance, leave and payroll processing.",
+        [
+            "menu_hrms",
+            "mark_attendance", "view_team_attendance", "approve_leave",
+            "regularize_attendance", "generate_payroll", "approve_payroll",
+            "edit_salary_structure", "view_staff", "create_staff", "edit_staff",
+            "show_hrm_dashboard", "view_approvals", "view_alerts", "export_excel",
+        ],
+    ),
+    (
+        "AUDITOR",
+        "Read-only / Auditor",
+        "Read-only audit access across all registers, ledgers, vouchers, and MIS reports without mutation rights.",
+        [
+            "menu_sales", "menu_purchase", "menu_inventory", "menu_accounts", "menu_jobwork", "menu_hrms", "menu_pms",
+            "view_sales", "view_purchase", "view_inventory", "view_ledger", "view_financial_reports",
+            "view_jobwork", "view_production", "view_staff", "view_owner_mis", "export_excel",
+        ],
     ),
 ]
 
@@ -418,8 +460,6 @@ def seed_roles(client):
             code=code,
             defaults={"name": name, "description": description, "is_system": True},
         )
-        if not created:
-            continue
         created_roles.append(role)
         wanted = every_permission if permission_ids == ["*"] else permission_ids
         RolePermission.objects.bulk_create(

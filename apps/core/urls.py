@@ -2,12 +2,16 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
-from . import views, views_settings
+from . import views, views_settings, approval_views
 
 router = DefaultRouter(trailing_slash=True)
 router.register("files", views.FileViewSet, basename="files")
 router.register("notifications", views.NotificationViewSet, basename="notifications")
 router.register("audit", views.AuditLogViewSet, basename="audit")
+router.register("approvals/rules", approval_views.ApprovalRuleViewSet, basename="approval-rules")
+router.register("approvals/requests", approval_views.ApprovalRequestViewSet, basename="approval-requests")
+router.register("alerts/incidents", approval_views.AlertIncidentViewSet, basename="alert-incidents")
+router.register("alerts/settings", approval_views.AlertSettingViewSet, basename="alert-settings")
 
 file_urlpatterns = [
     path("upload-url/", views.UploadUrlView.as_view(), name="file-upload-url"),

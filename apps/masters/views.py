@@ -114,7 +114,6 @@ class PartyViewSet(TenantModelViewSet):
         if not serializer.validated_data.get("code"):
             series = {
                 "Vendor": "VEND",
-                "Transporter": "TRNS",
                 "Processor": "PROC",
             }.get(serializer.validated_data.get("type"), "CUST")
             serializer.validated_data["code"] = allocate_number(

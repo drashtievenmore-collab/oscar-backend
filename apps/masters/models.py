@@ -54,7 +54,6 @@ class Party(TenantModel, LegacyIdMixin):
         ("Customer", "Customer"),
         ("Vendor", "Vendor"),
         ("Both", "Both"),
-        ("Transporter", "Transporter"),
         ("Processor", "Processor"),
     ]
     #: Supplier classification (db.md §4.1 addendum) -- only meaningful when

@@ -9,5 +9,7 @@ router.register("process-plans", views.ProcessPlanViewSet, basename="jobwork-pro
 router.register("orders", views.JobWorkOrderViewSet, basename="jobwork-orders")
 
 urlpatterns = [
+    path("itc-04/", views.ITC04ReportView.as_view(), name="jobwork-itc04-report"),
+    path("itc-04/export/", views.ITC04ExportView.as_view(), name="jobwork-itc04-export"),
     path("", include(router.urls)),
 ]

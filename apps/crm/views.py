@@ -1609,18 +1609,37 @@ class CrmDashboardView(APIView):
         return Response(
             {
                 "kpis": {
-                    "totalLeads": leads.count(),
-                    "openDeals": deals.exclude(stage__in=["Won", "Lost"]).count(),
-                    "wonDeals": deals.filter(stage="Won").count(),
-                    "pipelineValue": round2(
-                        deals.exclude(stage__in=["Won", "Lost"]).aggregate(
-                            value=money_sum("value")
-                        )["value"]
-                    ),
-                    "openTasks": Task.objects.filter(
-                        client_id=client_id, deleted_at__isnull=True
-                    ).exclude(status="Completed").count(),
-                },
+            "totalLeads": leads.count(),
+            "convertedLeads": leads.filter(converted_at__isnull=False).count(),
+            "openLeads": leads.filter(converted_at__isnull=True).count(),
+            "openDeals": deals.exclude(stage__in=["Won", "Lost"]).count(),
+            "wonDeals": deals.filter(stage="Won").count(),
+            "lostDeals": deals.filter(stage="Lost").count(),
+            "totalDeals": deals.count(),
+            "pipelineValue": round2(
+                deals.exclude(stage__in=["Won", "Lost"]).aggregate(
+                    value=money_sum("value")
+                )["value"]
+            ),
+            "wonValue": round2(
+                deals.filter(stage="Won").aggregate(value=money_sum("value"))["value"]
+            ),
+            "leadConversionRatePct": round(
+                (leads.filter(converted_at__isnull=False).count() / max(leads.count(), 1)) * 100, 1
+            ),
+            "winRatePct": round(
+                (deals.filter(stage="Won").count()
+                / max(deals.filter(stage__in=["Won", "Lost"]).count(), 1))
+                * 100,
+                1,
+            ),
+            "openTasks": Task.objects.filter(
+                client_id=client_id, deleted_at__isnull=True
+            ).exclude(status="Completed").count(),
+            "overdueTasks": Task.objects.filter(
+                client_id=client_id, deleted_at__isnull=True, due_date__lt=timezone.now().date()
+            ).exclude(status="Completed").count(),
+        },
                 "funnel": [
                     {
                         "stage": row["stage__name"],

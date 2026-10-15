@@ -138,11 +138,15 @@ return 404, never 403 (api.md §1.11).
 |---|---|
 | `seed_demo [--reset]` | Demo tenant built by posting real documents, so every derived number has a cause (db.md §14.1) |
 | `smoke_test` | The api-integration.md §12.3 checklist over real HTTP |
+| `seed_phase4_roles [--tenant <slug>]` | Seed or refresh the 12 core textile roles and permission catalogue (PDF §16) |
+| `run_alerts [--tenant <slug>] [--as-of YYYY-MM-DD]` | Scheduled alert engine: checks 12 operational thresholds & generates incidents (PDF §19) |
 | `run_maintenance --job {hourly,nightly,all}` | The db.md §13 jobs. Reconcilers **alert, never auto-correct** |
 | `enable_rls [--dry-run] [--drop]` | Install row-level security on all 160 tenant tables |
 
 `run_maintenance` exits non-zero when it finds drift, so it can be wired
 straight into an alerting cron.
+
+`run_alerts` evaluates the 12 operational exceptions (delayed JWOs, pending updates, overdue samples, credit limits, etc.) and should be scheduled every 15 minutes + EOD.
 
 ---
 
@@ -221,6 +225,47 @@ Stated plainly rather than stubbed silently:
 - **Object storage.** Files use a local backend behind the same signed
   three-step flow (`upload-url` → `PUT` → `commit`), so swapping in S3 is
   confined to `apps/core/files.py`.
-- **e-invoicing (IRN / e-way bill)** — api.md §5.7 marks it phase 2.
 - **`audit_log` partitioning** — the table and its indexes match db.md §2.5;
   monthly partitioning is a migration to add before the table gets large.
+
+---
+
+## Phase 4 — Control, Alerts, Dashboards, Integrations & Compliance (PDF §16, §19, §15, §20)
+
+### 1. Generic Approval Engine (PDF §16)
+- **Models**: `ApprovalRule` (stores condition thresholds like percent variance, amount, credit days, approver role) and `ApprovalRequest` (tracks status `Pending`, `Approved`, `Rejected` with decision logs and comments).
+- **Control points**: 13 points wired including purchase rate change, wastage above tolerance, credit limit exceeded, discount above user limit, sale below landed cost, manual stock adjustments, vendor invoice mismatch, and final PO creation.
+- **Workflow**: Any document under `Pending` approval is locked against progression until authorized. Approvals inbox at `/administration/approvals` with live count badge in top navigation.
+
+### 2. Role-Based Permissions (PDF §16)
+- 12 pre-seeded roles via `python manage.py seed_phase4_roles`:
+  1. Owner / Super Admin
+  2. Admin
+  3. Purchase Manager
+  4. Production Coordinator / Salaried Production Person
+  5. Godown / Inventory Manager
+  6. QC Person
+  7. Sales Manager
+  8. Sales Executive
+  9. Accounts
+  10. Dispatch / Logistics
+  11. HR / Payroll
+  12. Read-only / Auditor
+- Enforced server-side across all endpoints; non-textile modules (warranty cards, machines/serials) remain hidden.
+
+### 3. Alerts & Exception Engine (PDF §19)
+- **Runner**: `python manage.py run_alerts [--tenant <slug>] [--as-of YYYY-MM-DD]`
+- Evaluates 12 operational alert rules: delayed job work orders, missing daily production updates by EOD, un-returned samples, excessive loss/wastage, credit limit/overdue invoices, below-cost sales, un-invoiced challans, and slow-moving stock (>180 days).
+- **Incident Center**: In-app notifications and dedicated Alert Center page at `/administration/alerts` with severity tags, acknowledgement, and resolution workflows.
+
+### 4. Dashboards & Owner MIS (PDF §15)
+- All numbers calculated server-side from PostgreSQL models with zero client-side recomputation:
+  - **Annual Commercial Leakage**: Gross sales vs party discounts, incentives, brokerage, sales returns, and sampling expenses (with ₹ amounts and % of gross sales).
+  - **Party Profitability**: Customer-wise sales, COGS, discounts, brokerage, returns, and net contribution margin.
+  - **Design & Colour Shade Analysis**: Fabric-wise production, sales, current balance meters, and stock ageing.
+  - **Stock Ageing MIS**: 0-30, 31-60, 61-90, 91-180, and 180+ days (slow-moving) breakdown with meter quantities and valuation.
+
+### 5. Compliance & Integrations (PDF §20)
+- **E-Invoicing & E-Way Bill**: `apps/sales/einvoice_service.py` with pluggable GSP architecture (`EINVOICE_ENABLED`, `EINVOICE_SANDBOX`). Generates 64-character IRN, signed QR code data, and 12-digit E-Way bills for Tax Invoices and Delivery Challans.
+- **ITC-04 Statutory GST Return**: Quarterly job-work reporting at `/job-work/itc-04` covering Table 4 (goods sent to job workers), Table 5A (goods received back from job workers), and direct CSV export for GST portal submission.
+
