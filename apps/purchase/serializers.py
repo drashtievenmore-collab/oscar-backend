@@ -187,24 +187,30 @@ class GoodsReceiptLineSerializer(BaseModelSerializer):
         fields = [
             "id", "itemId", "sku", "itemName", "uom", "uom_factor", "stock_uom", "stock_qty",
             "ordered_qty", "received_qty",
-            "weighed_qty", "rejected_qty", "batch_number", "unit_cost",
-            "variation_pct",
+            "weighed_qty", "rejected_qty", "shortage_qty", "excess_qty",
+            "roll_count", "weight_kg", "fabric_width", "remarks",
+            "batch_number", "unit_cost", "variation_pct",
         ]
 
 
 class GoodsReceiptSerializer(BaseModelSerializer):
     lines = GoodsReceiptLineSerializer(many=True, read_only=True)
     vendorName = serializers.CharField(source="party.name", read_only=True)
+    vendorCode = serializers.CharField(source="party.code", read_only=True)
     billNumber = serializers.CharField(
-        source="purchase_bill.bill_number", read_only=True
+        source="purchase_bill.bill_number", read_only=True, allow_null=True
+    )
+    poNumber = serializers.CharField(
+        source="purchase_order.po_number", read_only=True, allow_null=True
     )
 
     class Meta:
         model = GoodsReceipt
         fields = [
-            "id", "grn_number", "purchase_order", "purchase_bill", "billNumber",
-            "party", "vendorName", "receipt_date", "location", "qc_status",
-            "qc_note", "qc_at", "lines", "created_at",
+            "id", "grn_number", "purchase_order", "poNumber", "purchase_bill", "billNumber",
+            "party", "vendorName", "vendorCode", "receipt_date",
+            "supplier_challan_no", "supplier_challan_date",
+            "location", "qc_status", "qc_note", "qc_at", "lines", "created_at",
         ]
 
 

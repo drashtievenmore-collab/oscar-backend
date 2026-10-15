@@ -15,8 +15,8 @@ from apps.core.serializers import (
     TenantPrimaryKeyRelatedField,
 )
 
-from . import services
 from .models import (
+    BrokerCommission,
     DeliveryChallan,
     DeliveryChallanLine,
     PaymentAllocation,
@@ -35,6 +35,7 @@ from .models import (
     WarrantyCard,
     WarrantyCardItem,
 )
+from . import services
 
 
 def line_serializer_for(line_model, table_name, extra_fields=(), extra_read_only=()):
@@ -67,14 +68,14 @@ SalesOrderLineSerializer = line_serializer_for(
     extra_read_only=["dispatched_qty", "invoiced_qty"],
 )
 ProformaInvoiceLineSerializer = line_serializer_for(
-    ProformaInvoiceLine, "proforma_invoice_lines"
+    ProformaInvoiceLine, "proforma_invoice_lines", extra_fields=["sales_order_line"],
 )
 DeliveryChallanLineSerializer = line_serializer_for(
-    DeliveryChallanLine, "delivery_challan_lines"
+    DeliveryChallanLine, "delivery_challan_lines", extra_fields=["taka_allocations"],
 )
 SalesInvoiceLineSerializer = line_serializer_for(
     SalesInvoiceLine, "sales_invoice_lines",
-    extra_fields=["returned_qty"], extra_read_only=["returned_qty"],
+    extra_fields=["returned_qty", "taka_allocations"], extra_read_only=["returned_qty"],
 )
 
 
@@ -289,10 +290,17 @@ class SalesReturnLineSerializer(DocumentLineSerializer):
         source="sales_invoice_line", queryset=SalesInvoiceLine.objects.all()
     )
     returnedQty = QuantityField(source="returned_qty")
+    condition = serializers.ChoiceField(
+        choices=["Good", "Hold", "Reprocess", "Second Quality", "Reject"],
+        required=False,
+    )
+    lotTakaId = serializers.UUIDField(source="lot_taka_id", required=False, allow_null=True)
 
     class Meta(DocumentLineSerializer.Meta):
         model = SalesReturnLine
-        fields = DocumentLineSerializer.Meta.fields + ["salesInvoiceLineId", "returnedQty"]
+        fields = DocumentLineSerializer.Meta.fields + [
+            "salesInvoiceLineId", "returnedQty", "condition", "lotTakaId",
+        ]
 
 
 class SalesReturnSerializer(DocumentSerializer):
@@ -410,3 +418,23 @@ class WarrantyCardSerializer(BaseModelSerializer):
 
 class ReasonSerializer(BaseSerializer):
     reason = serializers.CharField(required=False, allow_blank=True)
+
+
+class BrokerCommissionSerializer(BaseModelSerializer):
+    brokerName = serializers.CharField(source="broker.name", read_only=True)
+    brokerCode = serializers.CharField(source="broker.code", read_only=True)
+    partyName = serializers.CharField(source="party.name", read_only=True)
+    invoiceNumber = serializers.CharField(source="invoice.invoice_number", read_only=True)
+
+    class Meta:
+        model = BrokerCommission
+        fields = [
+            "id", "commission_number", "broker", "brokerName", "brokerCode",
+            "invoice", "invoiceNumber", "party", "partyName", "salesperson",
+            "invoice_date", "invoice_amount", "commission_basis", "commission_type",
+            "rate", "commission_amount", "paid_amount", "status",
+            "approved_by", "approved_at", "paid_at", "payment_reference",
+            "notes", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+

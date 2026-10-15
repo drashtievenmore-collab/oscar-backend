@@ -13,6 +13,7 @@ router.register(
     "expense-categories", views.ExpenseCategoryViewSet, basename="accounts-expense-categories"
 )
 router.register("chart-of-accounts", views.AccountViewSet, basename="accounts-coa")
+router.register("standalone-notes", views.StandaloneNoteViewSet, basename="accounts-standalone-notes")
 
 urlpatterns = [
     path("balances/", views.BalancesView.as_view(), name="accounts-balances"),
@@ -26,5 +27,7 @@ urlpatterns = [
         views.FinancialReportView.as_view(),
         name="accounts-reports",
     ),
+    path("export/tally/", views.TallyExportView.as_view(), name="accounts-tally-export"),
+    path("export/excel/", views.ExcelExportView.as_view(), name="accounts-excel-export"),
     path("", include(router.urls)),
 ]

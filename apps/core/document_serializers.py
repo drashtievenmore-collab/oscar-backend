@@ -15,6 +15,8 @@ LINE_FIELDS = [
     "id", "line_no", "itemId", "sku", "itemName", "description", "hsn_code", "uom",
     "uom_factor", "qty", "rate", "amount", "discount", "discount_amount", "tax", "tax_amount",
     "line_total", "serials",
+    "fabricQualityId", "fabricQualityName", "designId", "designName", "shadeId", "shadeName",
+    "lotPreference", "takaCount", "landedCost", "marginPct", "belowCost", "belowMargin", "reservedTakas",
     "isBomGenerated", "bomSourceItemId", "parentLineId", "isBomPart",
     "isUserModified", "parent_sku",
 ]
@@ -23,7 +25,9 @@ LINE_FIELDS = [
 HEADER_FIELDS = [
     "id", "partyId", "partyName", "party_gstin", "billing_address",
     "shipping_address", "place_of_supply", "date", "notes", "terms",
-    "salesperson", "broker", "payment_terms", "credit_days",
+    "salesperson", "salespersonId", "salespersonName",
+    "broker", "brokerId", "brokerName",
+    "transportResponsibility", "payment_terms", "paymentTerms", "credit_days", "creditDays",
     "subtotal", "total_discount", "taxable_value", "cgst", "sgst", "igst", "cess",
     "total_tax", "freight_charges", "other_charges", "round_off", "total",
     "amount_paid", "balance_due", "discount_override",
@@ -77,6 +81,25 @@ class DocumentLineSerializer(BaseModelSerializer):
     serials = serializers.ListField(
         child=serializers.CharField(), required=False, allow_empty=True
     )
+    fabricQualityId = TenantPrimaryKeyRelatedField(
+        source="fabric_quality", model="masters.FabricQuality", required=False, allow_null=True
+    )
+    fabricQualityName = serializers.CharField(source="fabric_quality.name", read_only=True)
+    designId = TenantPrimaryKeyRelatedField(
+        source="design", model="masters.Design", required=False, allow_null=True
+    )
+    designName = serializers.CharField(source="design.name", read_only=True)
+    shadeId = TenantPrimaryKeyRelatedField(
+        source="shade", model="masters.Shade", required=False, allow_null=True
+    )
+    shadeName = serializers.CharField(source="shade.name", read_only=True)
+    lotPreference = serializers.CharField(source="lot_preference", required=False, allow_blank=True, allow_null=True)
+    takaCount = serializers.IntegerField(source="taka_count", required=False, default=0)
+    landedCost = serializers.DecimalField(source="landed_cost", max_digits=18, decimal_places=4, required=False, default=0)
+    marginPct = serializers.DecimalField(source="margin_pct", max_digits=7, decimal_places=2, required=False, default=0)
+    belowCost = serializers.BooleanField(source="below_cost", required=False, default=False)
+    belowMargin = serializers.BooleanField(source="below_margin", required=False, default=False)
+    reservedTakas = serializers.ListField(source="reserved_takas", required=False, default=list)
 
     class Meta:
         fields = LINE_FIELDS
@@ -99,6 +122,17 @@ class DocumentSerializer(BaseModelSerializer):
     partyId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
     partyName = serializers.CharField(source="party_name", read_only=True)
     date = serializers.DateField(source="doc_date")
+    salespersonId = TenantPrimaryKeyRelatedField(
+        source="salesperson_fk", model="hrms.Employee", required=False, allow_null=True
+    )
+    salespersonName = serializers.CharField(source="salesperson_fk.name", read_only=True)
+    brokerId = TenantPrimaryKeyRelatedField(
+        source="broker_fk", model="masters.Broker", required=False, allow_null=True
+    )
+    brokerName = serializers.CharField(source="broker_fk.name", read_only=True)
+    transportResponsibility = serializers.CharField(
+        source="transport_responsibility", required=False, default="Company"
+    )
     paymentTerms = serializers.CharField(source="payment_terms", required=False, allow_blank=True, allow_null=True)
     creditDays = serializers.IntegerField(source="credit_days", required=False, allow_null=True)
     balance_due = serializers.SerializerMethodField()

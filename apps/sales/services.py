@@ -96,6 +96,8 @@ def recalculate_document(document, *, lines=None, save=True):
     """
     line_rows = list(lines if lines is not None else document.line_items.all())
 
+    from apps.inventory.costing_services import check_item_margin
+
     computed = []
     for line in line_rows:
         totals = compute_line(line.qty, line.rate, line.discount_pct, line.tax_pct)
@@ -103,6 +105,13 @@ def recalculate_document(document, *, lines=None, save=True):
         line.discount_amount = totals.discount_amount
         line.tax_amount = totals.tax_amount
         line.line_total = totals.line_total
+        below_cost, below_margin, landed_cost, margin_pct = check_item_margin(
+            document.client_id, line.item_id, line.rate, lot_number=getattr(line, "lot_preference", None)
+        )
+        line.landed_cost = landed_cost
+        line.margin_pct = margin_pct
+        line.below_cost = below_cost
+        line.below_margin = below_margin
         computed.append(totals)
 
     header = compute_document_totals(
@@ -129,7 +138,10 @@ def recalculate_document(document, *, lines=None, save=True):
         if line_rows:
             type(line_rows[0]).objects.bulk_update(
                 line_rows,
-                ["amount", "discount_amount", "tax_amount", "line_total", "updated_at"],
+                [
+                    "amount", "discount_amount", "tax_amount", "line_total",
+                    "landed_cost", "margin_pct", "below_cost", "below_margin", "updated_at",
+                ],
             )
         document.save(
             update_fields=[
@@ -175,7 +187,29 @@ def assert_credit_limit(party, additional_amount, *, user=None, override=False):
     Checked against the derived balance plus open unbilled orders (db.md §4.1).
     """
     limit = party.credit_limit
-    if limit is None or D(limit) <= ZERO:
+    has_limit = limit is not None and D(limit) > ZERO
+
+    # Check overdue invoices (PDF §11, §14)
+    if not (override and user is not None and has_permission(user, "override_credit_limit")):
+        today = timezone.localdate()
+        credit_days_allowed = getattr(party, "credit_days", 30) or 30
+        overdue_invoices = SalesInvoice.objects.filter(
+            client_id=party.client_id,
+            party_id=party.id,
+            status__in=["Unpaid", "Partially Paid"],
+            deleted_at__isnull=True,
+            due_date__lt=today,
+        )
+        for inv in overdue_invoices:
+            days_over = (today - inv.due_date).days
+            if days_over > credit_days_allowed:
+                raise BusinessRuleViolation(
+                    f"{party.name} has overdue invoice {inv.invoice_number} by {days_over} days (credit term {credit_days_allowed} days).",
+                    code="PAYMENT_OVERDUE",
+                    payload={"partyId": str(party.id), "overdueDays": days_over, "invoiceId": str(inv.id)},
+                )
+
+    if not has_limit:
         return
 
     open_orders = SalesOrder.objects.filter(
@@ -270,24 +304,25 @@ def refresh_order_payment_status(order):
 
 def invoice_outstanding(invoice):
     """``GET /sales/invoices/{id}/outstanding/`` (api.md §5.7)."""
-    from apps.core.money import ageing_bucket
+    from apps.core.money import ageing_bucket, days_overdue, effective_due_date
 
     paid = round2(allocated_to(invoice.client_id, "SalesInvoice", invoice.id))
     outstanding = round2(D(invoice.total) - paid)
     outstanding = outstanding if outstanding > ZERO else ZERO
     today = timezone.localdate()
-    days_overdue = (
-        (today - invoice.due_date).days
-        if invoice.due_date and outstanding > ZERO
+    due = effective_due_date(invoice.doc_date, invoice.due_date, invoice.credit_days)
+    overdue = (
+        days_overdue(today, invoice.doc_date, invoice.due_date, invoice.credit_days)
+        if outstanding > ZERO
         else 0
     )
     return {
         "total": round2(invoice.total),
         "paid": paid,
         "outstanding": outstanding,
-        "dueDate": invoice.due_date,
-        "daysOverdue": max(days_overdue, 0),
-        "ageingBucket": ageing_bucket(days_overdue),
+        "dueDate": due,
+        "daysOverdue": overdue,
+        "ageingBucket": ageing_bucket(overdue),
     }
 
 
@@ -345,7 +380,9 @@ def finalize_invoice(invoice, *, user=None, override_credit_limit=False):
         invoice.invoice_number = allocate_number(invoice.client, "INV", invoice.doc_date)
 
     if invoice.due_date is None:
-        invoice.due_date = invoice.doc_date + timedelta(days=DEFAULT_PAYMENT_TERM_DAYS)
+        # Ageing uses invoice date + credit days when no due date was entered.
+        term = invoice.credit_days if invoice.credit_days else DEFAULT_PAYMENT_TERM_DAYS
+        invoice.due_date = invoice.doc_date + timedelta(days=int(term))
 
     # 3. Post SALE movements, skipping anything a challan already depleted.
     _post_invoice_stock(invoice, lines, user=user)
@@ -365,6 +402,10 @@ def finalize_invoice(invoice, *, user=None, override_credit_limit=False):
     _bump_order_invoiced_qty(lines)
     if invoice.sales_order_id:
         _advance_order_stage(invoice.sales_order)
+
+    # 6. Broker commission calculation (PDF §12)
+    from .broker_services import calculate_broker_commission
+    calculate_broker_commission(invoice, user=user)
 
     return invoice
 
@@ -397,21 +438,132 @@ def _post_invoice_stock(invoice, lines, *, user=None):
         resolved = stock.resolve_serials(invoice.client_id, line.item_id, serials)
         stock.assert_serial_count(line.item, line.qty, serials, line.item_name)
 
-        movement = stock.post_movement(
+        movement = post_sale_movements(
             client_id=invoice.client_id,
-            item=line.item_id,
-            location=location_id,
-            type="SALE",
-            quantity=-stock_qty,
-            unit_cost=line.item.cost_price,
+            line=line,
+            stock_qty=stock_qty,
+            location_id=location_id,
             reference_type="SalesInvoice",
             reference_id=invoice.id,
             reference_number=invoice.invoice_number,
             movement_date=invoice.doc_date,
             user=user,
-        )
+        )[0]
         if resolved:
             stock.set_serial_status(resolved, "sold", movement=movement)
+
+
+LOT_TRACKED = ("LOT", "TAKA")
+#: Only QC-passed takas may be sold.
+SELLABLE_LOT_QC = ("Passed",)
+
+
+def allocate_takas(client_id, line, stock_qty, location_id):
+    """Which takas a sale line draws on: ``[(lot_taka | None, qty), ...]``.
+
+    Untracked items -> one untracked allocation. Lot/taka items use the
+    line's ``taka_allocations`` when given (validated: same item, at the
+    location, QC passed, enough on the taka, adding up to the line qty);
+    otherwise the oldest available QC-passed takas at the location (FIFO).
+    """
+    from apps.inventory.models import LotTaka
+
+    if getattr(line.item, "tracking_type", "NONE") not in LOT_TRACKED:
+        return [(None, stock_qty)]
+
+    stock_qty = D(stock_qty)
+    label = line.item_name or line.item.name
+    selection = getattr(line, "taka_allocations", None) or []
+    base = LotTaka.objects.select_for_update().filter(
+        client_id=client_id, item_id=line.item_id, deleted_at__isnull=True
+    )
+
+    allocations = []
+    if selection:
+        total = ZERO
+        for row in selection:
+            taka_id = row.get("lotTakaId") or row.get("lot_taka_id")
+            qty = round4(D(row.get("qty")))
+            taka = base.filter(pk=taka_id).first() if taka_id else None
+            if taka is None:
+                raise ValidationFailed(
+                    f"{label}: a selected taka was not found for this item.",
+                    field_errors={"takaAllocations": ["Unknown taka for this item."]},
+                )
+            if str(taka.location_id) != str(location_id):
+                raise ValidationFailed(
+                    f"{label}: taka {taka.taka_id or taka.taka_number} is not at the "
+                    "dispatch location.",
+                    field_errors={"takaAllocations": ["Taka is stored elsewhere."]},
+                )
+            if taka.qc_status not in SELLABLE_LOT_QC:
+                raise BusinessRuleViolation(
+                    f"{label}: taka {taka.taka_id or taka.taka_number} is "
+                    f"{taka.qc_status} in QC and cannot be dispatched.",
+                    code="QC_BLOCKED",
+                )
+            if qty <= ZERO:
+                continue
+            allocations.append((taka, qty))
+            total += qty
+        if abs(total - stock_qty) > ROUNDING_TOLERANCE:
+            raise ValidationFailed(
+                f"{label}: the selected takas add up to {round4(total)}, "
+                f"the line is for {round4(stock_qty)}.",
+                field_errors={"takaAllocations": ["Must add up to the line quantity."]},
+            )
+        return allocations
+
+    remaining = stock_qty
+    for taka in base.filter(
+        location_id=location_id, available_quantity__gt=0, qc_status__in=SELLABLE_LOT_QC
+    ).order_by("received_date", "created_at", "taka_number"):
+        if remaining <= ZERO:
+            break
+        take = min(D(taka.available_quantity), remaining)
+        allocations.append((taka, round4(take)))
+        remaining -= take
+    if remaining > ROUNDING_TOLERANCE:
+        raise BusinessRuleViolation(
+            f"{label}: only {round4(stock_qty - remaining)} is available on QC-passed "
+            f"takas at this location; {round4(stock_qty)} requested.",
+            code=Codes.INSUFFICIENT_STOCK,
+            payload={"itemId": str(line.item_id), "requested": str(round4(stock_qty)),
+                     "available": str(round4(stock_qty - remaining))},
+        )
+    return allocations
+
+
+def post_sale_movements(*, client_id, line, stock_qty, location_id, reference_type,
+                        reference_id, reference_number, movement_date, user):
+    """Post the SALE movement(s) for one line -- one per taka for lot/taka
+    items, costed at the taka's landed rate (else the location WAC)."""
+    movements = []
+    wac = None
+    for taka, qty in allocate_takas(client_id, line, stock_qty, location_id):
+        if taka is not None and D(taka.rate) > ZERO:
+            unit_cost = D(taka.rate)
+        else:
+            if wac is None:
+                wac = ledger.inventory_unit_cost(client_id, line.item, location_id)
+            unit_cost = wac
+        movements.append(
+            stock.post_movement(
+                client_id=client_id,
+                item=line.item,
+                location=location_id,
+                type="SALE",
+                quantity=-qty,
+                unit_cost=unit_cost,
+                reference_type=reference_type,
+                reference_id=reference_id,
+                reference_number=reference_number,
+                movement_date=movement_date,
+                user=user,
+                lot_taka=taka,
+            )
+        )
+    return movements
 
 
 def _already_dispatched(sales_order_line_id):
@@ -473,15 +625,7 @@ def _bump_order_invoiced_qty(lines):
 
 def _advance_order_stage(order):
     """Move an order to ``Invoiced`` once every line is fully invoiced."""
-    order = SalesOrder.objects.select_for_update().get(pk=order.pk)
-    if order.stage in ("Cancelled", "Invoiced"):
-        return order
-    outstanding = order.line_items.filter(
-        deleted_at__isnull=True, invoiced_qty__lt=F("qty")
-    ).exists()
-    if not outstanding:
-        order.stage = "Invoiced"
-        order.save(update_fields=["stage", "updated_at"])
+    order = recompute_order_stage(order)
     refresh_order_payment_status(order)
     return order
 
@@ -528,19 +672,17 @@ def dispatch_challan(challan, *, user=None):
         stock.assert_serial_count(line.item, line.qty, serial_numbers, line.item_name)
         resolved = stock.resolve_serials(challan.client_id, line.item_id, serial_numbers)
 
-        movement = stock.post_movement(
+        movement = post_sale_movements(
             client_id=challan.client_id,
-            item=line.item_id,
-            location=location_id,
-            type="SALE",
-            quantity=-stock_qty,
-            unit_cost=line.item.cost_price,
+            line=line,
+            stock_qty=stock_qty,
+            location_id=location_id,
             reference_type="DeliveryChallan",
             reference_id=challan.id,
             reference_number=challan.challan_number,
             movement_date=challan.dispatch_date or challan.doc_date,
             user=user,
-        )
+        )[0]
         if resolved:
             stock.set_serial_status(resolved, "sold", movement=movement)
 
@@ -579,16 +721,39 @@ def _bump_order_dispatched_qty(line):
     order_line.save(update_fields=["dispatched_qty", "updated_at"])
 
 
-def _advance_order_after_dispatch(order):
+def derive_order_stage(order):
+    """The fulfilment stage implied by the order's line quantities.
+
+    Draft / Cancelled / Closed are user decisions and are never derived away.
+    Otherwise: every line invoiced -> Invoiced; every line dispatched ->
+    Fully Dispatched; something dispatched -> Partially Dispatched; else
+    Confirmed.
+    """
+    if order.stage in ("Draft", "Cancelled", "Closed"):
+        return order.stage
+    lines = list(order.line_items.filter(deleted_at__isnull=True))
+    if not lines:
+        return order.stage
+    if all(D(line.invoiced_qty) >= D(line.qty) for line in lines):
+        return "Invoiced"
+    if all(D(line.dispatched_qty) >= D(line.qty) for line in lines):
+        return "Fully Dispatched"
+    if any(D(line.dispatched_qty) > ZERO for line in lines):
+        return "Partially Dispatched"
+    return "Confirmed"
+
+
+def recompute_order_stage(order):
     order = SalesOrder.objects.select_for_update().get(pk=order.pk)
-    if order.stage in ("Cancelled", "Invoiced", "Delivered"):
-        return order
-    pending = order.line_items.filter(
-        deleted_at__isnull=True, dispatched_qty__lt=F("qty")
-    ).exists()
-    order.stage = "Dispatched" if pending else "Delivered"
-    order.save(update_fields=["stage", "updated_at"])
+    stage = derive_order_stage(order)
+    if stage != order.stage:
+        order.stage = stage
+        order.save(update_fields=["stage", "updated_at"])
     return order
+
+
+def _advance_order_after_dispatch(order):
+    return recompute_order_stage(order)
 
 
 # ---------------------------------------------------------------------------
@@ -673,10 +838,7 @@ def cancel_invoice(invoice, *, reason=None, user=None):
             order_line.save(update_fields=["invoiced_qty", "updated_at"])
 
     if invoice.sales_order_id:
-        order = SalesOrder.objects.select_for_update().get(pk=invoice.sales_order_id)
-        if order.stage == "Invoiced":
-            order.stage = "Delivered"
-            order.save(update_fields=["stage", "updated_at"])
+        order = recompute_order_stage(invoice.sales_order)
         refresh_order_payment_status(order)
 
     return invoice
@@ -708,6 +870,8 @@ def cancel_challan(challan, *, reason=None, user=None):
             )
             order_line.save(update_fields=["dispatched_qty", "updated_at"])
 
+    if challan.sales_order_id:
+        recompute_order_stage(challan.sales_order)
     return challan
 
 
@@ -1016,3 +1180,83 @@ def compute_expiry(start_date, period, unit):
         return start_date.replace(year=start_date.year + period)
     except ValueError:  # 29 Feb
         return start_date.replace(year=start_date.year + period, day=28)
+
+
+@transaction.atomic
+def reserve_order_takas(order):
+    """Transition selected takas on open order lines to 'Reserved' status (PDF §11)."""
+    from apps.inventory.models import LotTaka
+
+    for line in order.line_items.all():
+        takas_info = getattr(line, "reserved_takas", None) or getattr(line, "taka_allocations", None) or []
+        for item in takas_info:
+            taka_id = item.get("lotTakaId") or item.get("lot_taka_id") or item.get("id")
+            if taka_id:
+                LotTaka.objects.filter(
+                    client_id=order.client_id, pk=taka_id, status=LotTaka.STATUS_AVAILABLE
+                ).update(status=LotTaka.STATUS_RESERVED)
+
+
+@transaction.atomic
+def release_order_takas(order):
+    """Release reserved takas back to 'Available' when order is cancelled."""
+    from apps.inventory.models import LotTaka
+
+    for line in order.line_items.all():
+        takas_info = getattr(line, "reserved_takas", None) or getattr(line, "taka_allocations", None) or []
+        for item in takas_info:
+            taka_id = item.get("lotTakaId") or item.get("lot_taka_id") or item.get("id")
+            if taka_id:
+                LotTaka.objects.filter(
+                    client_id=order.client_id, pk=taka_id, status=LotTaka.STATUS_RESERVED
+                ).update(status=LotTaka.STATUS_AVAILABLE)
+
+
+def get_picking_list(order):
+    """Build picking list with location, taka number, barcode, roll weight, meters."""
+    from apps.inventory.models import LotTaka
+
+    picking_items = []
+    for line in order.line_items.select_related("item").all():
+        takas_info = getattr(line, "reserved_takas", None) or getattr(line, "taka_allocations", None) or []
+        taka_records = []
+        for item in takas_info:
+            taka_id = item.get("lotTakaId") or item.get("lot_taka_id") or item.get("id")
+            if taka_id:
+                taka = LotTaka.objects.select_related("location", "fabric_quality", "design", "shade").filter(
+                    client_id=order.client_id, pk=taka_id
+                ).first()
+                if taka:
+                    taka_records.append({
+                        "id": str(taka.id),
+                        "takaId": taka.taka_id,
+                        "lotNumber": taka.lot_number,
+                        "takaNumber": taka.taka_number,
+                        "locationName": taka.location.name if taka.location else None,
+                        "locationCode": taka.location.code if taka.location else None,
+                        "meters": str(taka.available_quantity),
+                        "rollWeight": str(taka.roll_weight) if taka.roll_weight else None,
+                        "barcode": taka.barcode,
+                        "status": taka.status,
+                    })
+
+        picking_items.append({
+            "orderLineId": str(line.id),
+            "lineNo": line.line_no,
+            "itemId": str(line.item_id),
+            "itemName": line.item_name or (line.item.name if line.item else ""),
+            "orderedQty": str(line.qty),
+            "uom": line.uom,
+            "lotPreference": line.lot_preference,
+            "takas": taka_records,
+        })
+
+    return {
+        "orderId": str(order.id),
+        "orderNumber": order.order_number,
+        "customerName": order.party_name or (order.party.name if order.party else ""),
+        "date": order.doc_date.isoformat() if order.doc_date else None,
+        "deliveryDate": order.delivery_date.isoformat() if getattr(order, "delivery_date", None) else None,
+        "lines": picking_items,
+    }
+

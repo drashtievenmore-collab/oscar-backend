@@ -17,7 +17,10 @@ from apps.inventory import services as stock
 from apps.masters import uom
 
 from .models import (
+    Agency,
+    Broker,
     CategoryPart,
+    DefectMaster,
     Design,
     Fabric,
     FabricQuality,
@@ -27,14 +30,22 @@ from .models import (
     ItemCategory,
     ItemPart,
     ItemSerial,
+    JobWorkRateMaster,
     Location,
+    LossReasonMaster,
     Party,
     PartyContact,
+    ProcessMaster,
+    ReturnReasonMaster,
     Shade,
+    Transporter,
     Unit,
 )
 from .serializers import (
+    AgencySerializer,
+    BrokerSerializer,
     CategoryPartSerializer,
+    DefectMasterSerializer,
     DesignSerializer,
     FabricQualitySerializer,
     FabricSerializer,
@@ -45,10 +56,15 @@ from .serializers import (
     ItemPartSerializer,
     ItemSerializer,
     ItemSerialSerializer,
+    JobWorkRateMasterSerializer,
     LocationSerializer,
+    LossReasonMasterSerializer,
     PartyContactSerializer,
     PartySerializer,
+    ProcessMasterSerializer,
+    ReturnReasonMasterSerializer,
     ShadeSerializer,
+    TransporterSerializer,
     UnitSerializer,
 )
 
@@ -96,9 +112,11 @@ class PartyViewSet(TenantModelViewSet):
         # The server owns the party code (api.md §1.7): the client must never
         # invent one, and a collision on a hand-typed code is a support ticket.
         if not serializer.validated_data.get("code"):
-            series = {"Vendor": "VEND", "Transporter": "TRNS"}.get(
-                serializer.validated_data.get("type"), "CUST"
-            )
+            series = {
+                "Vendor": "VEND",
+                "Transporter": "TRNS",
+                "Processor": "PROC",
+            }.get(serializer.validated_data.get("type"), "CUST")
             serializer.validated_data["code"] = allocate_number(
                 self.request.user.client, series
             )
@@ -126,7 +144,16 @@ class PartyViewSet(TenantModelViewSet):
     @action(detail=False, methods=["get"])
     def vendors(self, request):
         queryset = self.filter_queryset(self.get_queryset()).filter(
-            type__in=["Vendor", "Both"]
+            type__in=["Vendor", "Both", "Processor"]
+        )
+        page = self.paginate_queryset(queryset)
+        return self.get_paginated_response(self.get_serializer(page, many=True).data)
+
+    @action(detail=False, methods=["get"])
+    def processors(self, request):
+        """Job workers / processors -- type in (Processor) or is_processor=True or vendor_type='Dyeing - Other Process'."""
+        queryset = self.filter_queryset(self.get_queryset()).filter(
+            Q(is_processor=True) | Q(type="Processor") | Q(vendor_type="Dyeing - Other Process")
         )
         page = self.paginate_queryset(queryset)
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
@@ -182,7 +209,7 @@ class PartyViewSet(TenantModelViewSet):
                 "creditLimit": round2(party.credit_limit) if party.credit_limit else None,
                 "outstanding": round2(invoice_rows["lifetime"] - invoice_rows["paid"]),
                 "lifetimeValue": round2(invoice_rows["lifetime"]),
-                "openOrders": orders.exclude(stage__in=["Invoiced", "Delivered"]).count(),
+                "openOrders": orders.exclude(stage__in=["Fully Dispatched", "Invoiced", "Closed"]).count(),
                 "openInvoices": invoices.exclude(status="Paid").count(),
                 "totalInvoices": invoice_rows["count"],
                 "lastOrderDate": last_order,
@@ -416,7 +443,7 @@ class ItemViewSet(TenantModelViewSet):
 
         open_sales = SalesOrderLine.objects.filter(
             item=item, deleted_at__isnull=True
-        ).exclude(sales_order__stage__in=["Invoiced", "Cancelled", "Delivered"]).count()
+        ).exclude(sales_order__stage__in=["Fully Dispatched", "Invoiced", "Closed", "Cancelled"]).count()
         open_purchase = PurchaseOrderLine.objects.filter(
             item=item, deleted_at__isnull=True
         ).exclude(purchase_order__status__in=["Received", "Cancelled"]).count()
@@ -1218,3 +1245,198 @@ class FabricViewSet(TenantModelViewSet):
                 "sampleRow": ["Cotton", "COTTON", "Natural fibre"],
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# Textile & Job Work Masters (Phase 2.1)
+# ---------------------------------------------------------------------------
+class AgencyViewSet(TenantModelViewSet):
+    queryset = Agency.objects.all()
+    serializer_class = AgencySerializer
+    required_permissions = ["view_masters"]
+    permission_map = {
+        "list": ["view_masters"],
+        "retrieve": ["view_masters"],
+        "create": ["manage_agencies"],
+        "update": ["manage_agencies"],
+        "partial_update": ["manage_agencies"],
+        "destroy": ["manage_agencies"],
+    }
+    audit_entity_type = "Agency"
+    search_fields = ["name", "code", "contact_person", "phone", "gstin"]
+    filter_map = {"isActive": "is_active", "is_active": "is_active"}
+
+    def perform_create(self, serializer):
+        if not serializer.validated_data.get("code"):
+            serializer.validated_data["code"] = allocate_number(self.request.client_id, "AGY")
+        return super().perform_create(serializer)
+
+
+class BrokerViewSet(TenantModelViewSet):
+    queryset = Broker.objects.all()
+    serializer_class = BrokerSerializer
+    required_permissions = ["view_masters"]
+    permission_map = {
+        "list": ["view_masters"],
+        "retrieve": ["view_masters"],
+        "create": ["manage_brokers"],
+        "update": ["manage_brokers"],
+        "partial_update": ["manage_brokers"],
+        "destroy": ["manage_brokers"],
+    }
+    audit_entity_type = "Broker"
+    search_fields = ["name", "code", "contact_person", "phone", "pan", "gstin"]
+    filter_map = {
+        "isActive": "is_active",
+        "is_active": "is_active",
+        "commissionType": "commission_type",
+    }
+
+    def perform_create(self, serializer):
+        if not serializer.validated_data.get("code"):
+            serializer.validated_data["code"] = allocate_number(self.request.client_id, "BRK")
+        return super().perform_create(serializer)
+
+
+class ProcessMasterViewSet(TenantModelViewSet):
+    queryset = ProcessMaster.objects.all()
+    serializer_class = ProcessMasterSerializer
+    required_permissions = ["view_masters"]
+    permission_map = {
+        "list": ["view_masters"],
+        "retrieve": ["view_masters"],
+        "create": ["manage_processes"],
+        "update": ["manage_processes"],
+        "partial_update": ["manage_processes"],
+        "destroy": ["manage_processes"],
+    }
+    audit_entity_type = "ProcessMaster"
+    search_fields = ["name", "code", "category"]
+    filter_map = {"isActive": "is_active", "is_active": "is_active", "category": "category"}
+
+    def perform_create(self, serializer):
+        if not serializer.validated_data.get("code"):
+            name = serializer.validated_data.get("name", "")
+            serializer.validated_data["code"] = slug_code(name, "PRC")
+        return super().perform_create(serializer)
+
+
+class JobWorkRateMasterViewSet(TenantModelViewSet):
+    queryset = JobWorkRateMaster.objects.select_related("processor", "process", "fabric_quality")
+    serializer_class = JobWorkRateMasterSerializer
+    required_permissions = ["view_masters"]
+    permission_map = {
+        "list": ["view_masters"],
+        "retrieve": ["view_masters"],
+        "create": ["manage_jobwork_rates"],
+        "update": ["manage_jobwork_rates"],
+        "partial_update": ["manage_jobwork_rates"],
+        "destroy": ["manage_jobwork_rates"],
+    }
+    audit_entity_type = "JobWorkRateMaster"
+    filter_map = {
+        "isActive": "is_active",
+        "is_active": "is_active",
+        "processorId": "processor_id",
+        "processId": "process_id",
+        "fabricQualityId": "fabric_quality_id",
+    }
+
+
+class DefectMasterViewSet(TenantModelViewSet):
+    queryset = DefectMaster.objects.all()
+    serializer_class = DefectMasterSerializer
+    required_permissions = ["view_masters"]
+    permission_map = {
+        "list": ["view_masters"],
+        "retrieve": ["view_masters"],
+        "create": ["manage_defects"],
+        "update": ["manage_defects"],
+        "partial_update": ["manage_defects"],
+        "destroy": ["manage_defects"],
+    }
+    audit_entity_type = "DefectMaster"
+    search_fields = ["name", "code", "category", "severity"]
+    filter_map = {
+        "isActive": "is_active",
+        "is_active": "is_active",
+        "category": "category",
+        "severity": "severity",
+    }
+
+    def perform_create(self, serializer):
+        if not serializer.validated_data.get("code"):
+            name = serializer.validated_data.get("name", "")
+            serializer.validated_data["code"] = slug_code(name, "DEF")
+        return super().perform_create(serializer)
+
+
+class LossReasonMasterViewSet(TenantModelViewSet):
+    queryset = LossReasonMaster.objects.all()
+    serializer_class = LossReasonMasterSerializer
+    required_permissions = ["view_masters"]
+    permission_map = {
+        "list": ["view_masters"],
+        "retrieve": ["view_masters"],
+        "create": ["manage_loss_reasons"],
+        "update": ["manage_loss_reasons"],
+        "partial_update": ["manage_loss_reasons"],
+        "destroy": ["manage_loss_reasons"],
+    }
+    audit_entity_type = "LossReasonMaster"
+    search_fields = ["name", "code", "description"]
+    filter_map = {"isActive": "is_active", "is_active": "is_active"}
+
+    def perform_create(self, serializer):
+        if not serializer.validated_data.get("code"):
+            name = serializer.validated_data.get("name", "")
+            serializer.validated_data["code"] = slug_code(name, "LOSS")
+        return super().perform_create(serializer)
+
+
+class ReturnReasonMasterViewSet(TenantModelViewSet):
+    queryset = ReturnReasonMaster.objects.all()
+    serializer_class = ReturnReasonMasterSerializer
+    required_permissions = ["view_masters"]
+    permission_map = {
+        "list": ["view_masters"],
+        "retrieve": ["view_masters"],
+        "create": ["manage_return_reasons"],
+        "update": ["manage_return_reasons"],
+        "partial_update": ["manage_return_reasons"],
+        "destroy": ["manage_return_reasons"],
+    }
+    audit_entity_type = "ReturnReasonMaster"
+    search_fields = ["name", "code", "description"]
+    filter_map = {"isActive": "is_active", "is_active": "is_active"}
+
+    def perform_create(self, serializer):
+        if not serializer.validated_data.get("code"):
+            name = serializer.validated_data.get("name", "")
+            serializer.validated_data["code"] = slug_code(name, "RET")
+        return super().perform_create(serializer)
+
+
+class TransporterViewSet(TenantModelViewSet):
+    queryset = Transporter.objects.all()
+    serializer_class = TransporterSerializer
+    required_permissions = ["view_masters"]
+    permission_map = {
+        "list": ["view_masters"],
+        "retrieve": ["view_masters"],
+        "create": ["manage_masters"],
+        "update": ["manage_masters"],
+        "partial_update": ["manage_masters"],
+        "destroy": ["manage_masters"],
+    }
+    audit_entity_type = "Transporter"
+    search_fields = ["name", "code", "phone", "gstin", "contact_person"]
+    filter_map = {"isActive": "is_active", "is_active": "is_active"}
+
+    def perform_create(self, serializer):
+        if not serializer.validated_data.get("code"):
+            name = serializer.validated_data.get("name", "")
+            serializer.validated_data["code"] = slug_code(name, "TRP")
+        return super().perform_create(serializer)
+
+

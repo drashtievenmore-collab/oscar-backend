@@ -56,9 +56,19 @@ class DocumentHeader(TenantModel, LegacyIdMixin):
     terms = models.TextField(null=True, blank=True)
 
     salesperson = models.TextField(null=True, blank=True)
+    salesperson_fk = models.ForeignKey(
+        "hrms.Employee", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     broker = models.TextField(null=True, blank=True)
+    broker_fk = models.ForeignKey(
+        "masters.Broker", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     payment_terms = models.TextField(null=True, blank=True)
     credit_days = models.IntegerField(null=True, blank=True, default=0)
+    transport_responsibility = models.TextField(
+        choices=[("Company", "Company"), ("Party", "Party"), ("Broker", "Broker")],
+        default="Company",
+    )
 
     posted_at = models.DateTimeField(null=True, blank=True)
     posted_by = models.ForeignKey(
@@ -133,6 +143,24 @@ class DocumentLine(TenantModel):
     tax_pct = models.DecimalField(max_digits=7, decimal_places=4, default=18)
     tax_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     line_total = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+
+    # -- Textile & Commercial tracking (PDF §09, §11) ------------------------
+    fabric_quality = models.ForeignKey(
+        "masters.FabricQuality", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    design = models.ForeignKey(
+        "masters.Design", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    shade = models.ForeignKey(
+        "masters.Shade", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    lot_preference = models.TextField(null=True, blank=True)
+    taka_count = models.IntegerField(default=0)
+    landed_cost = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    margin_pct = models.DecimalField(max_digits=7, decimal_places=2, default=0)
+    below_cost = models.BooleanField(default=False)
+    below_margin = models.BooleanField(default=False)
+    reserved_takas = models.JSONField(default=list, blank=True)
 
     # -- BOM explosion flags (api.md §4.3) ----------------------------------
     is_bom_generated = models.BooleanField(default=False)

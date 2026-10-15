@@ -4,6 +4,7 @@ Write gates reuse ``view_staff``/``edit_staff`` for employee selection and the
 new ``view_production``/``enter_production``/``verify_production`` ids for
 production work. ``mark_attendance`` is never accepted here.
 """
+from django.db import transaction
 from django.db.models import Count, Q
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -48,16 +49,20 @@ class ProductionInstructionViewSet(TenantModelViewSet):
         "read": ["view_production"],
         "write": ["enter_production"],
         "create": ["enter_production"],
+        "approve": ["verify_production"],
+        "start": ["enter_production"],
         "verify": ["verify_production"],
         "complete": ["enter_production"],
         "completion": ["view_production"],
+        "generate_po": ["verify_production"],
+        "three_way_match": ["view_production"],
     }
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
             total=Count("id"),
-            inProgress=Count("id", filter=Q(status="In Progress")),
-            verified=Count("id", filter=Q(status="Verified")),
+            inProgress=Count("id", filter=Q(status__in=["Running", "In Progress", "Partially Completed"])),
+            verified=Count("id", filter=Q(status__in=["Verified", "PO Pending", "PO Created"])),
             completed=Count("id", filter=Q(status="Completed")),
         )
 
@@ -66,21 +71,43 @@ class ProductionInstructionViewSet(TenantModelViewSet):
         instruction = services.create_instruction(
             client=self.request.user.client,
             employee=data["employee"],
-            agency_name=data["agency_name"],
+            agency_name=data.get("agency_name"),
+            agency=data.get("agency"),
             order_reference=data["order_reference"],
             order_meter=data.get("order_meter") or 0,
+            taka_count=data.get("taka_count") or 0,
+            total_weight=data.get("total_weight") or 0,
+            width=data.get("width"),
+            gsm=data.get("gsm"),
+            tentative_rate=data.get("tentative_rate") or 0,
+            agreed_rate=data.get("agreed_rate") or data.get("agreed_job_rate") or 0,
+            rate_uom=data.get("rate_uom") or "Meter",
+            special_terms=data.get("special_terms"),
+            expected_start_date=data.get("expected_start_date"),
             supervisor=data.get("supervisor"),
             notes=data.get("notes"),
             pi_date=data.get("pi_date"),
             fabric=data.get("fabric"),
             process_type=data.get("process_type"),
-            agreed_job_rate=data.get("agreed_job_rate") or 0,
+            agreed_job_rate=data.get("agreed_job_rate") or data.get("agreed_rate") or 0,
+            grey_lot=data.get("grey_lot"),
+            status="Draft",
             user=self.request.user,
         )
         serializer.instance = instruction
         self._created_instance = instruction
         self._concurrency_instance = instruction
         return instruction
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        instruction = services.approve_instruction(self.get_object(), user=request.user)
+        return Response(self.get_serializer(instruction).data)
+
+    @action(detail=True, methods=["post"])
+    def start(self, request, pk=None):
+        instruction = services.start_instruction(self.get_object(), user=request.user)
+        return Response(self.get_serializer(instruction).data)
 
     @action(detail=True, methods=["post"])
     def verify(self, request, pk=None):
@@ -99,6 +126,18 @@ class ProductionInstructionViewSet(TenantModelViewSet):
             rejected_qty=raw_rejected,
         )
         return Response(self.get_serializer(instruction).data)
+
+    @action(detail=True, methods=["post"], url_path="generate-po")
+    def generate_po(self, request, pk=None):
+        instruction = services.generate_final_job_work_po(self.get_object(), user=request.user)
+        return Response(self.get_serializer(instruction).data)
+
+    @action(detail=True, methods=["post"], url_path="three-way-match")
+    def three_way_match(self, request, pk=None):
+        invoice_qty = request.data.get("invoiceQty") or request.data.get("qty")
+        invoice_rate = request.data.get("invoiceRate") or request.data.get("rate")
+        result = services.agency_three_way_match(self.get_object(), invoice_qty, invoice_rate)
+        return Response(result)
 
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
@@ -145,6 +184,12 @@ class DailyProductionEntryViewSet(TenantModelViewSet):
             instruction=data["instruction"],
             entry_date=data["entry_date"],
             meters=data["meters"],
+            produced_takas=data.get("produced_takas") or 0,
+            produced_weight=data.get("produced_weight") or 0,
+            good_meter=data.get("good_meter") or data["meters"],
+            reject_meter=data.get("reject_meter") or 0,
+            reprocess_meter=data.get("reprocess_meter") or 0,
+            photo_file=data.get("photo_file"),
             entered_by_employee=data["entered_by_employee"],
             entered_by_user=self.request.user,
             remarks=data.get("remarks"),
@@ -154,6 +199,19 @@ class DailyProductionEntryViewSet(TenantModelViewSet):
         self._concurrency_instance = entry
         self.write_audit("create", entry, after={"meters": str(entry.meters)})
         return entry
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        services.lock_open_instruction(serializer.instance.instruction)
+        new_instruction = serializer.validated_data.get("instruction")
+        if new_instruction and new_instruction.pk != serializer.instance.instruction_id:
+            services.lock_open_instruction(new_instruction)
+        return super().perform_update(serializer)
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        services.lock_open_instruction(instance.instruction)
+        return super().perform_destroy(instance)
 
 
 class IncentiveSchemeViewSet(TenantModelViewSet):
@@ -194,6 +252,34 @@ class IncentiveCalculationViewSet(ReadOnlyTenantViewSet):
     ordering = ["-period_start"]
     filter_map = {"employeeId": "employee_id", "period": "period_label"}
     permission_map = {"read": ["view_production"]}
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        calc = services.approve_incentive(self.get_object(), user=request.user)
+        self.write_audit("approve", calc, description="Incentive calculation approved.")
+        return Response(self.get_serializer(calc).data)
+
+    @action(detail=True, methods=["post"], url_path="post-to-ledger")
+    def post_to_ledger(self, request, pk=None):
+        calc = services.post_incentive(self.get_object(), user=request.user)
+        self.write_audit("post", calc, description="Incentive posted to ledger.")
+        return Response(self.get_serializer(calc).data)
+
+    @action(detail=True, methods=["post"])
+    def pay(self, request, pk=None):
+        from apps.accounting.models import BankAccount
+        bank_account = None
+        bank_account_id = request.data.get("bankAccountId")
+        if bank_account_id:
+            bank_account = BankAccount.objects.filter(
+                id=bank_account_id, client_id=request.client_id, deleted_at__isnull=True
+            ).first()
+        amount = request.data.get("amount")
+        calc = services.pay_incentive(
+            self.get_object(), bank_account=bank_account, amount=amount, user=request.user
+        )
+        self.write_audit("pay", calc, description="Incentive paid.")
+        return Response(self.get_serializer(calc).data)
 
     @action(detail=True, methods=["post"])
     def reverse(self, request, pk=None):

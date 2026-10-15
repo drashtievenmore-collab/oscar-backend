@@ -518,16 +518,38 @@ class Settings(TenantModel):
 class ProductionInstruction(TenantModel):
     STATUSES = [
         ("Draft", "Draft"),
+        ("Approved", "Approved"),
+        ("Not Started", "Not Started"),
+        ("Running", "Running"),
         ("In Progress", "In Progress"),
+        ("Partially Completed", "Partially Completed"),
         ("Completed", "Completed"),
+        ("Verification Pending", "Verification Pending"),
         ("Verified", "Verified"),
+        ("PO Pending", "PO Pending"),
+        ("PO Created", "PO Created"),
         ("Closed", "Closed"),
     ]
 
     instruction_number = models.TextField(null=True, blank=True)
     agency_name = models.TextField()
+    agency = models.ForeignKey(
+        "masters.Agency", null=True, blank=True, on_delete=models.SET_NULL, related_name="production_instructions"
+    )
+    grey_lot = models.ForeignKey(
+        "inventory.LotTaka", null=True, blank=True, on_delete=models.SET_NULL, related_name="production_instructions"
+    )
     order_reference = models.TextField()
     order_meter = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    taka_count = models.IntegerField(default=0)
+    total_weight = models.DecimalField(max_digits=12, decimal_places=4, default=0)
+    width = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    gsm = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    tentative_rate = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    agreed_rate = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    rate_uom = models.TextField(default="Meter")
+    special_terms = models.TextField(null=True, blank=True)
+    expected_start_date = models.DateField(null=True, blank=True)
     pi_date = models.DateField(null=True, blank=True)
     fabric = models.TextField(null=True, blank=True)
     process_type = models.TextField(null=True, blank=True)
@@ -550,13 +572,14 @@ class ProductionInstruction(TenantModel):
         on_delete=models.SET_NULL,
         related_name="supervised_production_instructions",
     )
-    status = models.TextField(choices=[(s, s) for s in
-                                       ["Draft", "In Progress", "Completed", "Verified", "Closed"]],
-                              default="Draft")
+    status = models.TextField(choices=STATUSES, default="Draft")
     verified_by = models.ForeignKey(
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     verified_at = models.DateTimeField(null=True, blank=True)
+    final_po = models.ForeignKey(
+        "purchase.PurchaseOrder", null=True, blank=True, on_delete=models.SET_NULL, related_name="production_instructions"
+    )
     notes = models.TextField(null=True, blank=True)
 
     class Meta:
@@ -596,7 +619,18 @@ class DailyProductionEntry(TenantModel):
         ProductionInstruction, on_delete=models.CASCADE, related_name="daily_entries"
     )
     entry_date = models.DateField()
+    opening_pending = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     meters = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    produced_takas = models.IntegerField(default=0)
+    produced_weight = models.DecimalField(max_digits=12, decimal_places=4, default=0)
+    good_meter = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    reject_meter = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    reprocess_meter = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    cumulative_meter = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    balance_meter = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    photo_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     entered_by_employee = models.ForeignKey(
         "hrms.Employee", on_delete=models.PROTECT, related_name="production_entries"
     )
@@ -626,9 +660,19 @@ class DailyProductionEntry(TenantModel):
 
 
 class IncentiveScheme(TenantModel):
+    PERIOD_TYPES = [("Monthly", "Monthly"), ("Quarterly", "Quarterly"), ("Custom", "Custom")]
+    BASIS_CHOICES = [("INVOICE", "Invoice Value"), ("COLLECTION", "Collection"), ("GROSS_PROFIT", "Gross Profit")]
+    SLAB_TYPES = [("FLAT", "Flat %"), ("TIERED", "Tiered Slabs")]
+
     name = models.TextField()
     description = models.TextField(null=True, blank=True)
+    period_type = models.TextField(choices=PERIOD_TYPES, default="Quarterly")
+    basis = models.TextField(choices=BASIS_CHOICES, default="INVOICE")
+    slab_type = models.TextField(choices=SLAB_TYPES, default="FLAT")
     rate_pct = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    slabs = models.JSONField(default=list, blank=True)
+    hold_unpaid_invoices = models.BooleanField(default=False)
+    exclude_gst = models.BooleanField(default=False)
     applies_from = models.DateField(null=True, blank=True)
     applies_to = models.DateField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
@@ -649,7 +693,13 @@ class IncentiveScheme(TenantModel):
 
 
 class IncentiveCalculation(TenantModel):
-    STATUSES = [("Calculated", "Calculated"), ("Posted", "Posted"), ("Reversed", "Reversed")]
+    STATUSES = [
+        ("Calculated", "Calculated"),
+        ("Approved", "Approved"),
+        ("Posted", "Posted"),
+        ("Paid", "Paid"),
+        ("Reversed", "Reversed"),
+    ]
 
     calc_number = models.TextField(null=True, blank=True)
     scheme = models.ForeignKey(
@@ -658,16 +708,27 @@ class IncentiveCalculation(TenantModel):
     employee = models.ForeignKey(
         "hrms.Employee", on_delete=models.PROTECT, related_name="incentive_calcs"
     )
+    salesperson = models.ForeignKey(
+        "hrms.Employee", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     period_label = models.TextField()
     period_start = models.DateField()
     period_end = models.DateField()
+    basis = models.TextField(default="INVOICE")
     net_sales = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     returns_total = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     incentive_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    hold_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    paid_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     status = models.TextField(
-        choices=[(s, s) for s in ["Calculated", "Posted", "Reversed"]],
+        choices=[(s, s) for s in ["Calculated", "Approved", "Posted", "Paid", "Reversed"]],
         default="Calculated",
     )
+    approved_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
     detail = models.JSONField(default=dict, blank=True)
     journal_entry = models.ForeignKey(
         "accounting.JournalEntry",

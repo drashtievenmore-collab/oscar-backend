@@ -1,42 +1,47 @@
-"""Jobwork endpoints — process plans and job work orders."""
+"""Jobwork endpoints — process plans and job work orders.
+
+Child rows are managed one at a time through per-row endpoints; a header
+PATCH never creates, edits or deletes them (see services.py).
+"""
+from decimal import Decimal
+import uuid
 from datetime import date
 
 from django.db import transaction
-from django.db.models import Count, Sum
+from django.db.models import Count, DecimalField, Q, Sum, Value
 from django.db.models.functions import Coalesce
-from django.db.models import DecimalField, Value
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from apps.core.money import D, ZERO, round2
+from apps.core.audit import snapshot
+from apps.core.exceptions import Conflict, NotFound
+from apps.core.money import D, ZERO, round4
 from apps.core.numbering import allocate_number
-from apps.core.permissions import HasModulePermission
+from apps.core.permissions import HasModulePermission, require_permission
 from apps.core.viewsets import TenantModelViewSet
 
-from .models import (
-    JobWorkOrder,
-    JWOCharge,
-    JWOInward,
-    JWOMaterial,
-    JWOOutward,
-    JWOReprocess,
-    PlanCharge,
-    ProcessPlan,
-    VendorProcessInstruction,
-    VPIProgressEntry,
-)
+from .models import JobWorkOrder, PlanCharge, ProcessPlan
 from .serializers import (
     JobWorkOrderSerializer,
-    JWOChargeSerializer,
-    JWOInwardSerializer,
-    JWOMaterialSerializer,
-    JWOOutwardSerializer,
-    JWOReprocessSerializer,
+    JWOLossEntrySerializer,
     PlanChargeSerializer,
     ProcessPlanSerializer,
-    VendorProcessInstructionSerializer,
-    VPIProgressEntrySerializer,
+)
+from .services import (
+    ORDER_NESTED_KEYS,
+    ORDER_ROW_KIND_PATTERN,
+    ORDER_ROW_KINDS,
+    PLAN_NESTED_KEYS,
+    create_order_rows,
+    delete_order_row,
+    delete_plan_charge,
+    line_amount,
+    live,
+    reject_nested_on_update,
+    save_order_row,
+    save_plan_charge,
 )
 
 
@@ -45,6 +50,10 @@ class ProcessPlanViewSet(TenantModelViewSet):
     required_permissions = ["view_jobwork"]
     permission_map = {
         "write": ["manage_jobwork"],
+        # Approval points (approve_jobwork): approving a draft plan and
+        # marking a plan Completed.
+        "approve": ["approve_jobwork"],
+        "complete": ["approve_jobwork"],
     }
     queryset = ProcessPlan.objects.prefetch_related("charges")
     serializer_class = ProcessPlanSerializer
@@ -56,40 +65,115 @@ class ProcessPlanViewSet(TenantModelViewSet):
     ordering = ["-date", "-created_at"]
     idempotent_create = True
 
+    #: Plan statuses only an approver may move a plan into or out of.
+    APPROVAL_STATUSES = ("Completed",)
+
     @transaction.atomic
     def perform_create(self, serializer):
-        from .models import PlanCharge
-
         charges = serializer.validated_data.pop("charges", [])
+        if serializer.validated_data.get("status") in self.APPROVAL_STATUSES:
+            require_permission(
+                self.request.user, "approve_jobwork",
+                "Only an approver can create a Completed process plan.",
+            )
         serializer.validated_data["plan_no"] = allocate_number(
             self.request.user.client, "PP",
             serializer.validated_data.get("date"),
         )
         plan = super().perform_create(serializer)
-        PlanCharge.objects.bulk_create([
-            PlanCharge(client_id=self.get_client_id(), process_plan=plan, **c)
-            for c in charges
-        ])
+        for charge in charges:
+            charge = dict(charge)
+            charge.pop("id", None)
+            charge["amount"] = line_amount(charge)
+            PlanCharge.objects.create(
+                client_id=self.get_client_id(), process_plan=plan, **charge
+            )
         return plan
+
+    def update(self, request, *args, **kwargs):
+        # A header PATCH never touches charge rows (use /charges/ instead).
+        reject_nested_on_update(request.data, PLAN_NESTED_KEYS)
+        return super().update(request, *args, **kwargs)
 
     @transaction.atomic
     def perform_update(self, serializer):
-        from .models import PlanCharge
+        plan = serializer.instance
+        new_status = serializer.validated_data.get("status", plan.status)
+        if new_status != plan.status and (
+            new_status in self.APPROVAL_STATUSES or plan.status in self.APPROVAL_STATUSES
+        ):
+            require_permission(
+                self.request.user, "approve_jobwork",
+                "Only an approver can complete or reopen a process plan.",
+            )
+        return super().perform_update(serializer)
 
-        charges = serializer.validated_data.pop("charges", None)
-        plan = super().perform_update(serializer)
-        if charges is not None:
-            keep_ids = {str(r.get("id")) for r in charges if r.get("id")}
-            plan.charges.exclude(pk__in=[i for i in keep_ids if i]).delete()
-            for row in charges:
-                rid = row.pop("id", None)
-                if rid:
-                    plan.charges.filter(pk=rid).update(**row)
-                else:
-                    PlanCharge.objects.create(
-                        client_id=self.get_client_id(), process_plan=plan, **row
-                    )
-        return plan
+    def _status_change(self, request, to_status, allowed_from, verb):
+        plan = self.get_object()
+        if plan.status not in allowed_from:
+            raise Conflict(
+                f"Process plan {plan.plan_no} is {plan.status}; it cannot be {verb}.",
+                code="JOBWORK_PLAN_STATE",
+            )
+        before = snapshot(plan)
+        old = plan.status
+        plan.status = to_status
+        plan.approver = getattr(request.user, "name", None) or getattr(request.user, "email", "")
+        plan.updated_by = request.user
+        plan.save(update_fields=["status", "approver", "updated_by", "updated_at"])
+        self.write_audit(
+            verb, plan, before=before, after=snapshot(plan),
+            from_value=old, to_value=to_status,
+            comments=(request.data or {}).get("remarks") if isinstance(request.data, dict) else None,
+        )
+        self._concurrency_instance = plan
+        return Response(self.get_serializer(self.get_queryset().get(pk=plan.pk)).data)
+
+    @action(detail=True, methods=["post"], url_path="approve")
+    @transaction.atomic
+    def approve(self, request, pk=None):
+        """Draft → Active, stamped with the approver."""
+        return self._status_change(request, "Active", ("Draft",), "approved")
+
+    @action(detail=True, methods=["post"], url_path="complete")
+    @transaction.atomic
+    def complete(self, request, pk=None):
+        """Active → Completed (approval point)."""
+        return self._status_change(request, "Completed", ("Active",), "completed")
+
+    # -- charge rows: /process-plans/{id}/charges/[{rowId}/] -----------------
+    @action(detail=True, methods=["get", "post"], url_path="charges", url_name="charges")
+    @transaction.atomic
+    def charges(self, request, pk=None):
+        plan = self.get_object()
+        if request.method == "GET":
+            return Response({"results": PlanChargeSerializer(live(plan.charges), many=True).data})
+        serializer = PlanChargeSerializer(data=request.data, context=self.get_serializer_context())
+        serializer.is_valid(raise_exception=True)
+        row = save_plan_charge(request, plan, serializer)
+        return Response(PlanChargeSerializer(row).data, status=status.HTTP_201_CREATED)
+
+    @action(
+        detail=True, methods=["get", "patch", "delete"],
+        url_path=r"charges/(?P<row_id>[^/.]+)", url_name="charge-detail",
+    )
+    @transaction.atomic
+    def charge_detail(self, request, pk=None, row_id=None):
+        plan = self.get_object()
+        row = plan.charges.filter(pk=_uuid_or_404(row_id), deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound()
+        if request.method == "GET":
+            return Response(PlanChargeSerializer(row).data)
+        if request.method == "DELETE":
+            delete_plan_charge(request, plan, row)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = PlanChargeSerializer(
+            row, data=request.data, partial=True, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        row = save_plan_charge(request, plan, serializer, instance=row)
+        return Response(PlanChargeSerializer(row).data)
 
 
 class JobWorkOrderViewSet(TenantModelViewSet):
@@ -97,10 +181,15 @@ class JobWorkOrderViewSet(TenantModelViewSet):
     required_permissions = ["view_jobwork"]
     permission_map = {
         "write": ["manage_jobwork"],
+        # Approval point: closing an order freezes its rows.
+        "close": ["approve_jobwork"],
+        "approve_loss": ["approve_jobwork"],
     }
     queryset = (
         JobWorkOrder.objects.select_related("process_plan")
-        .prefetch_related("materials", "outwards", "inwards", "charges", "reprocesses")
+        .prefetch_related(
+            "materials", "outwards", "inwards", "charges", "reprocesses", "documents__file"
+        )
     )
     serializer_class = JobWorkOrderSerializer
     audit_entity_type = "JobWorkOrder"
@@ -138,8 +227,8 @@ class JobWorkOrderViewSet(TenantModelViewSet):
         )
         rows = []
         for order in queryset:
-            total_outward = sum((o.qty or ZERO for o in order.outwards.all()), ZERO)
-            total_inward = sum((i.qty or ZERO for i in order.inwards.all()), ZERO)
+            total_outward = sum((o.qty or ZERO for o in live(order.outwards)), ZERO)
+            total_inward = sum((i.qty or ZERO for i in live(order.inwards)), ZERO)
             if total_outward <= ZERO:
                 continue
             pending = total_outward - total_inward
@@ -153,7 +242,7 @@ class JobWorkOrderViewSet(TenantModelViewSet):
             else:
                 register_status = "Pending"
             outward_dates = sorted(
-                o.date.isoformat() for o in order.outwards.all() if o.date
+                o.date.isoformat() for o in live(order.outwards) if o.date
             )
             pending_since = outward_dates[0] if outward_dates else (
                 order.order_date.isoformat() if order.order_date else None
@@ -163,7 +252,7 @@ class JobWorkOrderViewSet(TenantModelViewSet):
                 days_pending = max(
                     0, (date.today() - date.fromisoformat(pending_since[:10])).days
                 )
-            mat = next(iter(order.materials.all()), None)
+            mat = next(iter(live(order.materials)), None)
             rows.append({
                 "jwoId": str(order.id),
                 "jwoNo": order.jwo_no,
@@ -209,12 +298,12 @@ class JobWorkOrderViewSet(TenantModelViewSet):
         )
         rows = []
         for order in queryset:
-            total_outward = sum((o.qty or ZERO for o in order.outwards.all()), ZERO)
-            total_inward = sum((i.qty or ZERO for i in order.inwards.all()), ZERO)
+            total_outward = sum((o.qty or ZERO for o in live(order.outwards)), ZERO)
+            total_inward = sum((i.qty or ZERO for i in live(order.inwards)), ZERO)
             if total_outward <= ZERO:
                 continue
-            accepted = sum((i.accepted or ZERO for i in order.inwards.all()), ZERO)
-            rejected = sum((i.rejected or ZERO for i in order.inwards.all()), ZERO)
+            accepted = sum((i.accepted or ZERO for i in live(order.inwards)), ZERO)
+            rejected = sum((i.rejected or ZERO for i in live(order.inwards)), ZERO)
             pending = total_outward - total_inward
             if pending < ZERO:
                 pending = ZERO
@@ -225,7 +314,7 @@ class JobWorkOrderViewSet(TenantModelViewSet):
                 recon_status = "Mismatch"
             else:
                 recon_status = "Pending"
-            mat = next(iter(order.materials.all()), None)
+            mat = next(iter(live(order.materials)), None)
             rows.append({
                 "jwoId": str(order.id),
                 "jwoNo": order.jwo_no,
@@ -250,199 +339,295 @@ class JobWorkOrderViewSet(TenantModelViewSet):
 
     @transaction.atomic
     def perform_create(self, serializer):
-        from .models import JWOCharge, JWOInward, JWOMaterial, JWOOutward, JWOReprocess
-
-        materials = serializer.validated_data.pop("materials", [])
-        outwards = serializer.validated_data.pop("outwards", [])
-        inwards = serializer.validated_data.pop("inwards", [])
-        charges = serializer.validated_data.pop("charges", [])
-        reprocesses = serializer.validated_data.pop("reprocesses", [])
+        rows_by_kind = {
+            kind: serializer.validated_data.pop(kind, [])
+            for kind in ("materials", "outwards", "inwards", "charges", "reprocesses")
+        }
+        if serializer.validated_data.get("status") in JobWorkOrder.APPROVAL_STATUSES:
+            require_permission(
+                self.request.user, "approve_jobwork",
+                "Only an approver can create a Completed / Closed job work order.",
+            )
         serializer.validated_data["jwo_no"] = allocate_number(
             self.request.user.client, "JWO",
             serializer.validated_data.get("order_date"),
         )
-        # Recompute header totals from materials so the server owns the numbers.
-        if materials:
-            planned = sum((D(m.get("qty") or 0) for m in materials), ZERO)
-            total = sum(
-                (D(m.get("amount") or 0) or D(m.get("qty") or 0) * D(m.get("rate") or 0)
-                 for m in materials), ZERO,
-            )
-            serializer.validated_data["planned_qty"] = planned
-            serializer.validated_data["total_amount"] = round2(total)
         order = super().perform_create(serializer)
-        client_id = self.get_client_id()
-        JWOMaterial.objects.bulk_create([
-            JWOMaterial(client_id=client_id, job_work_order=order, **m) for m in materials
-        ])
-        JWOOutward.objects.bulk_create([
-            JWOOutward(client_id=client_id, job_work_order=order, **o) for o in outwards
-        ])
-        JWOInward.objects.bulk_create([
-            JWOInward(client_id=client_id, job_work_order=order, **i) for i in inwards
-        ])
-        JWOCharge.objects.bulk_create([
-            JWOCharge(client_id=client_id, job_work_order=order, **c) for c in charges
-        ])
-        JWOReprocess.objects.bulk_create([
-            JWOReprocess(client_id=client_id, job_work_order=order, **r) for r in reprocesses
-        ])
+        create_order_rows(order, rows_by_kind, self.request.user.client)
         return order
+
+    def update(self, request, *args, **kwargs):
+        # A header PATCH never touches child rows -- they have their own
+        # endpoints (/orders/{id}/<kind>/[{rowId}/]).
+        reject_nested_on_update(request.data, ORDER_NESTED_KEYS)
+        return super().update(request, *args, **kwargs)
 
     @transaction.atomic
     def perform_update(self, serializer):
-        from .models import JWOCharge, JWOInward, JWOMaterial, JWOOutward, JWOReprocess
-
-        materials = serializer.validated_data.pop("materials", None)
-        outwards = serializer.validated_data.pop("outwards", None)
-        inwards = serializer.validated_data.pop("inwards", None)
-        charges = serializer.validated_data.pop("charges", None)
-        reprocesses = serializer.validated_data.pop("reprocesses", None)
-        order = super().perform_update(serializer)
-        client_id = self.get_client_id()
-
-        def update_or_add(manager, model, rows):
-            if rows is None:
-                return
-            for row in rows:
-                rid = row.pop("id", None)
-                if rid and manager.filter(pk=rid).exists():
-                    manager.filter(pk=rid).update(**row)
-                elif row.get("no") and manager.filter(no=row["no"]).exists():
-                    manager.filter(no=row["no"]).update(**row)
-                else:
-                    model.objects.create(
-                        client_id=client_id, job_work_order=order, **row
-                    )
-
-        update_or_add(order.materials, JWOMaterial, materials)
-        update_or_add(order.outwards, JWOOutward, outwards)
-        update_or_add(order.inwards, JWOInward, inwards)
-        update_or_add(order.charges, JWOCharge, charges)
-        update_or_add(order.reprocesses, JWOReprocess, reprocesses)
-        if materials is not None:
-            mats = list(order.materials.all())
-            order.planned_qty = sum((m.qty or ZERO for m in mats), ZERO)
-            order.total_amount = round2(
-                sum((m.amount or ZERO for m in mats), ZERO)
+        order = serializer.instance
+        new_status = serializer.validated_data.get("status", order.status)
+        status_changes = new_status != order.status
+        if status_changes and (
+            new_status in JobWorkOrder.APPROVAL_STATUSES
+            or order.status in JobWorkOrder.APPROVAL_STATUSES
+        ):
+            require_permission(
+                self.request.user, "approve_jobwork",
+                "Only an approver can complete, close or reopen a job work order.",
             )
-            order.save(update_fields=["planned_qty", "total_amount", "updated_at"])
-        return order
+        if order.status in JobWorkOrder.LOCKED_STATUSES:
+            other = [k for k in serializer.validated_data if k not in ("status", "remarks")]
+            if other:
+                raise Conflict(
+                    f"Job work order {order.jwo_no} is {order.status}; reopen it before editing.",
+                    code="JOBWORK_ORDER_CLOSED",
+                )
+        return super().perform_update(serializer)
 
-    @action(detail=True, methods=["post"], url_path="materials")
+    def check_delete_allowed(self, instance):
+        if instance.status in JobWorkOrder.LOCKED_STATUSES:
+            raise Conflict(
+                f"Job work order {instance.jwo_no} is {instance.status} and cannot be deleted.",
+                code="JOBWORK_ORDER_CLOSED",
+            )
+        if live(instance.outwards) or live(instance.inwards):
+            raise Conflict(
+                f"Job work order {instance.jwo_no} already has outward / inward movements "
+                "and cannot be deleted.",
+                code="JOBWORK_ROW_IN_USE",
+            )
+
+    @action(detail=False, methods=["get"], url_path="lookup-rate")
+    def lookup_rate(self, request):
+        processor_id = request.query_params.get("processorId") or request.query_params.get("vendorId")
+        process_id = request.query_params.get("processId")
+        quality_id = request.query_params.get("fabricQualityId")
+
+        from apps.masters.models import JobWorkRateMaster
+        today = date.today()
+        qs = JobWorkRateMaster.objects.filter(
+            client_id=request.client_id,
+            is_active=True,
+            effective_from__lte=today,
+        ).filter(
+            Q(effective_to__isnull=True) | Q(effective_to__gte=today)
+        )
+        if processor_id:
+            qs = qs.filter(processor_id=processor_id)
+        if process_id:
+            qs = qs.filter(process_id=process_id)
+        if quality_id:
+            qs = qs.filter(fabric_quality_id=quality_id)
+
+        rate_obj = qs.order_by("-effective_from").first()
+        if rate_obj:
+            return Response({
+                "rateMasterId": str(rate_obj.id),
+                "rate": float(rate_obj.rate),
+                "rateUom": rate_obj.rate_uom,
+            })
+        return Response({"rateMasterId": None, "rate": None, "rateUom": "Meter"})
+
+    @action(detail=False, methods=["get"], url_path="processor-ledger")
+    def processor_ledger(self, request):
+        processor_id = request.query_params.get("processorId") or request.query_params.get("vendorId")
+        from apps.masters.models import Party
+
+        client_id = request.client_id
+        parties = Party.objects.filter(client_id=client_id, deleted_at__isnull=True)
+        if processor_id:
+            parties = parties.filter(id=processor_id)
+        else:
+            parties = parties.filter(type__in=["Vendor", "Both"])
+
+        results = []
+        for p in parties:
+            orders = JobWorkOrder.objects.filter(
+                client_id=client_id,
+                deleted_at__isnull=True,
+            ).filter(
+                Q(vendor=p) | Q(vendor_name=p.name)
+            ).prefetch_related("outwards", "inwards", "loss_entries")
+
+            entries = []
+            running_bal = ZERO
+
+            for o in orders:
+                for ow in live(o.outwards):
+                    qty = ow.qty or ZERO
+                    running_bal += qty
+                    entries.append({
+                        "date": ow.date.isoformat() if ow.date else None,
+                        "jwoNo": o.jwo_no,
+                        "docType": "Outward",
+                        "docNo": ow.no,
+                        "challanNo": ow.challan_no,
+                        "debitQty": float(qty),
+                        "creditQty": 0.0,
+                        "lossQty": 0.0,
+                        "balanceQty": float(running_bal),
+                    })
+                for iw in live(o.inwards):
+                    qty = iw.qty or ZERO
+                    running_bal -= qty
+                    entries.append({
+                        "date": iw.date.isoformat() if iw.date else None,
+                        "jwoNo": o.jwo_no,
+                        "docType": "Inward",
+                        "docNo": iw.no,
+                        "challanNo": iw.challan_no,
+                        "debitQty": 0.0,
+                        "creditQty": float(qty),
+                        "lossQty": 0.0,
+                        "balanceQty": float(running_bal),
+                    })
+                for loss in o.loss_entries.filter(deleted_at__isnull=True, status="Approved"):
+                    qty = loss.qty or ZERO
+                    running_bal -= qty
+                    entries.append({
+                        "date": loss.approved_at.date().isoformat() if loss.approved_at else None,
+                        "jwoNo": o.jwo_no,
+                        "docType": "Loss",
+                        "docNo": f"LOSS-{str(loss.id)[:8]}",
+                        "challanNo": None,
+                        "debitQty": 0.0,
+                        "creditQty": 0.0,
+                        "lossQty": float(qty),
+                        "balanceQty": float(running_bal),
+                    })
+
+            entries.sort(key=lambda x: x["date"] or "")
+            total_debit = sum(e["debitQty"] for e in entries)
+            total_credit = sum(e["creditQty"] for e in entries)
+            total_loss = sum(e["lossQty"] for e in entries)
+            net_balance = total_debit - total_credit - total_loss
+
+            if entries or processor_id:
+                results.append({
+                    "processorId": str(p.id),
+                    "processorName": p.name,
+                    "processorCode": p.code,
+                    "totalSent": total_debit,
+                    "totalReceived": total_credit,
+                    "totalLoss": total_loss,
+                    "closingBalance": net_balance,
+                    "entries": entries,
+                })
+
+        return Response({"results": results, "count": len(results)})
+
+    @action(detail=True, methods=["post"], url_path="close")
     @transaction.atomic
-    def add_material(self, request, pk=None):
+    def close(self, request, pk=None):
+        """Close the order (approval point, approve_jobwork). Rows freeze."""
         order = self.get_object()
-        serializer = JWOMaterialSerializer(data=request.data, context=self.get_serializer_context())
-        serializer.is_valid(raise_exception=True)
-        from .models import JWOMaterial
-        mat = JWOMaterial.objects.create(
-            client_id=self.get_client_id(),
-            job_work_order=order,
-            **serializer.validated_data,
-        )
-        mats = list(order.materials.all())
-        order.planned_qty = sum((m.qty or ZERO for m in mats), ZERO)
-        order.total_amount = round2(sum((m.amount or ZERO for m in mats), ZERO))
-        order.save(update_fields=["planned_qty", "total_amount", "updated_at"])
-        return Response(JWOMaterialSerializer(mat).data, status=status.HTTP_201_CREATED)
+        if order.status == "Closed":
+            raise Conflict(f"Job work order {order.jwo_no} is already Closed.", code="JOBWORK_ORDER_CLOSED")
 
-    @action(detail=True, methods=["post"], url_path="outwards")
+        # Reconciliation Gate (PDF §07): Sent = Received + Approved Loss
+        sent_qty = sum((o.qty or ZERO for o in live(order.outwards)), ZERO)
+        received_qty = sum((i.qty or ZERO for i in live(order.inwards)), ZERO)
+        approved_loss = sum(
+            (l.qty or ZERO for l in order.loss_entries.filter(deleted_at__isnull=True, status="Approved")),
+            ZERO,
+        )
+
+        has_phase2_spec = (
+            (order.process_master_id is not None)
+            or (order.vendor_id is not None)
+            or bool(isinstance(request.data, dict) and request.data.get("reconcile"))
+        )
+        if has_phase2_spec and sent_qty > ZERO:
+            tol_pct = order.expected_loss_pct
+            if (not tol_pct or tol_pct <= ZERO) and getattr(order, "process_master", None):
+                tol_pct = order.process_master.tolerance_pct or order.process_master.expected_loss_pct
+            tol_pct = D(tol_pct or 0)
+
+            allowed_variance = round4(sent_qty * tol_pct / Decimal("100"))
+            net_diff = abs(sent_qty - (received_qty + approved_loss))
+
+            force = isinstance(request.data, dict) and (request.data.get("force") or request.data.get("override"))
+            if net_diff > allowed_variance and not force:
+                raise Conflict(
+                    f"Cannot close job work order {order.jwo_no}: Reconciliation gate failed. "
+                    f"Sent ({sent_qty}m) does not match Received ({received_qty}m) + Approved Loss ({approved_loss}m). "
+                    f"Variance ({net_diff}m) exceeds allowed tolerance ({allowed_variance}m, {tol_pct}%). "
+                    f"Record approved loss entry or pass force=true to override.",
+                    code="JOBWORK_RECONCILIATION_FAILED",
+                )
+
+        before = snapshot(order)
+        old = order.status
+        order.status = "Closed"
+        order.updated_by = request.user
+        order.save(update_fields=["status", "updated_by", "updated_at"])
+        remarks = request.data.get("remarks") if isinstance(request.data, dict) else None
+        self.write_audit(
+            "closed", order, before=before, after=snapshot(order),
+            from_value=old, to_value="Closed", comments=remarks,
+        )
+        self._concurrency_instance = order
+        return Response(self.get_serializer(self.get_queryset().get(pk=order.pk)).data)
+
+    @action(detail=True, methods=["post"], url_path=r"losses/(?P<loss_id>[^/.]+)/approve")
     @transaction.atomic
-    def add_outward(self, request, pk=None):
+    def approve_loss(self, request, pk=None, loss_id=None):
         order = self.get_object()
-        serializer = JWOOutwardSerializer(data=request.data, context=self.get_serializer_context())
-        serializer.is_valid(raise_exception=True)
-        from .models import JWOOutward
-        outward = JWOOutward.objects.create(
-            client_id=self.get_client_id(),
-            job_work_order=order,
-            **serializer.validated_data,
-        )
-        return Response(JWOOutwardSerializer(outward).data, status=status.HTTP_201_CREATED)
+        loss = order.loss_entries.filter(id=_uuid_or_404(loss_id), deleted_at__isnull=True).first()
+        if loss is None:
+            raise NotFound("Loss entry not found.")
+        loss.status = "Approved"
+        loss.approved_by = request.user
+        loss.approved_at = timezone.now()
+        loss.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
+        return Response(JWOLossEntrySerializer(loss).data)
 
-    @action(detail=True, methods=["post"], url_path="inwards")
+    # -- child rows: /orders/{id}/<kind>/ and /orders/{id}/<kind>/{rowId}/ ---
+    @action(
+        detail=True, methods=["get", "post"],
+        url_path=rf"(?P<kind>{ORDER_ROW_KIND_PATTERN})", url_name="rows",
+    )
     @transaction.atomic
-    def add_inward(self, request, pk=None):
+    def rows(self, request, pk=None, kind=None):
         order = self.get_object()
-        serializer = JWOInwardSerializer(data=request.data, context=self.get_serializer_context())
+        _model, row_serializer, _series, _label = ORDER_ROW_KINDS[kind]
+        context = self.get_serializer_context()
+        if request.method == "GET":
+            rows = live(getattr(order, kind))
+            return Response({"results": row_serializer(rows, many=True, context=context).data})
+        serializer = row_serializer(data=request.data, context=context)
         serializer.is_valid(raise_exception=True)
-        from .models import JWOInward
-        inward = JWOInward.objects.create(
-            client_id=self.get_client_id(),
-            job_work_order=order,
-            **serializer.validated_data,
-        )
-        return Response(JWOInwardSerializer(inward).data, status=status.HTTP_201_CREATED)
+        row = save_order_row(request, order, kind, serializer)
+        return Response(row_serializer(row, context=context).data, status=status.HTTP_201_CREATED)
 
-    @action(detail=True, methods=["post"], url_path="charges")
+    @action(
+        detail=True, methods=["get", "patch", "delete"],
+        url_path=rf"(?P<kind>{ORDER_ROW_KIND_PATTERN})/(?P<row_id>[^/.]+)",
+        url_name="row-detail",
+    )
     @transaction.atomic
-    def add_charge(self, request, pk=None):
+    def row_detail(self, request, pk=None, kind=None, row_id=None):
         order = self.get_object()
-        serializer = JWOChargeSerializer(data=request.data, context=self.get_serializer_context())
+        _model, row_serializer, _series, _label = ORDER_ROW_KINDS[kind]
+        context = self.get_serializer_context()
+        row = getattr(order, kind).filter(
+            pk=_uuid_or_404(row_id), deleted_at__isnull=True
+        ).first()
+        if row is None:
+            raise NotFound()
+        if request.method == "GET":
+            return Response(row_serializer(row, context=context).data)
+        if request.method == "DELETE":
+            delete_order_row(request, order, kind, row)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = row_serializer(row, data=request.data, partial=True, context=context)
         serializer.is_valid(raise_exception=True)
-        from .models import JWOCharge
-        charge = JWOCharge.objects.create(
-            client_id=self.get_client_id(),
-            job_work_order=order,
-            **serializer.validated_data,
-        )
-        return Response(JWOChargeSerializer(charge).data, status=status.HTTP_201_CREATED)
-
-    @action(detail=True, methods=["post"], url_path="reprocesses")
-    @transaction.atomic
-    def add_reprocess(self, request, pk=None):
-        order = self.get_object()
-        serializer = JWOReprocessSerializer(data=request.data, context=self.get_serializer_context())
-        serializer.is_valid(raise_exception=True)
-        from .models import JWOReprocess
-        reprocess = JWOReprocess.objects.create(
-            client_id=self.get_client_id(),
-            job_work_order=order,
-            **serializer.validated_data,
-        )
-        return Response(JWOReprocessSerializer(reprocess).data, status=status.HTTP_201_CREATED)
+        row = save_order_row(request, order, kind, serializer, instance=row)
+        return Response(row_serializer(row, context=context).data)
 
 
-class VendorProcessInstructionViewSet(TenantModelViewSet):
-    permission_classes = [HasModulePermission]
-    required_permissions = ["view_jobwork"]
-    permission_map = {
-        "write": ["manage_jobwork"],
-    }
-    queryset = VendorProcessInstruction.objects.prefetch_related("entries")
-    serializer_class = VendorProcessInstructionSerializer
-    audit_entity_type = "VendorProcessInstruction"
-    audit_label_field = "pi_number"
-    status_field = "status"
-    default_date_field = "date"
-    search_fields = ["pi_number", "po_number", "vendor", "fabric", "process_type"]
-    ordering = ["-date", "-created_at"]
-    idempotent_create = True
-
-    def perform_create(self, serializer):
-        serializer.validated_data["pi_number"] = allocate_number(
-            self.request.user.client, "VPI",
-            serializer.validated_data.get("date"),
-        )
-        return super().perform_create(serializer)
-
-
-class VPIProgressEntryViewSet(TenantModelViewSet):
-    permission_classes = [HasModulePermission]
-    required_permissions = ["view_jobwork"]
-    permission_map = {
-        "write": ["manage_jobwork"],
-    }
-    queryset = VPIProgressEntry.objects.select_related("instruction")
-    serializer_class = VPIProgressEntrySerializer
-    audit_entity_type = "VPIProgressEntry"
-    audit_label_field = "id"
-    status_field = None
-    default_date_field = "date"
-    search_fields = ["entered_by", "remarks"]
-    ordering = ["-date", "-created_at"]
-    filter_map = {
-        "instructionId": "instruction_id",
-        "instruction_id": "instruction_id",
-    }
+def _uuid_or_404(value):
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError):
+        raise NotFound()

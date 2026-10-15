@@ -21,69 +21,153 @@ def _entry_totals(queryset):
 
 
 def agency_production_view(client_id, *, day=None):
-    """Agency-wise: agencies handled, orders monitored, entries, meters, pending."""
+    """Agency-wise: today produced, cumulative, balance, delayed, missing today's update."""
+    from datetime import date
+    from django.utils import timezone
     from .models import DailyProductionEntry, ProductionInstruction
+    from apps.masters.models import Agency
+
+    if day is None:
+        today = timezone.localdate()
+    elif isinstance(day, str):
+        try:
+            today = date.fromisoformat(day)
+        except (ValueError, TypeError):
+            today = timezone.localdate()
+    else:
+        today = day
 
     instructions = ProductionInstruction.objects.filter(
         client_id=client_id, deleted_at__isnull=True
     )
-    rows = []
-    for agency in (
+    agency_names = list(
         instructions.values_list("agency_name", flat=True).distinct().order_by("agency_name")
-    ):
-        scoped = instructions.filter(agency_name=agency)
-        day_entries = DailyProductionEntry.objects.filter(
+    )
+    agencies_master = {a.name: a for a in Agency.objects.filter(client_id=client_id, deleted_at__isnull=True)}
+    for name in agencies_master:
+        if name not in agency_names:
+            agency_names.append(name)
+
+    rows = []
+    for agency_name in agency_names:
+        if not agency_name:
+            continue
+        scoped = instructions.filter(agency_name=agency_name)
+        master = agencies_master.get(agency_name)
+
+        all_entries = DailyProductionEntry.objects.filter(
             client_id=client_id, instruction__in=scoped, deleted_at__isnull=True
         )
-        if day is not None:
-            day_entries = day_entries.filter(entry_date=day)
-        totals = _entry_totals(day_entries)
+        today_entries = all_entries.filter(entry_date=today)
+
+        today_produced = today_entries.aggregate(m=Sum("meters"))["m"] or ZERO
+        today_takas = today_entries.aggregate(t=Sum("produced_takas"))["t"] or 0
+        cumulative_produced = all_entries.aggregate(m=Sum("meters"))["m"] or ZERO
+        order_meters = scoped.aggregate(m=Sum("order_meter"))["m"] or ZERO
+        balance_meters = max(ZERO, order_meters - cumulative_produced)
+
+        active_instructions = scoped.filter(status__in=["Running", "Partially Completed", "Not Started", "Approved"])
+        running_instructions = scoped.filter(status__in=["Running", "Partially Completed"])
+        instructions_with_today_entry = set(today_entries.values_list("instruction_id", flat=True))
+        missing_today_count = sum(1 for inst in running_instructions if inst.id not in instructions_with_today_entry)
+
+        delayed_count = scoped.filter(
+            expected_start_date__lt=today,
+            status__in=["Draft", "Approved", "Not Started"]
+        ).count()
+
+        totals = _entry_totals(all_entries)
         rows.append(
             {
-                "agency": agency,
+                "agency": agency_name,
+                "agencyCode": master.code if master else None,
+                "agencyId": str(master.id) if master else None,
                 "ordersMonitored": scoped.values("order_reference").distinct().count(),
                 "instructions": scoped.count(),
+                "activeInstructions": active_instructions.count(),
+                "todayProduced": float(today_produced),
+                "todayTakas": int(today_takas),
+                "cumulativeProduced": float(cumulative_produced),
+                "orderMeters": float(order_meters),
+                "balanceMeters": float(balance_meters),
+                "delayed": delayed_count,
+                "missingTodayUpdate": missing_today_count,
                 "dailyEntries": totals["entries"],
-                "metersMonitored": totals["meters"],
-                "pendingReports": scoped.exclude(status__in=["Verified", "Closed"]).count(),
+                "metersMonitored": float(totals["meters"]),
+                "pendingReports": scoped.exclude(status__in=["Verified", "Closed", "PO Created"]).count(),
             }
         )
     return rows
 
 
 def employee_production_view(client_id, *, employee_id=None, day=None):
-    """Employee-wise: entries joined on ``entered_by_employee_id`` plus workload."""
+    """Employee-wise: today produced, cumulative, balance, delayed, missing today's update."""
+    from datetime import date
+    from django.utils import timezone
     from apps.hrms.models import Employee
-
     from .models import DailyProductionEntry, ProductionInstruction
+
+    if day is None:
+        today = timezone.localdate()
+    elif isinstance(day, str):
+        try:
+            today = date.fromisoformat(day)
+        except (ValueError, TypeError):
+            today = timezone.localdate()
+    else:
+        today = day
 
     employees = Employee.objects.filter(client_id=client_id, deleted_at__isnull=True)
     if employee_id is not None:
         employees = employees.filter(pk=employee_id)
     rows = []
     for employee in employees.order_by("name"):
-        entries = DailyProductionEntry.objects.filter(
+        all_entries = DailyProductionEntry.objects.filter(
             client_id=client_id,
             entered_by_employee=employee,
             deleted_at__isnull=True,
         )
-        if day is not None:
-            entries = entries.filter(entry_date=day)
-        totals = _entry_totals(entries)
+        today_entries = all_entries.filter(entry_date=today)
+        today_produced = today_entries.aggregate(m=Sum("meters"))["m"] or ZERO
+        cumulative_produced = all_entries.aggregate(m=Sum("meters"))["m"] or ZERO
+
+        assigned_instructions = ProductionInstruction.objects.filter(
+            client_id=client_id, employee=employee, deleted_at__isnull=True
+        )
+        active_instructions = assigned_instructions.filter(
+            status__in=["Running", "Partially Completed", "Not Started", "Approved"]
+        )
+        running_instructions = assigned_instructions.filter(status__in=["Running", "Partially Completed"])
+        today_entered_inst_ids = set(
+            DailyProductionEntry.objects.filter(
+                client_id=client_id, instruction__in=running_instructions, entry_date=today, deleted_at__isnull=True
+            ).values_list("instruction_id", flat=True)
+        )
+        missing_today_count = sum(1 for inst in running_instructions if inst.id not in today_entered_inst_ids)
+
+        delayed_count = assigned_instructions.filter(
+            expected_start_date__lt=today,
+            status__in=["Draft", "Approved", "Not Started"]
+        ).count()
+
+        totals = _entry_totals(all_entries)
         rows.append(
             {
                 "employeeId": str(employee.id),
                 "employeeCode": employee.employee_code,
                 "name": employee.name,
                 "status": employee.status,
-                "agenciesHandled": entries.values(
+                "agenciesHandled": all_entries.values(
                     "instruction__agency_name"
                 ).distinct().count(),
-                "ordersMonitored": ProductionInstruction.objects.filter(
-                    client_id=client_id, employee=employee, deleted_at__isnull=True
-                ).count(),
+                "ordersMonitored": assigned_instructions.count(),
+                "activeInstructions": active_instructions.count(),
+                "todayProduced": float(today_produced),
+                "cumulativeProduced": float(cumulative_produced),
+                "delayed": delayed_count,
+                "missingTodayUpdate": missing_today_count,
                 "dailyEntries": totals["entries"],
-                "metersMonitored": totals["meters"],
+                "metersMonitored": float(totals["meters"]),
             }
         )
     return rows

@@ -24,6 +24,16 @@ class ProductionInstructionSerializer(BaseModelSerializer):
     supervisorId = TenantPrimaryKeyRelatedField(
         source="supervisor", model="hrms.Employee", required=False, allow_null=True
     )
+    agencyId = TenantPrimaryKeyRelatedField(
+        source="agency", model="masters.Agency", required=False, allow_null=True
+    )
+    agencyCode = serializers.ReadOnlyField(source="agency.code")
+    greyLotId = TenantPrimaryKeyRelatedField(
+        source="grey_lot", model="inventory.LotTaka", required=False, allow_null=True
+    )
+    greyLotNo = serializers.ReadOnlyField(source="grey_lot.lot_number")
+    finalPoId = serializers.PrimaryKeyRelatedField(source="final_po", read_only=True)
+    finalPoNumber = serializers.ReadOnlyField(source="final_po.po_number")
     employeeCode = serializers.ReadOnlyField(source="employee.employee_code")
     employeeName = serializers.ReadOnlyField(source="employee.name")
     cumulative = serializers.SerializerMethodField()
@@ -36,19 +46,23 @@ class ProductionInstructionSerializer(BaseModelSerializer):
     class Meta:
         model = ProductionInstruction
         fields = [
-            "id", "instruction_number", "agency_name", "order_reference", "order_meter",
-            "pi_date", "fabric", "process_type", "agreed_job_rate", "rejected_qty",
-            "verification_remarks", "completed_at",
+            "id", "instruction_number", "agency_name", "agencyId", "agencyCode", "order_reference", "order_meter",
+            "taka_count", "total_weight", "width", "gsm", "tentative_rate", "agreed_rate", "rate_uom",
+            "special_terms", "expected_start_date", "pi_date", "fabric", "process_type", "agreed_job_rate", "rejected_qty",
+            "verification_remarks", "completed_at", "greyLotId", "greyLotNo", "finalPoId", "finalPoNumber",
             "employeeId", "employeeCode", "employeeName", "supervisorId",
             "status", "verified_by", "verified_at", "notes",
             "cumulative", "balance", "totalProduced", "acceptedQty",
             "shortageQty", "finalAmount", "created_at", "updated_at",
         ]
         read_only_fields = [
-            "id", "instruction_number", "status", "verified_by", "verified_at",
+            "id", "instruction_number", "verified_by", "verified_at",
             "completed_at", "rejected_qty", "verification_remarks",
             "employeeCode", "employeeName", "cumulative", "balance",
             "totalProduced", "acceptedQty", "shortageQty", "finalAmount",
+            "agencyCode", "greyLotNo", "finalPoNumber",
+            # Status only moves through approve/start/complete/verify/generate-po.
+            "status",
             "created_at", "updated_at",
         ]
 
@@ -65,6 +79,12 @@ class ProductionInstructionSerializer(BaseModelSerializer):
 
             raise drf_serializers.ValidationError(
                 {"agreed_job_rate": ["Must be zero or more."]}
+            )
+        if "agreed_rate" in attrs and D(attrs["agreed_rate"]) < ZERO:
+            from rest_framework import serializers as drf_serializers
+
+            raise drf_serializers.ValidationError(
+                {"agreed_rate": ["Must be zero or more."]}
             )
         return attrs
 
@@ -102,17 +122,25 @@ class DailyProductionEntrySerializer(BaseModelSerializer):
     enteredByEmployeeId = TenantPrimaryKeyRelatedField(
         source="entered_by_employee", model="hrms.Employee"
     )
+    photoFileId = TenantPrimaryKeyRelatedField(
+        source="photo_file", model="core.File", required=False, allow_null=True
+    )
     employeeCode = serializers.ReadOnlyField(source="entered_by_employee.employee_code")
     employeeName = serializers.ReadOnlyField(source="entered_by_employee.name")
 
     class Meta:
         model = DailyProductionEntry
         fields = [
-            "id", "instructionId", "entry_date", "meters",
+            "id", "instructionId", "entry_date", "opening_pending", "meters",
+            "produced_takas", "produced_weight", "good_meter", "reject_meter", "reprocess_meter",
+            "cumulative_meter", "balance_meter", "photoFileId",
             "enteredByEmployeeId", "employeeCode", "employeeName",
             "entered_by_user", "created_at", "remarks",
         ]
-        read_only_fields = ["id", "entered_by_user", "created_at"]
+        read_only_fields = [
+            "id", "entered_by_user", "created_at", "opening_pending",
+            "cumulative_meter", "balance_meter",
+        ]
 
     def validate(self, attrs):
         employee = attrs.get(
@@ -128,8 +156,9 @@ class IncentiveSchemeSerializer(BaseModelSerializer):
     class Meta:
         model = IncentiveScheme
         fields = [
-            "id", "name", "description", "rate_pct", "applies_from",
-            "applies_to", "is_active", "created_at", "updated_at",
+            "id", "name", "description", "period_type", "basis", "slab_type",
+            "rate_pct", "slabs", "hold_unpaid_invoices", "exclude_gst",
+            "applies_from", "applies_to", "is_active", "created_at", "updated_at",
         ]
 
 
@@ -148,8 +177,10 @@ class IncentiveCalculationSerializer(BaseModelSerializer):
         fields = [
             "id", "calc_number", "schemeId", "employeeId", "employeeCode",
             "employeeName", "period_label", "period_start", "period_end",
-            "net_sales", "returns_total", "incentive_amount", "status",
-            "detail", "journal_entry", "reversed_at", "reversal_reason",
+            "basis", "net_sales", "returns_total", "incentive_amount",
+            "hold_amount", "paid_amount", "status", "approved_by",
+            "approved_at", "paid_at", "detail", "journal_entry",
+            "reversed_at", "reversal_reason",
         ]
         read_only_fields = [
             "id", "calc_number", "net_sales", "returns_total", "incentive_amount",

@@ -40,6 +40,12 @@ SERIES_DEFAULTS = {
     "TKT": ("TKT", "never", 4, "-"),
     "AUD": ("AUD", "fy", 4, "-"),
     "TAK": ("TAK", "never", 6, "-"),
+    "ITM": ("ITM", "never", 4, "-"),
+    "SMPL": ("SMPL", "fy", 4, "-"),
+    "SMPR": ("SMPR", "fy", 4, "-"),
+    "LOT": ("LOT", "fy", 5, "-"),
+    # QC reprocess orders (JWOReprocess)
+    "RP": ("RP", "fy", 4, "-"),
     # Accounts
     "JE": ("JE", "fy", 3, "-"),
     # PMS -- calendar year, three digits: PRJ-2026-001

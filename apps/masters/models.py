@@ -55,6 +55,7 @@ class Party(TenantModel, LegacyIdMixin):
         ("Vendor", "Vendor"),
         ("Both", "Both"),
         ("Transporter", "Transporter"),
+        ("Processor", "Processor"),
     ]
     #: Supplier classification (db.md §4.1 addendum) -- only meaningful when
     #: ``type == "Vendor"``; left null for every other role.
@@ -91,6 +92,7 @@ class Party(TenantModel, LegacyIdMixin):
     code = models.TextField()
     type = models.TextField(choices=TYPES, default="Customer")
     vendor_type = models.TextField(choices=VENDOR_TYPES, null=True, blank=True)
+    is_processor = models.BooleanField(default=False)
     #: Transporter fleet details (``type == "Transporter"`` only).
     vehicle_number = models.TextField(null=True, blank=True)
     vehicle_type = models.TextField(choices=VEHICLE_TYPES, null=True, blank=True)
@@ -119,6 +121,14 @@ class Party(TenantModel, LegacyIdMixin):
         "accounting.Account", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     credit_limit = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    credit_days = models.IntegerField(default=30)
+    default_discount_pct = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    default_broker = models.ForeignKey(
+        "masters.Broker", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    default_salesperson = models.ForeignKey(
+        "hrms.Employee", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     payment_terms = models.TextField(null=True, blank=True)
 
     bank_account_number = models.TextField(null=True, blank=True)
@@ -542,6 +552,236 @@ class FabricVariant(TextileMaster):
                 name="uq_fabricvariant_combo",
             ),
         ]
+
+
+class Agency(TenantModel, LegacyIdMixin):
+    """External grey fabric production agency (PDF §04, §05)."""
+
+    name = models.TextField()
+    code = models.TextField()
+    contact_person = models.TextField(null=True, blank=True)
+    phone = models.TextField(null=True, blank=True)
+    email = models.EmailField(null=True, blank=True)
+    gstin = models.TextField(null=True, blank=True)
+    address = models.TextField(null=True, blank=True)
+    default_rate = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    rate_uom = models.TextField(default="Meter")
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "production_agencies"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_agency_code",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
+
+
+class Broker(TenantModel, LegacyIdMixin):
+    """Broker master for commission and brokerage tracking (PDF §04, §14)."""
+
+    COMMISSION_TYPES = [
+        ("percent", "percent"),
+        ("per_meter", "per_meter"),
+        ("fixed", "fixed"),
+    ]
+
+    name = models.TextField()
+    code = models.TextField()
+    contact_person = models.TextField(null=True, blank=True)
+    phone = models.TextField(null=True, blank=True)
+    email = models.EmailField(null=True, blank=True)
+    pan = models.TextField(null=True, blank=True)
+    gstin = models.TextField(null=True, blank=True)
+    commission_type = models.TextField(choices=COMMISSION_TYPES, default="percent")
+    default_value = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "brokers"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_broker_code",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
+
+
+class ProcessMaster(TenantModel, LegacyIdMixin):
+    """Textile processing types (Dyeing, Printing, Washing, etc.) with standard loss & tolerance (PDF §04, §07)."""
+
+    code = models.TextField()
+    name = models.TextField()
+    category = models.TextField(null=True, blank=True)
+    expected_loss_pct = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    tolerance_pct = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "process_masters"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_process_master_code",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
+
+
+class JobWorkRateMaster(TenantModel, LegacyIdMixin):
+    """Standard rate contract: processor × process × fabric quality (PDF §04, §07)."""
+
+    processor = models.ForeignKey(
+        Party, on_delete=models.CASCADE, related_name="jobwork_rates"
+    )
+    process = models.ForeignKey(
+        ProcessMaster, on_delete=models.CASCADE, related_name="rates"
+    )
+    fabric_quality = models.ForeignKey(
+        FabricQuality, null=True, blank=True, on_delete=models.CASCADE, related_name="jobwork_rates"
+    )
+    rate = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    rate_uom = models.TextField(default="Meter")
+    effective_from = models.DateField()
+    effective_to = models.DateField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "jobwork_rate_masters"
+        ordering = ["-effective_from", "processor"]
+
+    def __str__(self):
+        return f"{self.processor.name} - {self.process.name}: {self.rate}/{self.rate_uom}"
+
+
+class DefectMaster(TenantModel, LegacyIdMixin):
+    """Configurable defect catalogue for QC inspections (PDF §04, §08)."""
+
+    CATEGORIES = [
+        ("shade", "shade"),
+        ("stain", "stain"),
+        ("hole", "hole"),
+        ("printing defect", "printing defect"),
+        ("finish", "finish"),
+        ("weaving defect", "weaving defect"),
+        ("other", "other"),
+    ]
+    SEVERITIES = [
+        ("Minor", "Minor"),
+        ("Major", "Major"),
+        ("Critical", "Critical"),
+    ]
+
+    code = models.TextField()
+    name = models.TextField()
+    category = models.TextField(choices=CATEGORIES, default="other")
+    severity = models.TextField(choices=SEVERITIES, default="Minor")
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "defect_masters"
+        ordering = ["category", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_defect_master_code",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.code} - {self.name} ({self.severity})"
+
+
+class LossReasonMaster(TenantModel, LegacyIdMixin):
+    """Loss/wastage reason master (PDF §07, §11)."""
+
+    code = models.TextField()
+    name = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "loss_reason_masters"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_loss_reason_code",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
+
+
+class ReturnReasonMaster(TenantModel, LegacyIdMixin):
+    """Reason for customer/supplier return or job work return (PDF §07, §09)."""
+
+    code = models.TextField()
+    name = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "return_reason_masters"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_return_reason_code",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
+
+
+class Transporter(TenantModel, LegacyIdMixin):
+    """Dedicated transporter master with fleet and driver management (PDF §13)."""
+
+    name = models.TextField()
+    code = models.TextField()
+    contact_person = models.TextField(null=True, blank=True)
+    phone = models.TextField(null=True, blank=True)
+    email = models.EmailField(null=True, blank=True)
+    gstin = models.TextField(null=True, blank=True)
+    pan = models.TextField(null=True, blank=True)
+    address = models.JSONField(default=dict, blank=True)
+    # List of vehicle objects: [{ "vehicleNumber": "...", "vehicleType": "...", "capacity": "...", "defaultDriver": "...", "driverPhone": "..." }]
+    vehicles = models.JSONField(default=list, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "transporters"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_transporter_code",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.code} - {self.name}"
 
 
 class Item(TenantModel, LegacyIdMixin):

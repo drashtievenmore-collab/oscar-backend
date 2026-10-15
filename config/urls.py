@@ -37,6 +37,7 @@ api_v1 = [
 # Shared masters (api.md §4)
 if enabled("masters"):
     api_v1.append(path("parties/", include("apps.masters.urls")))
+    api_v1.append(path("masters/", include("apps.masters.master_urls")))
 if enabled("inventory"):
     api_v1.append(path("inventory/", include("apps.inventory.urls")))
 
