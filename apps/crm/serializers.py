@@ -239,12 +239,17 @@ class LeadThreadSerializer(BaseModelSerializer):
 
 class LeadEmailSerializer(BaseModelSerializer):
     createdByName = serializers.CharField(source="created_by.name", read_only=True)
+    toAddresses = serializers.ListField(
+        child=serializers.CharField(), source="to_addresses", required=False
+    )
+    status = serializers.CharField(required=False)
+    errorMessage = serializers.CharField(source="error_message", read_only=True)
 
     class Meta:
         model = LeadEmail
         fields = [
-            "id", "subject", "body", "to_addresses", "sent_at",
-            "provider_message_id", "created_at", "createdByName",
+            "id", "subject", "body", "to_addresses", "toAddresses", "sent_at",
+            "provider_message_id", "status", "errorMessage", "created_at", "createdByName",
         ]
 
 

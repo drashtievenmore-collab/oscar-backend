@@ -142,12 +142,11 @@ class SalesDocumentViewSet(TenantModelViewSet):
             actor=request.user,
             attachments=attachments,
         )
-        # A sent quotation advances its deal out of Draft.
-        if (
-            document.__class__.__name__ == "Quotation"
-            and (channel or "").lower() == "email"
-            and payload.get("sent")
-        ):
+        # A sent quotation advances its deal out of Draft into Sent.
+        if document.__class__.__name__ == "Quotation":
+            if getattr(document, "status", None) == "Draft":
+                document.status = "Sent"
+                document.save(update_fields=["status", "updated_at"])
             crm_services.advance_deal_for_quotation(
                 document, "Sent", actor=request.user,
                 description=(
@@ -251,6 +250,28 @@ class QuotationViewSet(SalesDocumentViewSet):
             self.request.user.client, "QT", serializer.validated_data.get("doc_date")
         )
         return super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        from apps.crm import services as crm_services
+        previous_status = serializer.instance.status
+        quotation = super().perform_update(serializer)
+        if quotation.status != previous_status:
+            if quotation.status == "Sent":
+                crm_services.advance_deal_for_quotation(
+                    quotation, "Sent", actor=self.request.user,
+                    description=f"Quotation {quotation.quotation_number} status changed to Sent.",
+                )
+            elif quotation.status == "Rejected":
+                crm_services.advance_deal_for_quotation(
+                    quotation, "Open", actor=self.request.user,
+                    description=f"Quotation {quotation.quotation_number} rejected — deal moved to Open for negotiation.",
+                )
+            elif quotation.status in ("Accepted", "Approved"):
+                crm_services.advance_deal_for_quotation(
+                    quotation, "Won", actor=self.request.user,
+                    description=f"Quotation {quotation.quotation_number} approved — deal won.",
+                )
+        return quotation
 
     @action(detail=True, methods=["get"])
     def pdf(self, request, pk=None):
@@ -438,6 +459,33 @@ class QuotationViewSet(SalesDocumentViewSet):
     def accept(self, request, pk=None):
         """Alias of approve: staff-side acceptance (Approved/Accepted)."""
         return self.approve(request, pk=pk)
+
+    @action(detail=True, methods=["post"], url_path="reject")
+    @transaction.atomic
+    def reject(self, request, pk=None):
+        """Staff-side rejection of quotation: moves quotation to Rejected and linked deal to Open."""
+        from apps.crm import services as crm_services
+
+        quotation = self.get_object()
+        quotation.status = "Rejected"
+        quotation.save(update_fields=["status", "updated_at"])
+        QuotationActivity.objects.create(
+            quotation=quotation,
+            event="rejected",
+            actor_label=getattr(request.user, "name", None) or "staff",
+            comment=request.data.get("reason"),
+        )
+        self.write_audit(
+            "reject", quotation,
+            description=f"Rejected ({quotation.quotation_number})",
+        )
+        crm_services.advance_deal_for_quotation(
+            quotation, "Open", actor=request.user,
+            description=f"Quotation {quotation.quotation_number} rejected — deal moved to Open for negotiation.",
+        )
+        return Response(
+            QuotationSerializer(quotation, context=self.get_serializer_context()).data
+        )
 
     @action(detail=True, methods=["post", "delete"], url_path="share")
     def share(self, request, pk=None):

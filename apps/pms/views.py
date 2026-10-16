@@ -499,7 +499,11 @@ class ProjectViewSet(TenantModelViewSet):
     def retrieve(self, request, *args, **kwargs):
         project = self.get_object()
         self._concurrency_instance = project
+        from .pipeline_services import sync_project_pipeline_stages
+        pipeline_res = sync_project_pipeline_stages(project)
         context = self._detail_context(project)
+        context["pipeline_summary"] = pipeline_res["stockEvaluation"]
+        context["pipeline_stages_map"] = {s["sequence"]: s for s in pipeline_res["stages"]}
         return Response(ProjectDetailSerializer(project, context=context).data)
 
     def _detail_context(self, project):
@@ -755,6 +759,14 @@ class ProjectViewSet(TenantModelViewSet):
         )
         return Response(envelope(ApprovalSerializer(rows, many=True).data))
 
+    @action(detail=True, methods=["get"], url_path="customer-returns")
+    def customer_returns(self, request, pk=None):
+        """Retrieve customer returns and credit notes associated with this project."""
+        project = self.get_object()
+        serializer = ProjectDetailSerializer(project, context=self.get_serializer_context())
+        returns_data = serializer.data.get("customerReturns", [])
+        return Response(envelope(returns_data))
+
     # -- stages ------------------------------------------------------------
     def _get_stage(self, project, stage_id):
         from django.core.exceptions import ValidationError as DjangoValidationError
@@ -792,7 +804,7 @@ class ProjectViewSet(TenantModelViewSet):
                 )
             )
 
-        # Permission check: Only project creator can add dynamic stages
+        # Permission check: Only project creator can add stages
         if (
             getattr(request.user, "is_authenticated", False)
             and not getattr(request.user, "is_superuser", False)
@@ -842,18 +854,29 @@ class ProjectViewSet(TenantModelViewSet):
             entity_type="PmsProject",
             entity_id=project.id,
             entity_label=project.code,
-            description=f"Dynamic stage '{stage.name}' added with {stage.weight_pct}% weight",
+            description=f"Stage '{stage.name}' added with {stage.weight_pct}% weight",
         )
         return Response(
             ProjectStageSerializer(stage, context=self.get_serializer_context()).data,
             status=status.HTTP_201_CREATED,
         )
 
-    @action(detail=True, methods=["patch"], url_path=r"stages/(?P<stage_id>[^/.]+)")
+    @action(detail=True, methods=["patch", "delete"], url_path=r"stages/(?P<stage_id>[^/.]+)")
     @transaction.atomic
     def stage_detail(self, request, pk=None, stage_id=None):
         project = self.get_object()
         stage = self._get_stage(project, stage_id)
+
+        if request.method == "DELETE":
+            stage_name = stage.name
+            stage.delete()
+            services.recalculate_project(project)
+            record_audit(
+                client=request.client_id, actor=request.user, action="STAGE_DELETED",
+                entity_type="PmsStage", entity_id=stage.id, entity_label=stage_name,
+                description=f"Stage '{stage_name}' removed from project",
+            )
+            return Response(status=status.HTTP_204_NO_CONTENT)
 
         # If modifying percentage, gate on project creator
         if any(k in request.data for k in ("percentage", "weightPct", "weight", "weight_pct")):

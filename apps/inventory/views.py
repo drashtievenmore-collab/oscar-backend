@@ -205,6 +205,127 @@ class StockSummaryView(APIView):
         )
 
 
+class CombinedGreyStockView(APIView):
+    """
+    GET /inventory/combined-grey-stock/
+    Authoritative calculation of combined grey fabric stock across all fabric qualities,
+    configured minimum threshold, shortage status, and external WIP.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request):
+        client_id = request.client_id
+        location_id = request.query_params.get("locationId") or request.query_params.get("location_id")
+        grey_calc = stock.calculate_combined_grey_stock(client_id, location_id=location_id)
+        grey_setting = stock.get_combined_grey_stock_setting(client_id)
+        threshold = grey_setting["threshold"]
+        avail_grey = grey_calc["available_grey_stock"]
+
+        shortage = ZERO
+        if not grey_setting["is_configured"]:
+            status_val = "Unconfigured"
+        elif not grey_setting["is_enabled"]:
+            status_val = "Disabled"
+        elif avail_grey < threshold:
+            shortage = round4(threshold - avail_grey)
+            status_val = "Critical" if avail_grey <= ZERO else "Low Stock"
+        else:
+            status_val = "Sufficient"
+
+        return Response({
+            "physicalGrey": float(grey_calc["physical_grey_stock"]),
+            "reservedGrey": float(grey_calc["reserved_grey_stock"]),
+            "availableGrey": float(grey_calc["available_grey_stock"]),
+            "externalWip": float(grey_calc["external_wip"]),
+            "wipByParty": grey_calc["wip_by_party"],
+            "uom": grey_calc["uom"],
+            "qualitiesCount": grey_calc["qualities_count"],
+            "takasCount": grey_calc["takas_count"],
+            "threshold": float(threshold),
+            "shortage": float(shortage),
+            "status": status_val,
+            "isConfigured": grey_setting["is_configured"],
+            "isEnabled": grey_setting["is_enabled"],
+            "channels": grey_setting["channels"],
+            "incompatibleItems": grey_calc["incompatible_items"],
+        })
+
+
+class CombinedGreyStockSettingView(APIView):
+    """
+    GET /inventory/combined-grey-stock/setting/
+    POST /inventory/combined-grey-stock/setting/
+    View and update the minimum total grey stock threshold in AlertSetting.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request):
+        setting = stock.get_combined_grey_stock_setting(request.client_id)
+        return Response({
+            "threshold": float(setting["threshold"]),
+            "isEnabled": setting["is_enabled"],
+            "isConfigured": setting["is_configured"],
+            "uom": setting["uom"],
+            "channels": setting["channels"],
+            "settingId": setting["setting_id"],
+        })
+
+    def post(self, request):
+        client_id = request.client_id
+        data = request.data or {}
+
+        raw_threshold = data.get("threshold")
+        if raw_threshold is None or str(raw_threshold).strip() == "":
+            raise ValidationFailed(
+                "Threshold amount is required.",
+                field_errors={"threshold": ["Please specify a minimum grey stock threshold in meters."]},
+            )
+        try:
+            threshold = round4(D(raw_threshold))
+            if threshold < ZERO:
+                raise ValueError()
+        except (ValueError, TypeError, ArithmeticError):
+            raise ValidationFailed(
+                "Invalid threshold amount.",
+                field_errors={"threshold": ["Threshold must be a non-negative number."]},
+            )
+
+        uom_str = data.get("uom", "Mtr")
+        if uom_str and uom_str.strip().lower() not in ("mtr", "meter", "m", "meters"):
+            raise ValidationFailed(
+                "Combined grey stock threshold must be configured in linear meters.",
+                field_errors={"uom": ["Only meter units are supported for combined grey stock aggregation."]},
+            )
+
+        is_enabled = data.get("isEnabled", True)
+        if isinstance(is_enabled, str):
+            is_enabled = is_enabled.lower() in ("true", "1", "yes")
+
+        channels = data.get("channels") or ["in_app", "email"]
+        if not isinstance(channels, list):
+            channels = [channels]
+
+        updated_setting = stock.set_combined_grey_stock_setting(
+            client_id=client_id,
+            threshold=threshold,
+            is_enabled=is_enabled,
+            channels=channels,
+            user=request.user if getattr(request, "user", None) and request.user.is_authenticated else None,
+        )
+
+        return Response({
+            "threshold": float(updated_setting["threshold"]),
+            "isEnabled": updated_setting["is_enabled"],
+            "isConfigured": updated_setting["is_configured"],
+            "uom": updated_setting["uom"],
+            "channels": updated_setting["channels"],
+            "settingId": updated_setting["setting_id"],
+            "message": "Combined grey stock threshold updated successfully.",
+        })
+
+
 class StockMovementViewSet(ReadOnlyTenantViewSet):
     """``GET /inventory/movements/`` -- the movement ledger.
 
@@ -1960,6 +2081,41 @@ class InventoryDashboardView(APIView):
                     "lotNo": None,
                 })
 
+        # Combined Grey Fabric Stock metrics & alert status
+        grey_calc = stock.calculate_combined_grey_stock(client_id, location_id=godown_id)
+        grey_setting = stock.get_combined_grey_stock_setting(client_id)
+        threshold = grey_setting["threshold"]
+        avail_grey = grey_calc["available_grey_stock"]
+
+        shortage = ZERO
+        if not grey_setting["is_configured"]:
+            status_val = "Unconfigured"
+        elif not grey_setting["is_enabled"]:
+            status_val = "Disabled"
+        elif avail_grey < threshold:
+            shortage = round4(threshold - avail_grey)
+            status_val = "Critical" if avail_grey <= ZERO else "Low Stock"
+        else:
+            status_val = "Sufficient"
+
+        combined_grey_stock = {
+            "physicalGrey": float(grey_calc["physical_grey_stock"]),
+            "reservedGrey": float(grey_calc["reserved_grey_stock"]),
+            "availableGrey": float(grey_calc["available_grey_stock"]),
+            "externalWip": float(grey_calc["external_wip"]),
+            "wipByParty": grey_calc["wip_by_party"],
+            "uom": grey_calc["uom"],
+            "qualitiesCount": grey_calc["qualities_count"],
+            "takasCount": grey_calc["takas_count"],
+            "threshold": float(threshold),
+            "shortage": float(shortage),
+            "status": status_val,
+            "isConfigured": grey_setting["is_configured"],
+            "isEnabled": grey_setting["is_enabled"],
+            "channels": grey_setting["channels"],
+            "incompatibleItems": grey_calc["incompatible_items"],
+        }
+
         return Response({
             "units": {"inScope": units_in_scope, "mixed": mixed_units},
             "filters": {
@@ -1987,6 +2143,7 @@ class InventoryDashboardView(APIView):
             "goodRecords": good_records,
             "reprocessRecords": reprocess_records,
             "returnRecords": return_records,
+            "combinedGreyStock": combined_grey_stock,
         })
 
     @transaction.atomic

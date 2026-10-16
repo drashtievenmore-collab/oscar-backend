@@ -324,6 +324,11 @@ class LeadEmail(LeadSubResource):
     to_addresses = models.JSONField(default=list, blank=True)
     sent_at = models.DateTimeField(null=True, blank=True)
     provider_message_id = models.TextField(null=True, blank=True)
+    status = models.TextField(
+        choices=[("Queued", "Queued"), ("Sent", "Sent"), ("Failed", "Failed"), ("Delivered", "Delivered")],
+        default="Sent",
+    )
+    error_message = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "crm_lead_emails"

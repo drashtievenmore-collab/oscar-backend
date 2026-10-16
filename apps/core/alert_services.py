@@ -132,11 +132,21 @@ DEFAULT_ALERT_CONFIGS = [
         "is_enabled": True,
         "channels": ["in_app"],
     },
+    {
+        "alert_key": "combined_grey_stock_low",
+        "name": "Combined Total Grey Stock Level",
+        "description": "Combined available grey fabric stock across all qualities falls below configured minimum threshold.",
+        "threshold_days": 0,
+        "threshold_pct": 0,
+        "threshold_amount": 0,
+        "is_enabled": True,
+        "channels": ["in_app", "email"],
+    },
 ]
 
 
 def ensure_alert_settings(client):
-    """Ensure all 12 default alert settings exist for a tenant."""
+    """Ensure all default alert settings exist for a tenant."""
     for conf in DEFAULT_ALERT_CONFIGS:
         AlertSetting.objects.get_or_create(
             client=client,
@@ -178,6 +188,12 @@ def trigger_incident(
         status="Active",
     ).first()
     if existing:
+        existing.severity = severity
+        existing.title = title
+        existing.message = message
+        if metadata:
+            existing.metadata = metadata
+        existing.save(update_fields=["severity", "title", "message", "metadata", "updated_at"])
         return existing
 
     incident = AlertIncident.objects.create(
@@ -546,4 +562,15 @@ def run_all_alert_checks(client_id, as_of=None):
     except Exception:
         pass
 
+    # 13. Combined Grey Fabric Stock below minimum threshold
+    try:
+        from apps.inventory.services import evaluate_combined_grey_stock_alert
+        result = evaluate_combined_grey_stock_alert(client_id)
+        inc = result.get("incident")
+        if inc:
+            incidents.append(inc)
+    except Exception:
+        pass
+
     return incidents
+

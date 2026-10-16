@@ -94,12 +94,18 @@ class QuotationSerializer(DocumentSerializer):
     partyId = TenantPrimaryKeyRelatedField(
         source="party", model="masters.Party", required=False, allow_null=True
     )
+    crmDeal = TenantPrimaryKeyRelatedField(
+        source="crm_deal", model="crm.Deal", required=False, allow_null=True
+    )
+    crmLead = TenantPrimaryKeyRelatedField(
+        source="crm_lead", model="crm.Lead", required=False, allow_null=True
+    )
 
     class Meta:
         model = Quotation
         fields = HEADER_FIELDS + [
             "quotation_number", "status", "valid_until", "subject",
-            "crm_deal", "crm_lead",
+            "crm_deal", "crm_lead", "crmDeal", "crmLead",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["quotation_number"]
 

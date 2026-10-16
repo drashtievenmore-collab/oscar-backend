@@ -9,21 +9,14 @@ from django.db import models
 
 from apps.core.models import LegacyIdMixin, TenantModel
 
-# api.md §4.2 -- the typedef says Machine | Part | Standalone, but the code also
-# branches on Service, Component and Consumable. Accept all six. `Service` items
-# hold no stock and are excluded from movements and valuation.
+# api.md §4.2 -- Textile ERP item kinds.
+# `Service` items hold no stock and are excluded from movements and valuation.
 ITEM_KINDS = [
-    ("Machine", "Machine"),
-    ("Part", "Part"),
-    ("Standalone", "Standalone"),
-    ("Service", "Service"),
-    ("Component", "Component"),
-    ("Consumable", "Consumable"),
     ("Fabric", "Fabric"),
 ]
 
 #: Kinds that never hold stock (api.md §4.2).
-STOCKLESS_ITEM_KINDS = {"Service"}
+STOCKLESS_ITEM_KINDS = set()
 
 #: Permanent fabric catalogue. These are master rows stored in the database
 #: (``masters.Fabric``), never frontend mock data. Seeded by migration 0007
@@ -801,7 +794,7 @@ class Item(TenantModel, LegacyIdMixin):
     category = models.ForeignKey(
         ItemCategory, null=True, blank=True, on_delete=models.SET_NULL, related_name="items"
     )
-    item_kind = models.TextField(choices=ITEM_KINDS, default="Standalone")
+    item_kind = models.TextField(choices=ITEM_KINDS, default="Fabric")
     hsn_code = models.TextField(null=True, blank=True)
 
     uom = models.TextField(default="Nos")

@@ -171,4 +171,21 @@ class AlertSettingViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         client_id = getattr(self.request, "client_id", None) or getattr(self.request.user, "client_id", None)
-        serializer.save(client_id=client_id)
+        instance = serializer.save(client_id=client_id)
+        if instance.alert_key == "combined_grey_stock_low":
+            try:
+                from apps.inventory.services import evaluate_combined_grey_stock_alert
+                evaluate_combined_grey_stock_alert(client_id)
+            except Exception:
+                pass
+
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        client_id = getattr(self.request, "client_id", None) or getattr(self.request.user, "client_id", None)
+        if instance.alert_key == "combined_grey_stock_low":
+            try:
+                from apps.inventory.services import evaluate_combined_grey_stock_alert
+                evaluate_combined_grey_stock_alert(client_id)
+            except Exception:
+                pass
+

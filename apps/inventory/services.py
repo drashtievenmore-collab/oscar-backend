@@ -226,7 +226,15 @@ def post_movement(
         )
 
     _apply_to_balance(movement)
+
+    try:
+        if getattr(item_obj, "item_kind", None) == "Fabric" or getattr(item_obj, "fabric_quality", None):
+            evaluate_combined_grey_stock_alert(client_id)
+    except Exception:
+        pass
+
     return movement
+
 
 
 def _apply_to_balance(movement):
@@ -1338,4 +1346,376 @@ def trace_lot_lineage(client_id, lot_taka_id_or_number):
         "jobWorkHistory": job_work_history,
         "qcHistory": qc_history,
     }
+
+
+# ---------------------------------------------------------------------------
+# Combined Grey Stock Calculation & Minimum-Level Alert Engine
+# ---------------------------------------------------------------------------
+def calculate_combined_grey_stock(client_id, location_id=None):
+    """
+    Authoritative calculation of combined grey fabric stock across all fabric qualities.
+
+    Buckets:
+    - Physical Grey Stock: Fabric items/takas physically at company godowns (non-WIP,
+      non-blocked) that are NOT finished, not rejected, not on QC hold.
+    - Reserved Grey Stock: Open sales order line commitments reserving grey stock
+      (and takas explicitly in Reserved status).
+    - Available Grey Stock: max(0, Physical Grey Stock - Reserved Grey Stock).
+    - External Job Work WIP: Material dispatched to outside processors (SYS-WIP-*),
+      broken down by processor/vendor.
+    - Excluded from Available Grey: Finished fabric, QC Hold (SYS-QC-HOLD),
+      Reprocess (SYS-REPROCESS), Second Quality (SYS-SECOND-QUALITY),
+      Reject/Scrap (SYS-REJECT / FAULTY), Samples issued, and External WIP.
+
+    Unit Safety:
+    - Aggregates exclusively in linear length (Meters / Mtr).
+    - Incompatible units are excluded from the meter sum and reported in incompatible_items.
+    """
+    from apps.masters import uom as uom_master
+    from apps.masters.models import Item, Location, Party
+    from apps.inventory.models import LotTaka, StockBalance
+
+    book = uom_master.UnitBook(client_id)
+
+    # 1. Identify grey fabric items
+    items_qs = Item.objects.filter(
+        client_id=client_id, deleted_at__isnull=True
+    ).exclude(item_kind="Service").filter(
+        Q(item_kind="Fabric") | Q(category__name__icontains="Fabric") | Q(fabric_quality__isnull=False)
+    ).select_related("category")
+
+    grey_items = []
+    incompatible_items = []
+    for item in items_qs:
+        f_stage = (getattr(item, "fabric_stage", "") or "").lower()
+        f_qual = (item.fabric_quality or "").lower()
+        cat_name = (item.category.name if item.category else "").lower()
+        name_lower = (item.name or "").lower()
+        if f_stage == "finished" or "finished" in f_qual or "finished" in cat_name or "finished" in name_lower:
+            continue
+
+        resolved_uom = book.resolve(item.uom)
+        is_length = False
+        if resolved_uom and getattr(resolved_uom, "uom_type", None) == "Length":
+            is_length = True
+        elif (item.uom or "").lower() in ("mtr", "meter", "m", "meters"):
+            is_length = True
+
+        if is_length:
+            grey_items.append(item)
+        else:
+            incompatible_items.append({
+                "id": str(item.id),
+                "sku": item.sku,
+                "name": item.name,
+                "uom": item.uom,
+            })
+
+    grey_item_map = {item.id: item for item in grey_items}
+    grey_item_ids = list(grey_item_map.keys())
+
+    if not grey_item_ids:
+        return {
+            "physical_grey_stock": ZERO_QTY,
+            "reserved_grey_stock": ZERO_QTY,
+            "available_grey_stock": ZERO_QTY,
+            "external_wip": ZERO_QTY,
+            "wip_by_party": [],
+            "uom": "Mtr",
+            "qualities_count": 0,
+            "takas_count": 0,
+            "incompatible_items": incompatible_items,
+        }
+
+    # 2. Location mapping
+    role_by_code = {code: role for role, (code, _, _) in SYSTEM_LOCATIONS.items()}
+    all_locations = list(Location.objects.filter(client_id=client_id, deleted_at__isnull=True))
+    location_role = {}
+    wip_locations = {}
+    for loc in all_locations:
+        if loc.code in role_by_code:
+            location_role[loc.id] = role_by_code[loc.code]
+        elif (loc.code and loc.code.startswith("SYS-WIP-")) or (loc.name and loc.name.startswith("WIP - ")):
+            location_role[loc.id] = "EXTERNAL_WIP"
+            wip_locations[loc.id] = loc
+        else:
+            location_role[loc.id] = "GOOD"
+
+    # 3. Balances
+    balances_qs = StockBalance.objects.filter(
+        client_id=client_id, deleted_at__isnull=True, item_id__in=grey_item_ids
+    )
+    if location_id:
+        balances_qs = balances_qs.filter(location_id=location_id)
+    balance_rows = list(balances_qs.select_related("item", "location"))
+
+    # 4. WIP by party & External WIP
+    external_wip_qty = ZERO
+    wip_by_party_dict = {}
+    parties = {p.code: p for p in Party.objects.filter(client_id=client_id, deleted_at__isnull=True) if p.code}
+    parties_by_name = {p.name: p for p in Party.objects.filter(client_id=client_id, deleted_at__isnull=True)}
+
+    for b in balance_rows:
+        role = location_role.get(b.location_id, "GOOD")
+        if role == "EXTERNAL_WIP":
+            on_hand = round4(b.on_hand or ZERO)
+            external_wip_qty += on_hand
+            loc = wip_locations.get(b.location_id)
+            loc_code = loc.code if loc else ""
+            loc_name = loc.name if loc else ""
+            suffix = loc_code.replace("SYS-WIP-", "") if loc_code.startswith("SYS-WIP-") else ""
+            party = parties.get(suffix)
+            if not party and loc_name.startswith("WIP - "):
+                party = parties_by_name.get(loc_name[6:].strip())
+            party_id = str(party.id) if party else None
+            party_name = party.name if party else (loc_name[6:].strip() if loc_name.startswith("WIP - ") else (loc_name or "External Processor"))
+            entry = wip_by_party_dict.setdefault(b.location_id, {
+                "partyId": party_id,
+                "partyName": party_name,
+                "locationCode": loc_code,
+                "locationName": loc_name,
+                "qty": ZERO,
+            })
+            entry["qty"] += on_hand
+
+    wip_by_party = [
+        {
+            "partyId": v["partyId"],
+            "partyName": v["partyName"],
+            "party": v["partyName"],
+            "locationCode": v["locationCode"],
+            "locationName": v["locationName"],
+            "qty": float(v["qty"]),
+            "quantity": v["qty"],
+        }
+        for v in wip_by_party_dict.values()
+    ]
+
+    # 5. Taka-level analysis of GOOD stock for real Grey partitioning
+    good_takas = LotTaka.objects.filter(
+        client_id=client_id,
+        deleted_at__isnull=True,
+        available_quantity__gt=0,
+        item_id__in=grey_item_ids,
+    )
+    if location_id:
+        good_takas = good_takas.filter(location_id=location_id)
+
+    physical_grey_qty = ZERO
+    taka_reserved_qty = ZERO
+    taka_on_hand_by_item_loc = {}
+    grey_takas_count = 0
+
+    for lt in good_takas:
+        if location_role.get(lt.location_id, "GOOD") != "GOOD":
+            continue
+        taka_on_hand_by_item_loc[(lt.item_id, lt.location_id)] = (
+            taka_on_hand_by_item_loc.get((lt.item_id, lt.location_id), ZERO) + D(lt.available_quantity)
+        )
+        lt_qty = round4(lt.available_quantity)
+
+        if lt.status == "Reserved":
+            taka_reserved_qty += lt_qty
+        elif (
+            lt.status == "Finished"
+            or (lt.source_document_type in ("JobWorkInward", "JWOInward", "Production"))
+            or lt.parent_taka_id is not None
+        ):
+            # Finished fabric -- excluded from grey stock
+            pass
+        elif lt.status in ("Available", "Active"):
+            physical_grey_qty += lt_qty
+            grey_takas_count += 1
+
+    # 6. Loose stock for grey items (balances on hand minus takas)
+    for b in balance_rows:
+        if location_role.get(b.location_id, "GOOD") != "GOOD":
+            continue
+        loose = round4(D(b.on_hand or ZERO) - taka_on_hand_by_item_loc.get((b.item_id, b.location_id), ZERO))
+        if loose > ZERO:
+            physical_grey_qty += loose
+
+    # 7. Sales order reservations for grey items
+    so_reserved_map = reserved_quantity(client_id, grey_item_ids)
+    so_reserved_qty = sum((round4(v) for v in so_reserved_map.values()), ZERO)
+    reserved_grey_qty = max(so_reserved_qty, taka_reserved_qty)
+
+    # 8. Available Grey Stock
+    available_grey_qty = max(ZERO, physical_grey_qty - reserved_grey_qty)
+
+    qualities = {item.fabric_quality or item.name for item in grey_items if item.fabric_quality or item.name}
+
+    return {
+        "physical_grey_stock": round4(physical_grey_qty),
+        "reserved_grey_stock": round4(reserved_grey_qty),
+        "available_grey_stock": round4(available_grey_qty),
+        "external_wip": round4(external_wip_qty),
+        "wip_by_party": wip_by_party,
+        "uom": "Mtr",
+        "qualities_count": len(qualities),
+        "takas_count": grey_takas_count,
+        "incompatible_items": incompatible_items,
+    }
+
+
+def get_combined_grey_stock_setting(client_id):
+    """Return configured minimum threshold and alert preference for combined grey stock."""
+    from apps.core.models import AlertSetting
+    setting = AlertSetting.objects.filter(client_id=client_id, alert_key="combined_grey_stock_low").first()
+    if setting is None:
+        return {
+            "threshold": ZERO_QTY,
+            "is_enabled": True,
+            "is_configured": False,
+            "uom": "Mtr",
+            "channels": ["in_app", "email"],
+            "setting_id": None,
+        }
+    threshold = round4(setting.threshold_amount or ZERO)
+    return {
+        "threshold": threshold,
+        "is_enabled": bool(setting.is_enabled),
+        "is_configured": bool(threshold > ZERO),
+        "uom": "Mtr",
+        "channels": setting.channels or ["in_app"],
+        "setting_id": str(setting.id),
+    }
+
+
+@transaction.atomic
+def set_combined_grey_stock_setting(client_id, threshold, is_enabled=True, channels=None, user=None):
+    """Persist the minimum grey stock threshold in backend AlertSetting."""
+    from apps.core.audit import record_audit, snapshot
+    from apps.core.models import AlertSetting
+
+    threshold = round4(D(threshold or 0))
+    setting, created = AlertSetting.objects.select_for_update().get_or_create(
+        client_id=client_id,
+        alert_key="combined_grey_stock_low",
+        defaults={
+            "name": "Combined Total Grey Stock Level",
+            "description": "Combined available grey fabric stock across all qualities falls below configured minimum threshold.",
+            "threshold_amount": threshold,
+            "is_enabled": bool(is_enabled),
+            "channels": channels or ["in_app", "email"],
+        },
+    )
+    if not created:
+        before = snapshot(setting)
+        setting.threshold_amount = threshold
+        if is_enabled is not None:
+            setting.is_enabled = bool(is_enabled)
+        if channels is not None:
+            setting.channels = channels
+        setting.save(update_fields=["threshold_amount", "is_enabled", "channels", "updated_at"])
+        record_audit(
+            client=client_id,
+            actor=user,
+            action="update",
+            entity_type="AlertSetting",
+            entity_id=setting.id,
+            entity_label="Combined Total Grey Stock Level",
+            description=f"Combined grey stock minimum threshold set to {threshold} Mtr (enabled: {setting.is_enabled})",
+            before=before,
+            after=snapshot(setting),
+        )
+
+    # Immediately evaluate alert and return state
+    evaluate_combined_grey_stock_alert(client_id)
+    return get_combined_grey_stock_setting(client_id)
+
+
+def evaluate_combined_grey_stock_alert(client_id):
+    """
+    Evaluates combined grey fabric inventory against the configured minimum threshold.
+    - If disabled or threshold <= 0, auto-resolves any existing active incident.
+    - If available grey stock < threshold, triggers or updates active incident.
+    - If available grey stock >= threshold, auto-resolves existing active incident.
+    """
+    from apps.core import alert_services
+    from apps.core.models import AlertIncident
+
+    setting = get_combined_grey_stock_setting(client_id)
+    calc = calculate_combined_grey_stock(client_id)
+    available = calc["available_grey_stock"]
+    threshold = setting["threshold"]
+
+    active_incident = AlertIncident.objects.filter(
+        client_id=client_id,
+        alert_key="combined_grey_stock_low",
+        entity_type="GreyStock",
+        status="Active",
+    ).first()
+
+    if not setting["is_enabled"] or not setting["is_configured"]:
+        if active_incident:
+            active_incident.status = "Resolved"
+            active_incident.resolved_at = timezone.now()
+            active_incident.save(update_fields=["status", "resolved_at", "updated_at"])
+        return {
+            "alert_triggered": False,
+            "incident": None,
+            "status": "Not Configured" if not setting["is_configured"] else "Disabled",
+            "stock": calc,
+            "setting": setting,
+        }
+
+    if available < threshold:
+        shortage = round4(threshold - available)
+        severity = "Critical" if available <= round4(threshold / Decimal("2")) else "Warning"
+        title = f"Combined Grey Stock Low: {available} Mtr (Min {threshold} Mtr)"
+        message = (
+            f"Combined available grey fabric stock ({available} Mtr) is below the configured "
+            f"minimum threshold of {threshold} Mtr across {calc['qualities_count']} fabric qualities. "
+            f"Shortage: {shortage} Mtr. "
+            f"(Physical Godown Grey: {calc['physical_grey_stock']} Mtr, Reserved: {calc['reserved_grey_stock']} Mtr, "
+            f"External WIP: {calc['external_wip']} Mtr)."
+        )
+        metadata = {
+            "current_stock": float(available),
+            "physical_stock": float(calc["physical_grey_stock"]),
+            "reserved_stock": float(calc["reserved_grey_stock"]),
+            "external_wip": float(calc["external_wip"]),
+            "threshold": float(threshold),
+            "shortage": float(shortage),
+            "uom": "Mtr",
+            "qualities_count": calc["qualities_count"],
+            "takas_count": calc["takas_count"],
+            "metric": "available_grey_stock",
+        }
+
+        incident = alert_services.trigger_incident(
+            client_id=client_id,
+            alert_key="combined_grey_stock_low",
+            severity=severity,
+            title=title,
+            message=message,
+            entity_type="GreyStock",
+            entity_id=str(client_id),
+            entity_number="GREY-STOCK",
+            metadata=metadata,
+        )
+        return {
+            "alert_triggered": True,
+            "incident": incident,
+            "status": "Critical" if severity == "Critical" else "Low Stock",
+            "shortage": shortage,
+            "stock": calc,
+            "setting": setting,
+        }
+    else:
+        # Stock recovered above threshold
+        if active_incident:
+            active_incident.status = "Resolved"
+            active_incident.resolved_at = timezone.now()
+            active_incident.save(update_fields=["status", "resolved_at", "updated_at"])
+        return {
+            "alert_triggered": False,
+            "incident": None,
+            "status": "Optimal",
+            "shortage": ZERO_QTY,
+            "stock": calc,
+            "setting": setting,
+        }
+
 

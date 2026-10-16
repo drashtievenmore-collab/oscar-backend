@@ -25,6 +25,9 @@ PROJECT_STATUSES = [
     ("At Risk", "At Risk"),
     ("Completed", "Completed"),
     ("On Hold", "On Hold"),
+    ("Dyeing", "Dyeing"),
+    ("Partial Received", "Partial Received"),
+    ("Partial", "Partial"),
 ]
 
 #: api.md §10.3 -- the full stage status vocabulary.
@@ -40,9 +43,10 @@ STAGE_STATUSES = [
     ("Need Improvement", "Need Improvement"),
     ("Completed", "Completed"),
     ("Blocked", "Blocked"),
+    ("Not Required", "Not Required"),
 ]
 #: Stages that count as closed for the project-completion gate.
-CLOSED_STAGE_STATUSES = ("Completed", "Approved")
+CLOSED_STAGE_STATUSES = ("Completed", "Approved", "Not Required")
 
 TASK_STATUSES = [
     ("Not Started", "Not Started"),
@@ -167,6 +171,16 @@ class Project(TenantModel, LegacyIdMixin):
     expected_completion_date = models.DateTimeField(null=True, blank=True)
     actual_completion_date = models.DateTimeField(null=True, blank=True)
     status = models.TextField(choices=PROJECT_STATUSES, default="Draft")
+    payment_status = models.TextField(choices=[("Pending", "Pending"), ("Paid", "Paid"), ("Overdue", "Overdue")], default="Pending")
+    requirement_meters = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    dyeing_sent_meters = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    customer_project_received_meters = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    customer_project_total_meters = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    customer_project_status = models.TextField(default="Pending", null=True, blank=True)
+    own_project_received_meters = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    own_project_total_meters = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    own_project_status = models.TextField(default="Pending", null=True, blank=True)
+    project_types = models.JSONField(default=list, blank=True)
 
     class Meta:
         db_table = "pms_projects"

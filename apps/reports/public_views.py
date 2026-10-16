@@ -164,10 +164,9 @@ class PublicQuotationDecisionView(PublicWriteView):
             else:
                 reason = (request.data.get("reason") or "").strip()
                 crm_services.advance_deal_for_quotation(
-                    quotation, "Lost",
+                    quotation, "Open",
                     description=(
-                        f"Deal lost: customer rejected quotation "
-                        f"{quotation.quotation_number}."
+                        f"Quotation {quotation.quotation_number} rejected by customer — moved to Open for negotiation."
                         + (f" Reason: {reason}" if reason else "")
                     ),
                 )
