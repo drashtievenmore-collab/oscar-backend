@@ -1,17 +1,17 @@
 """
 Project Stage Pipeline Services (Conditional Grey Stock Workflow).
 
-Enforces the 11-stage end-to-end textile lifecycle defined in:
+Enforces the 10-stage end-to-end textile lifecycle defined in:
 Oscar ERP - Grey Fabric Trading & Job Work Management Scope.
 
 Route Branches:
 - Branch A: Required grey fabric is available in Oscar inventory.
   Direct Job Work Outward to Vendor B (Dyeing/Processing).
-  Stages 3, 4, 5 (Vendor A Purchase & Weaving) are marked "Not Required".
+  Stage 2 (Procurement If Required) is marked "Not Required".
 - Branch B: Grey fabric is unavailable or in shortage.
-  Stages 3, 4, 5 activate for the shortage quantity (PO -> Daily Production -> Transfer to Oscar).
+  Stage 2 activates for the shortage quantity (PO -> Daily Production -> Transfer to Oscar).
 - Partial: In-stock quantity allocated; shortage quantity routed through Branch B.
-  Both converge cleanly at Stage 6 (Vendor B Processing).
+  Both converge cleanly at Stage 5 (Vendor B Processing).
 """
 from decimal import Decimal
 from django.db import transaction
@@ -22,96 +22,93 @@ from apps.core.money import round2, round4, D
 from apps.pms.models import Project, ProjectStage, Department, CLOSED_STAGE_STATUSES
 
 
-STAGE_DEFINITIONS = [
-    {
-        "sequence": 1,
-        "name": "Customer Requirement & Approval",
-        "department_name": "Sales",
-        "branch": "common",
-        "default_weight": Decimal("10.00"),
-        "icon": "ShoppingCart",
-    },
-    {
-        "sequence": 2,
-        "name": "Grey Stock Check & Allocation",
-        "department_name": "Inventory",
-        "branch": "common",
-        "default_weight": Decimal("10.00"),
-        "icon": "Boxes",
-    },
-    {
-        "sequence": 3,
-        "name": "Procurement (If Required)",
-        "department_name": "Purchase",
-        "branch": "branch_b",
-        "default_weight": Decimal("10.00"),
-        "icon": "ShoppingCart",
-    },
-    {
-        "sequence": 4,
-        "name": "Processing Plan & Vendor Assignment",
-        "department_name": "Job Work",
-        "branch": "common",
-        "default_weight": Decimal("10.00"),
-        "icon": "ClipboardList",
-    },
-    {
-        "sequence": 5,
-        "name": "Job Work Outward (Send to Vendor)",
-        "department_name": "Job Work",
-        "branch": "common",
-        "default_weight": Decimal("10.00"),
-        "icon": "Truck",
-    },
-    {
-        "sequence": 6,
-        "name": "Processing (Dyeing)",
-        "department_name": "Job Work",
-        "branch": "common",
-        "default_weight": Decimal("15.00"),
-        "icon": "Cog",
-    },
-    {
-        "sequence": 7,
-        "name": "Job Work Inward (Receive)",
-        "department_name": "Job Work",
-        "branch": "common",
-        "default_weight": Decimal("10.00"),
-        "icon": "ArrowDownToLine",
-    },
-    {
-        "sequence": 8,
-        "name": "Quality Check & Stock Allocation",
-        "department_name": "Quality Control",
-        "branch": "common",
-        "default_weight": Decimal("10.00"),
-        "icon": "ShieldCheck",
-    },
-    {
-        "sequence": 9,
-        "name": "Customer Dispatch",
-        "department_name": "Dispatch",
-        "branch": "common",
-        "default_weight": Decimal("10.00"),
-        "icon": "Boxes",
-    },
-    {
-        "sequence": 10,
-        "name": "Invoice & Payment Collection",
-        "department_name": "Accounts",
-        "branch": "common",
-        "default_weight": Decimal("10.00"),
-        "icon": "IndianRupee",
-    },
-    {
-        "sequence": 11,
-        "name": "Project Closure",
-        "department_name": "Management",
-        "branch": "common",
-        "default_weight": Decimal("5.00"),
-        "icon": "CheckCircle2",
-    },
+STAGE_1_DEF = {
+    "name": "Grey Stock Check & Allocation",
+    "department_name": "Inventory",
+    "branch": "common",
+    "default_weight": Decimal("10.00"),
+    "icon": "Boxes",
+}
+
+STAGE_2_PROCUREMENT_DEF = {
+    "name": "Procurement (If Required)",
+    "department_name": "Purchase",
+    "branch": "branch_b",
+    "default_weight": Decimal("10.00"),
+    "icon": "ShoppingCart",
+}
+
+PURCHASE_PO_STAGES = [
+    {"name": "Create Grey Purchase PO", "department_name": "Purchase", "branch": "branch_purchase", "default_weight": Decimal("5.00"), "icon": "FileText"},
+    {"name": "Supplier Delivery", "department_name": "Purchase", "branch": "branch_purchase", "default_weight": Decimal("5.00"), "icon": "Truck"},
+    {"name": "GRN / Inward", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("5.00"), "icon": "Boxes"},
+    {"name": "Lot & Taka Creation", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("5.00"), "icon": "Layers"},
+    {"name": "Grey QC", "department_name": "Quality Control", "branch": "branch_purchase", "default_weight": Decimal("5.00"), "icon": "ShieldCheck"},
+    {"name": "Grey Stock Updated", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("5.00"), "icon": "Building2"},
 ]
+
+VENDOR_PRODUCTION_STAGES = [
+    {"name": "Production Work Instruction", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "FileText"},
+    {"name": "Assign Vendor A + Employee", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "Users"},
+    {"name": "Daily Production Entry", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "ClipboardList"},
+    {"name": "Production Completion", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "CheckCircle2"},
+    {"name": "Final Quantity Verification", "department_name": "Quality Control", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "ShieldCheck"},
+    {"name": "Generate Final Job Work PO", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "FileText"},
+    {"name": "Production / Job Work PO", "department_name": "Accounts", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "FileText"},
+    {"name": "Agency Bill Match (PO + verified qty + invoice)", "department_name": "Accounts", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "FileSpreadsheet"},
+    {"name": "Approval / Hold / Payment", "department_name": "Accounts", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "IndianRupee"},
+]
+
+DOWNSTREAM_STAGES = [
+    {"name": "Processing Plan & Vendor Assignment", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("10.00"), "icon": "ClipboardList"},
+    {"name": "Job Work Outward (Send to Vendor)", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("10.00"), "icon": "Truck"},
+    {"name": "Processing (Dyeing)", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("10.00"), "icon": "Cog"},
+    {"name": "Job Work Inward (Receive)", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("10.00"), "icon": "ArrowDownToLine"},
+    {"name": "Quality Check & Stock Allocation", "department_name": "Quality Control", "branch": "common", "default_weight": Decimal("10.00"), "icon": "ShieldCheck"},
+    {"name": "Customer Dispatch", "department_name": "Dispatch", "branch": "common", "default_weight": Decimal("10.00"), "icon": "Boxes"},
+    {"name": "Invoice & Payment Collection", "department_name": "Accounts", "branch": "common", "default_weight": Decimal("10.00"), "icon": "IndianRupee"},
+    {"name": "Project Closure", "department_name": "Management", "branch": "common", "default_weight": Decimal("10.00"), "icon": "CheckCircle2"},
+]
+
+def get_project_cfv(project):
+    if not project:
+        return {}
+    val = getattr(project, "custom_field_values", None)
+    if isinstance(val, dict):
+        return val
+    spec = getattr(project, "specifications", None) or ""
+    if isinstance(spec, str) and spec.strip().startswith("{") and spec.strip().endswith("}"):
+        try:
+            import json
+            return json.loads(spec)
+        except Exception:
+            return {}
+    return {}
+
+def get_project_stage_definitions(project=None, stock_eval=None):
+    cfv = get_project_cfv(project)
+    shortage_action = cfv.get("shortage_action")
+    shortage_meters = stock_eval.get("shortage_meters", Decimal("0")) if stock_eval else Decimal("0")
+    route_branch = stock_eval.get("route_branch") if stock_eval else "BRANCH_A"
+
+    if (shortage_meters <= Decimal("0") and shortage_action is None) or route_branch == "BRANCH_A":
+        raw_list = [STAGE_1_DEF] + DOWNSTREAM_STAGES
+    elif shortage_action == "PURCHASE_PO":
+        raw_list = [STAGE_1_DEF] + PURCHASE_PO_STAGES + DOWNSTREAM_STAGES
+    elif shortage_action == "PRODUCTION_ORDER":
+        raw_list = [STAGE_1_DEF] + VENDOR_PRODUCTION_STAGES + DOWNSTREAM_STAGES
+    else:
+        raw_list = [STAGE_1_DEF, STAGE_2_PROCUREMENT_DEF] + DOWNSTREAM_STAGES
+
+    stages = []
+    for idx, item in enumerate(raw_list):
+        stages.append({
+            **item,
+            "sequence": idx + 1,
+        })
+    return stages
+
+STAGE_DEFINITIONS = get_project_stage_definitions()
 
 
 def evaluate_stock_and_route(project):
@@ -132,18 +129,20 @@ def evaluate_stock_and_route(project):
 
     order = project.sales_order
     if req_qty == Decimal("0") and order:
-        line_sum = order.lines.aggregate(s=Sum("ordered_quantity"))["s"] or 0
-        req_qty = Decimal(str(line_sum))
+        line_items = getattr(order, "line_items", None)
+        if line_items:
+            line_sum = line_items.aggregate(s=Sum("qty"))["s"] or 0
+            req_qty = Decimal(str(line_sum))
 
     if req_qty == Decimal("0"):
         req_qty = Decimal("0.00")
 
-    # Check actual eligible stock in Oscar Inventory
     from apps.inventory.services import calculate_combined_grey_stock, calculate_item_stock
 
     item = None
     if order:
-        first_line = order.lines.first()
+        line_items = getattr(order, "line_items", None)
+        first_line = line_items.first() if line_items else None
         if first_line and first_line.item:
             item = first_line.item
 
@@ -157,6 +156,29 @@ def evaluate_stock_and_route(project):
             available_stock = max(Decimal("0"), Decimal(str(combined.get("available_grey_stock", 0))))
         except Exception:
             available_stock = Decimal("0")
+
+    cfv = get_project_cfv(project)
+    if "grey_stock_allocated_meters" in cfv:
+        allocated = Decimal(str(cfv.get("grey_stock_allocated_meters") or 0))
+        shortage = max(Decimal("0"), req_qty - allocated)
+        if shortage <= Decimal("0"):
+            branch = "BRANCH_A"
+            label = "Branch A (100% Grey Stock Available in Warehouse)"
+        elif allocated > Decimal("0"):
+            branch = "PARTIAL"
+            label = f"Partial Availability ({allocated} M Available, {shortage} M Shortage)"
+        else:
+            branch = "BRANCH_B"
+            label = "Branch B (Stock Unavailable — Procurement Required)"
+        return {
+            "required_meters": round2(req_qty),
+            "available_meters": round2(available_stock),
+            "allocated_meters": round2(allocated),
+            "shortage_meters": round2(shortage),
+            "route_branch": branch,
+            "route_label": label,
+            "shortage_action": cfv.get("shortage_action"),
+        }
 
     if req_qty == Decimal("0"):
         branch = "BRANCH_A"
@@ -186,15 +208,12 @@ def evaluate_stock_and_route(project):
         "shortage_meters": round2(shortage),
         "route_branch": branch,
         "route_label": label,
+        "shortage_action": cfv.get("shortage_action"),
     }
 
 
 @transaction.atomic
 def sync_project_pipeline_stages(project):
-    """
-    Ensures the project has all 11 stages populated and synced with real
-    business documents and conditional grey stock branch status.
-    """
     stock_eval = evaluate_stock_and_route(project)
     branch = stock_eval["route_branch"]
     req_qty = stock_eval["required_meters"]
@@ -203,29 +222,35 @@ def sync_project_pipeline_stages(project):
 
     client_id = project.client_id
     order = project.sales_order
+    cfv = get_project_cfv(project)
 
-    # Remove any obsolete/extra stages (e.g., dyeing, vbvb, or non-standard sequences)
+    stage_defs = get_project_stage_definitions(project, stock_eval)
+    allowed_names = [s["name"] for s in stage_defs]
+
     ProjectStage.objects.filter(project=project).filter(
-        Q(name__iexact="dyeing") | Q(name__iexact="vbvb") | ~Q(sequence__in=[s["sequence"] for s in STAGE_DEFINITIONS])
+        Q(name__iexact="dyeing")
+        | Q(name__iexact="vbvb")
+        | Q(name__icontains="customer requirement")
+        | ~Q(name__in=allowed_names)
     ).delete()
 
-    # Query operational documents
+    for st in ProjectStage.objects.filter(project=project):
+        st.sequence = st.sequence + 1000
+        st.save(update_fields=["sequence"])
+
     from apps.purchase.models import PurchaseOrder
     from apps.jobwork.models import JobWorkOrder, ProcessPlan
     from apps.inventory.models import QCInspection
     from apps.sales.models import DeliveryChallan, SalesInvoice
 
-    # Purchase PO
     po = PurchaseOrder.objects.filter(client_id=client_id).filter(
         Q(reference_number=project.code) | Q(reference_number=getattr(order, "order_number", ""))
     ).first()
 
-    # Process Plan
     plan = ProcessPlan.objects.filter(client_id=client_id).filter(
         Q(remarks__icontains=project.code) | Q(plan_no__icontains=project.code)
     ).first()
 
-    # Job Work Order
     jwo = JobWorkOrder.objects.filter(client_id=client_id).filter(
         Q(remarks__icontains=project.code) | Q(jwo_no__icontains=project.code)
     ).first()
@@ -243,43 +268,47 @@ def sync_project_pipeline_stages(project):
         if inwards and inwards.exists():
             jwo_received = sum((Decimal(str(i.meter or 0)) for i in inwards.all()), Decimal("0"))
 
-    # QC Inspection
     qc = QCInspection.objects.filter(client_id=client_id).first()
 
-    # Customer Dispatch Challan
     dispatched_qty = Decimal("0")
     dc_doc = None
     if order:
         challans = DeliveryChallan.objects.filter(sales_order=order, status__in=["Dispatched", "Delivered"])
         for ch in challans:
-            line_sum = ch.lines.aggregate(s=Sum("dispatched_quantity"))["s"] or 0
-            dispatched_qty += Decimal(str(line_sum))
+            line_items = getattr(ch, "line_items", None)
+            if line_items:
+                line_sum = line_items.aggregate(s=Sum("qty"))["s"] or 0
+                dispatched_qty += Decimal(str(line_sum))
         dc_doc = challans.first()
 
-    # Sales Invoices
     invoiced_amount = Decimal("0")
     paid_amount = Decimal("0")
     inv_doc = None
     if order:
         invoices = SalesInvoice.objects.filter(sales_order=order)
         for inv in invoices:
-            invoiced_amount += Decimal(str(inv.total_amount or 0))
-            paid_amount += Decimal(str(inv.amount_paid or 0))
+            invoiced_amount += Decimal(str(getattr(inv, "total", 0) or 0))
+            paid_amount += Decimal(str(getattr(inv, "amount_paid", 0) or 0))
         inv_doc = invoices.first()
 
     departments_by_name = {d.name: d for d in Department.objects.filter(client_id=client_id)}
 
-    # Build stage state list
     stages_data = []
 
-    for defn in STAGE_DEFINITIONS:
+    for defn in stage_defs:
         seq = defn["sequence"]
         name = defn["name"]
         dept = departments_by_name.get(defn["department_name"])
+        if not dept and defn.get("department_name"):
+            dept, _ = Department.objects.get_or_create(
+                client_id=client_id,
+                name=defn["department_name"],
+            )
+            departments_by_name[defn["department_name"]] = dept
+
         stage_branch = defn["branch"]
         weight = defn["default_weight"]
 
-        # Default values
         status = "Pending"
         pct = 0
         quantities = {
@@ -292,36 +321,9 @@ def sync_project_pipeline_stages(project):
             "dispatched": None,
         }
         document = None
+        remarks = ""
 
-        # -------------------------------------------------------------
-        # Stage 1: Customer Requirement & Approval
-        # -------------------------------------------------------------
-        if seq == 1:
-            if order and order.stage in ("Confirmed", "Approved", "In Production", "Closed", "Completed"):
-                status = "Completed"
-                pct = 100
-            elif order and order.stage != "Draft":
-                status = "Completed"
-                pct = 100
-            elif order:
-                status = "In Progress"
-                pct = 50
-            elif project.status in ("In Progress", "Completed"):
-                status = "Completed"
-                pct = 100
-            quantities["accepted"] = float(req_qty)
-            if order:
-                document = {
-                    "type": "SalesOrder",
-                    "number": order.order_number or str(order.id),
-                    "url": f"/sales/orders?id={order.id}",
-                    "label": f"SO: {order.order_number}",
-                }
-
-        # -------------------------------------------------------------
-        # Stage 2: Grey Stock Check & Allocation
-        # -------------------------------------------------------------
-        elif seq == 2:
+        if name == "Grey Stock Check & Allocation":
             quantities["reserved"] = float(allocated_qty)
             if allocated_qty > Decimal("0") or stock_eval["available_meters"] > Decimal("0"):
                 status = "Completed"
@@ -338,24 +340,99 @@ def sync_project_pipeline_stages(project):
             else:
                 status = "Pending"
                 pct = 0
+            if allocated_qty > Decimal("0"):
+                remarks = f"{int(allocated_qty):,} m allocated"
+            else:
+                remarks = "Stock check pending"
 
-        # -------------------------------------------------------------
-        # Stage 3: Procurement (If Required)
-        # -------------------------------------------------------------
-        elif seq == 3:
+        elif name == "Create Grey Purchase PO":
+            quantities["input"] = float(shortage_qty)
+            po_data = cfv.get("grey_stock_po")
+            if po and po.status in ("Received", "Fully Received", "Closed"):
+                status = "Completed"
+                pct = 100
+                remarks = f"Received PO {po.po_number}"
+                document = {
+                    "type": "PurchaseOrder",
+                    "number": po.po_number or str(po.id),
+                    "url": f"/purchase/orders?id={po.id}",
+                    "label": f"PO: {po.po_number}",
+                }
+            elif po_data or po:
+                status = "In Progress"
+                pct = 50
+                po_num = (po_data and po_data.get("orderNumber")) or (po and po.po_number) or "PO-2026-0881"
+                remarks = f"PO {po_num} drafted"
+                document = {
+                    "type": "PurchaseOrder",
+                    "number": po_num,
+                    "url": "/purchase/orders",
+                    "label": f"PO: {po_num}",
+                }
+            else:
+                status = "Pending"
+                pct = 0
+                remarks = "PO pending"
+
+        elif name in ("Supplier Delivery", "GRN / Inward", "Lot & Taka Creation", "Grey QC", "Grey Stock Updated"):
+            status = "Pending"
+            pct = 0
+            remarks = f"{name} pending"
+
+        elif name == "Production Work Instruction":
+            quantities["input"] = float(shortage_qty)
+            prod_data = cfv.get("grey_stock_production_order")
+            if prod_data:
+                status = "In Progress"
+                pct = 50
+                order_num = prod_data.get("orderNumber", "PROD-2026-0412")
+                remarks = f"Order {order_num} issued"
+                document = {
+                    "type": "ProductionOrder",
+                    "number": order_num,
+                    "url": "/production/orders",
+                    "label": f"Order: {order_num}",
+                }
+            else:
+                status = "Pending"
+                pct = 0
+                remarks = "Instruction pending"
+
+        elif name in (
+            "Assign Vendor A + Employee",
+            "Daily Production Entry",
+            "Production Completion",
+            "Final Quantity Verification",
+            "Generate Final Job Work PO",
+            "Production / Job Work PO",
+            "Agency Bill Match (PO + verified qty + invoice)",
+            "Approval / Hold / Payment",
+        ):
+            status = "Pending"
+            pct = 0
+            remarks = f"{name} pending"
+
+        elif name == "Procurement (If Required)":
             if branch == "BRANCH_A":
                 status = "Not Required"
                 pct = 100
                 weight = Decimal("0.00")
+                remarks = "Stock available"
             else:
                 quantities["input"] = float(shortage_qty)
                 if po and po.status in ("Received", "Fully Received", "Closed"):
                     status = "Completed"
                     pct = 100
                     quantities["good"] = float(shortage_qty)
+                    remarks = f"Received PO {po.po_number}"
                 elif po:
                     status = "In Progress"
                     pct = 50
+                    remarks = f"PO {po.po_number} in progress"
+                else:
+                    status = "Pending"
+                    pct = 0
+                    remarks = "Procurement required"
                 if po:
                     document = {
                         "type": "PurchaseOrder",
@@ -364,10 +441,7 @@ def sync_project_pipeline_stages(project):
                         "label": f"PO: {po.po_number}",
                     }
 
-        # -------------------------------------------------------------
-        # Stage 4: Processing Plan & Vendor Assignment
-        # -------------------------------------------------------------
-        elif seq == 4:
+        elif name == "Processing Plan & Vendor Assignment":
             quantities["input"] = float(req_qty)
             if plan or jwo:
                 status = "Completed"
@@ -386,11 +460,16 @@ def sync_project_pipeline_stages(project):
             else:
                 status = "Pending"
                 pct = 0
+            if jwo and getattr(jwo, "vendor_name", None):
+                remarks = f"{jwo.vendor_name} assigned"
+            elif plan and getattr(plan, "vendor_name", None):
+                remarks = f"{plan.vendor_name} assigned"
+            elif plan or jwo:
+                remarks = "Vendor B assigned"
+            else:
+                remarks = "Processing plan pending"
 
-        # -------------------------------------------------------------
-        # Stage 5: Job Work Outward (Send to Vendor)
-        # -------------------------------------------------------------
-        elif seq == 5:
+        elif name == "Job Work Outward (Send to Vendor)":
             quantities["input"] = float(req_qty)
             quantities["produced"] = float(jwo_sent)
             if jwo_sent >= req_qty and req_qty > Decimal("0"):
@@ -416,11 +495,14 @@ def sync_project_pipeline_stages(project):
                     "url": f"/job-work/orders?id={jwo.id}",
                     "label": f"JWO: {jwo.jwo_no}",
                 }
+            if outward_challan and getattr(outward_challan, "challan_no", None):
+                remarks = f"Challan {outward_challan.challan_no}"
+            elif jwo and getattr(jwo, "jwo_no", None):
+                remarks = f"JWO {jwo.jwo_no}"
+            else:
+                remarks = "Outward pending"
 
-        # -------------------------------------------------------------
-        # Stage 6: Processing (Dyeing)
-        # -------------------------------------------------------------
-        elif seq == 6:
+        elif name == "Processing (Dyeing)":
             quantities["input"] = float(jwo_sent)
             quantities["produced"] = float(jwo_received)
             if jwo_received >= jwo_sent and jwo_sent > Decimal("0"):
@@ -435,11 +517,15 @@ def sync_project_pipeline_stages(project):
             else:
                 status = "Pending"
                 pct = 0
+            vendor = (jwo and getattr(jwo, "vendor_name", None)) or "Vendor B"
+            if jwo_received >= jwo_sent and jwo_sent > Decimal("0"):
+                remarks = f"Dyeing completed at {vendor}"
+            elif jwo_sent > Decimal("0"):
+                remarks = f"Dyeing in process at {vendor}"
+            else:
+                remarks = "Processing pending"
 
-        # -------------------------------------------------------------
-        # Stage 7: Job Work Inward (Receive)
-        # -------------------------------------------------------------
-        elif seq == 7:
+        elif name == "Job Work Inward (Receive)":
             quantities["input"] = float(jwo_sent or req_qty)
             quantities["good"] = float(jwo_received)
             if jwo_received >= req_qty and req_qty > Decimal("0"):
@@ -451,11 +537,14 @@ def sync_project_pipeline_stages(project):
             else:
                 status = "Pending"
                 pct = 0
+            if jwo_received >= req_qty and req_qty > Decimal("0"):
+                remarks = f"Received full {int(jwo_received):,} m"
+            elif jwo_received > Decimal("0"):
+                remarks = f"Received {int(jwo_received):,} m"
+            else:
+                remarks = "Inward pending"
 
-        # -------------------------------------------------------------
-        # Stage 8: Quality Check & Stock Allocation
-        # -------------------------------------------------------------
-        elif seq == 8:
+        elif name == "Quality Check & Stock Allocation":
             if qc and qc.status in ("Approved", "Completed", "Passed"):
                 status = "Completed"
                 pct = 100
@@ -477,11 +566,14 @@ def sync_project_pipeline_stages(project):
                     "url": f"/inventory/qc/register?id={qc.id}",
                     "label": f"QC: {qc.inspection_number}",
                 }
+            if qc and qc.status in ("Approved", "Completed", "Passed"):
+                remarks = f"QC Passed {int(qc.passed_qty or jwo_received):,} m"
+            elif qc:
+                remarks = "QC inspection in progress"
+            else:
+                remarks = "QC pending"
 
-        # -------------------------------------------------------------
-        # Stage 9: Customer Dispatch
-        # -------------------------------------------------------------
-        elif seq == 9:
+        elif name == "Customer Dispatch":
             quantities["dispatched"] = float(dispatched_qty)
             if dispatched_qty >= req_qty and req_qty > Decimal("0"):
                 status = "Completed"
@@ -499,11 +591,14 @@ def sync_project_pipeline_stages(project):
                     "url": f"/sales/delivery-challans?id={dc_doc.id}",
                     "label": f"DC: {dc_doc.challan_number}",
                 }
+            if dispatched_qty >= req_qty and req_qty > Decimal("0"):
+                remarks = f"Dispatched {int(dispatched_qty):,} m"
+            elif dispatched_qty > Decimal("0"):
+                remarks = f"Dispatched {int(dispatched_qty):,} m"
+            else:
+                remarks = "Dispatch pending"
 
-        # -------------------------------------------------------------
-        # Stage 10: Invoice & Payment Collection
-        # -------------------------------------------------------------
-        elif seq == 10:
+        elif name == "Invoice & Payment Collection":
             quantities["invoicedAmount"] = float(invoiced_amount)
             quantities["paidAmount"] = float(paid_amount)
             if paid_amount >= invoiced_amount and invoiced_amount > Decimal("0"):
@@ -522,11 +617,14 @@ def sync_project_pipeline_stages(project):
                     "url": f"/sales/invoices?id={inv_doc.id}",
                     "label": f"Inv: {inv_doc.invoice_number}",
                 }
+            if paid_amount >= invoiced_amount and invoiced_amount > Decimal("0"):
+                remarks = "Payment received"
+            elif invoiced_amount > Decimal("0"):
+                remarks = f"Invoiced ₹{int(invoiced_amount):,}"
+            else:
+                remarks = "Invoice pending"
 
-        # -------------------------------------------------------------
-        # Stage 11: Project Closure
-        # -------------------------------------------------------------
-        elif seq == 11:
+        elif name == "Project Closure":
             if project.status == "Completed":
                 status = "Completed"
                 pct = 100
@@ -539,122 +637,41 @@ def sync_project_pipeline_stages(project):
             else:
                 status = "Pending"
                 pct = 0
-
-        # Operational remarks
-        remarks = ""
-        if seq == 1:
-            if order and order.stage in ("Confirmed", "Approved", "In Production", "Closed", "Completed"):
-                remarks = "Quotation approved"
-            elif order and order.stage != "Draft":
-                remarks = "Order confirmed"
-            elif order:
-                remarks = "Quotation under review"
-            else:
-                remarks = "Requirement submitted"
-        elif seq == 2:
-            if allocated_qty > Decimal("0"):
-                remarks = f"{int(allocated_qty):,} m allocated"
-            else:
-                remarks = "Stock check pending"
-        elif seq == 3:
-            if branch == "BRANCH_A":
-                remarks = "Stock available"
-            elif po and po.status in ("Received", "Fully Received", "Closed"):
-                remarks = f"Received PO {po.po_number}"
-            elif po:
-                remarks = f"PO {po.po_number} in progress"
-            else:
-                remarks = "Procurement required"
-        elif seq == 4:
-            if jwo and getattr(jwo, "vendor_name", None):
-                remarks = f"{jwo.vendor_name} assigned"
-            elif plan and getattr(plan, "vendor_name", None):
-                remarks = f"{plan.vendor_name} assigned"
-            elif plan or jwo:
-                remarks = "Vendor B assigned"
-            else:
-                remarks = "Processing plan pending"
-        elif seq == 5:
-            if outward_challan and getattr(outward_challan, "challan_no", None):
-                remarks = f"Challan {outward_challan.challan_no}"
-            elif jwo and getattr(jwo, "jwo_no", None):
-                remarks = f"JWO {jwo.jwo_no}"
-            else:
-                remarks = "Outward pending"
-        elif seq == 6:
-            vendor = (jwo and getattr(jwo, "vendor_name", None)) or "Vendor B"
-            if jwo_received >= jwo_sent and jwo_sent > Decimal("0"):
-                remarks = f"Dyeing completed at {vendor}"
-            elif jwo_sent > Decimal("0"):
-                remarks = f"Dyeing in process at {vendor}"
-            else:
-                remarks = "Processing pending"
-        elif seq == 7:
-            if jwo_received >= req_qty and req_qty > Decimal("0"):
-                remarks = f"Received full {int(jwo_received):,} m"
-            elif jwo_received > Decimal("0"):
-                remarks = f"Received {int(jwo_received):,} m"
-            else:
-                remarks = "Inward pending"
-        elif seq == 8:
-            if qc and qc.status in ("Approved", "Completed", "Passed"):
-                remarks = f"QC Passed {int(qc.passed_qty or jwo_received):,} m"
-            elif qc:
-                remarks = "QC inspection in progress"
-            else:
-                remarks = "QC pending"
-        elif seq == 9:
-            if dispatched_qty >= req_qty and req_qty > Decimal("0"):
-                remarks = f"Dispatched {int(dispatched_qty):,} m"
-            elif dispatched_qty > Decimal("0"):
-                remarks = f"Dispatched {int(dispatched_qty):,} m"
-            else:
-                remarks = "Dispatch pending"
-        elif seq == 10:
-            if paid_amount >= invoiced_amount and invoiced_amount > Decimal("0"):
-                remarks = "Payment received"
-            elif invoiced_amount > Decimal("0"):
-                remarks = f"Invoiced ₹{int(invoiced_amount):,}"
-            else:
-                remarks = "Invoice pending"
-        elif seq == 11:
             if project.status == "Completed":
                 remarks = "Project closed"
             else:
                 remarks = "Closure pending"
 
-        # Sync or Create ProjectStage in database
         stage_start = project.start_date if status != "Pending" else None
         stage_expected = project.expected_completion_date if status != "Pending" else None
 
-        stage_obj, _ = ProjectStage.objects.get_or_create(
-            project=project,
-            sequence=seq,
-            defaults={
-                "client_id": client_id,
-                "name": name,
-                "department": dept,
-                "weight_pct": weight,
-                "status": status,
-                "completion_pct": pct,
-                "start_datetime": stage_start,
-                "expected_completion_datetime": stage_expected,
-            },
-        )
-
-        stage_obj.name = name
-        stage_obj.weight_pct = weight
-        stage_obj.status = status
-        stage_obj.completion_pct = pct
-        if dept:
-            stage_obj.department = dept
-        if status == "Pending" and not stage_obj.actual_start_datetime:
-            stage_obj.start_datetime = None
-            stage_obj.expected_completion_datetime = None
-        elif not stage_obj.start_datetime and status != "Pending":
-            stage_obj.start_datetime = stage_start
-
-        stage_obj.save(update_fields=["name", "weight_pct", "status", "completion_pct", "department", "start_datetime", "expected_completion_datetime", "updated_at"])
+        stage_obj = ProjectStage.objects.filter(project=project, name=name).first()
+        if not stage_obj:
+            stage_obj = ProjectStage.objects.create(
+                project=project,
+                sequence=seq,
+                client_id=client_id,
+                name=name,
+                department=dept,
+                weight_pct=weight,
+                status=status,
+                completion_pct=pct,
+                start_datetime=stage_start,
+                expected_completion_datetime=stage_expected,
+            )
+        else:
+            stage_obj.sequence = seq
+            stage_obj.weight_pct = weight
+            stage_obj.status = status
+            stage_obj.completion_pct = pct
+            if dept:
+                stage_obj.department = dept
+            if status == "Pending" and not stage_obj.actual_start_datetime:
+                stage_obj.start_datetime = None
+                stage_obj.expected_completion_datetime = None
+            elif not stage_obj.start_datetime and status != "Pending":
+                stage_obj.start_datetime = stage_start
+            stage_obj.save(update_fields=["sequence", "name", "weight_pct", "status", "completion_pct", "department", "start_datetime", "expected_completion_datetime", "updated_at"])
 
         stages_data.append({
             "id": str(stage_obj.id),
@@ -674,7 +691,8 @@ def sync_project_pipeline_stages(project):
             "actualCompletionDateTime": stage_obj.actual_completion_datetime.isoformat() if stage_obj.actual_completion_datetime else None,
         })
 
-    # Recalculate project overall completion
+    ProjectStage.objects.filter(project=project, sequence__gte=1000).delete()
+
     active_stages = [s for s in stages_data if s["status"] != "Not Required"]
     total_active_weight = sum(s["weightPct"] for s in active_stages) or 100
     weighted_progress = sum(s["completionPct"] * s["weightPct"] for s in active_stages)

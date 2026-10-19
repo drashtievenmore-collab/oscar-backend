@@ -326,7 +326,10 @@ class ProjectStageSerializer(BaseModelSerializer):
         return services.is_stage_at_risk(stage, threshold)
 
     def get_branch(self, stage):
-        if stage.sequence in (3, 4, 5):
+        meta_dict = (self.context.get("pipeline_stages_map") or {}).get(stage.sequence, {})
+        if "branch" in meta_dict:
+            return meta_dict["branch"]
+        if stage.sequence == 2 or "procurement" in (stage.name or "").lower():
             return "branch_b"
         return "common"
 
@@ -448,11 +451,21 @@ class ProjectDetailSerializer(ProjectListSerializer):
     activityLog = serializers.SerializerMethodField()
     pipelineSummary = serializers.SerializerMethodField()
     customerReturns = serializers.SerializerMethodField()
+    custom_field_values = serializers.SerializerMethodField()
+    shortageAction = serializers.SerializerMethodField()
 
     class Meta(ProjectListSerializer.Meta):
         fields = ProjectListSerializer.Meta.fields + [
-            "stages", "activityLog", "pipelineSummary", "customerReturns"
+            "stages", "activityLog", "pipelineSummary", "customerReturns", "custom_field_values", "shortageAction"
         ]
+
+    def get_custom_field_values(self, project):
+        from .pipeline_services import get_project_cfv
+        return get_project_cfv(project)
+
+    def get_shortageAction(self, project):
+        from .pipeline_services import get_project_cfv
+        return get_project_cfv(project).get("shortage_action")
 
     def get_customerReturns(self, project):
         try:
