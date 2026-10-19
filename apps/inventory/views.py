@@ -4596,6 +4596,43 @@ class LotTakaRegisterView(APIView):
         if item_filter:
             qs = qs.filter(item_id=item_filter)
 
+        grn_filter = (
+            request.query_params.get("grn")
+            or request.query_params.get("grn_no")
+            or request.query_params.get("grn_number")
+            or request.query_params.get("grnNumber")
+        )
+        if grn_filter and grn_filter != "All":
+            grn_q = Q(source_document_number__iexact=grn_filter) | Q(source_document_number__icontains=grn_filter)
+            try:
+                import uuid
+                grn_uuid = uuid.UUID(str(grn_filter))
+                grn_q |= Q(source_document_id=grn_uuid)
+            except Exception:
+                pass
+            qs = qs.filter(grn_q)
+
+        po_filter = (
+            request.query_params.get("po")
+            or request.query_params.get("po_id")
+            or request.query_params.get("po_number")
+            or request.query_params.get("poNumber")
+            or request.query_params.get("purchaseOrderId")
+        )
+        if po_filter and po_filter != "All":
+            from apps.purchase.models import GoodsReceipt
+            po_q = Q(purchase_order_id=po_filter) | Q(purchase_order__po_number__iexact=po_filter)
+            try:
+                import uuid
+                po_uuid = uuid.UUID(str(po_filter))
+                po_q |= Q(purchase_order_id=po_uuid)
+            except Exception:
+                pass
+            linked_grns = list(GoodsReceipt.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(po_q).values_list("id", "grn_number"))
+            grn_ids = [g[0] for g in linked_grns]
+            grn_nums = [g[1] for g in linked_grns if g[1]]
+            qs = qs.filter(Q(source_document_id__in=grn_ids) | Q(source_document_number__in=grn_nums))
+
         if search_query:
             qs = qs.filter(
                 Q(lot_number__icontains=search_query)
@@ -4711,6 +4748,7 @@ class LotTakaRegisterView(APIView):
                 "imageUrl": lt.image_url or "",
                 "sourceDoc": lt.source_document_type,
                 "grnNo": lt.source_document_number or "-",
+                "sourceDocumentId": str(lt.source_document_id) if lt.source_document_id else None,
                 "stockMovements": mov_list,
             })
 
@@ -4811,8 +4849,186 @@ class LotTakaRegisterView(APIView):
         field_errors = {}
 
         item = Item.objects.filter(client_id=client_id, id=data.get("itemId"), deleted_at__isnull=True).first() if data.get("itemId") else None
-        if item is None:
-            field_errors["itemId"] = ["Choose the fabric item."]
+
+        takas_list = data.get("takas")
+        if takas_list and isinstance(takas_list, list) and len(takas_list) > 0:
+            if item is None:
+                field_errors["itemId"] = ["Choose the fabric item."]
+            qc_status = data.get("qcStatus") or "Pending"
+            if qc_status not in ("Passed", "Pending"):
+                qc_status = "Pending"
+            try:
+                rec_date = date.fromisoformat(str(data.get("receivedDate") or ""))
+            except ValueError:
+                rec_date = date.today()
+
+            grn_id = data.get("grnId") or data.get("sourceDocumentId")
+            grn = None
+            if grn_id:
+                from apps.purchase.models import GoodsReceipt
+                grn = GoodsReceipt.objects.filter(client_id=client_id, id=grn_id, deleted_at__isnull=True).first()
+            if not grn and data.get("grnNo"):
+                from apps.purchase.models import GoodsReceipt
+                grn = GoodsReceipt.objects.filter(client_id=client_id, grn_number__iexact=data.get("grnNo"), deleted_at__isnull=True).first()
+
+            total_taka_meters = ZERO
+            for idx, t in enumerate(takas_list):
+                t_qty = round4(D(str(t.get("receivedQty") or t.get("qty") or 0)))
+                if t_qty <= ZERO:
+                    field_errors[f"takas_{idx}"] = [f"Taka #{t.get('takaRoll') or idx+1} quantity must be greater than 0."]
+                total_taka_meters += t_qty
+
+            if grn:
+                grn_total_qty = sum(D(str(l.received_qty or 0)) for l in grn.lines.all())
+                existing_grn_takas = list(LotTaka.objects.filter(client_id=client_id, source_document_id=grn.id, deleted_at__isnull=True))
+                is_single_placeholder = False
+                if len(existing_grn_takas) == 1:
+                    ph = existing_grn_takas[0]
+                    if abs(D(str(ph.received_quantity)) - grn_total_qty) < Decimal("0.001"):
+                        is_single_placeholder = True
+
+                already_allocated = ZERO if is_single_placeholder else sum(D(str(t.received_quantity or 0)) for t in existing_grn_takas)
+                available_for_split = max(ZERO, grn_total_qty - already_allocated)
+
+                if total_taka_meters > available_for_split:
+                    field_errors["takas"] = [
+                        f"Total taka quantity ({total_taka_meters} m) cannot exceed the received quantity available from GRN ({available_for_split} m)."
+                    ]
+
+            if field_errors:
+                raise ValidationFailed("Validation failed for lot/taka creation.", field_errors=field_errors)
+
+            client = request.user.client
+            lot_no = (data.get("lotNo") or "").strip() or allocate_number(client, "LOT", rec_date)
+
+            existing_taka_rolls = set(
+                LotTaka.objects.filter(client_id=client_id, lot_number=lot_no, deleted_at__isnull=True).values_list("taka_number", flat=True)
+            )
+
+            if grn:
+                placeholder_takas = LotTaka.objects.filter(client_id=client_id, source_document_id=grn.id, deleted_at__isnull=True)
+                if placeholder_takas.count() == 1:
+                    ph = placeholder_takas.first()
+                    if abs(D(str(ph.received_quantity)) - grn_total_qty) < Decimal("0.001"):
+                        if ph.stock_movement:
+                            bal = StockBalance.objects.filter(
+                                client_id=client_id,
+                                item_id=ph.stock_movement.item_id,
+                                location_id=ph.stock_movement.location_id,
+                            ).first()
+                            if bal:
+                                bal.on_hand = max(ZERO, (bal.on_hand or ZERO) - ph.stock_movement.effective_quantity)
+                                bal.save(update_fields=["on_hand", "updated_at"])
+                            ph.stock_movement.delete()
+                        ph.delete()
+                        existing_taka_rolls.discard(ph.taka_number)
+
+            supplier = None
+            if data.get("supplierId"):
+                supplier = Party.objects.filter(client_id=client_id, id=data.get("supplierId")).first()
+            elif data.get("supplier"):
+                supplier = Party.objects.filter(client_id=client_id, name=data.get("supplier")).first()
+            elif grn and grn.party:
+                supplier = grn.party
+
+            def dec_or_none_val(value):
+                return D(str(value)) if value not in (None, "") else None
+
+            rate = dec_or_none_val(data.get("rate")) or (grn.lines.first().unit_cost if grn and grn.lines.exists() else ZERO)
+            target_location = stock.system_location(client_id, "QC_HOLD") if qc_status == "Pending" else (Location.objects.filter(client_id=client_id, id=data.get("locationId"), deleted_at__isnull=True).first() or Location.objects.filter(client_id=client_id, is_active=True).first())
+
+            created_takas = []
+            for t_idx, t in enumerate(takas_list):
+                t_roll = str(t.get("takaRoll") or t.get("takaNumber") or (t_idx + 1)).strip()
+                if t_roll in existing_taka_rolls:
+                    raise ValidationFailed(
+                        f"Taka roll '{t_roll}' already exists for Lot '{lot_no}'. Duplicate roll numbers are not permitted.",
+                        field_errors={"takaRoll": [f"Roll #{t_roll} already exists."]}
+                    )
+                existing_taka_rolls.add(t_roll)
+
+                taka_qty = round4(D(str(t.get("receivedQty") or t.get("qty") or 0)))
+                taka_code = allocate_number(client, "TAK")
+                roll_weight = dec_or_none_val(t.get("rollWeight") or t.get("weight"))
+                t_width = dec_or_none_val(t.get("width") or data.get("width"))
+                t_gsm = dec_or_none_val(t.get("gsm") or data.get("gsm"))
+                t_remarks = t.get("remarks") or data.get("remarks") or None
+
+                lot_taka = LotTaka.objects.create(
+                    client_id=client_id,
+                    taka_id=taka_code,
+                    lot_number=lot_no,
+                    taka_number=t_roll,
+                    item=item,
+                    supplier=supplier,
+                    source_document_type="GRN" if grn else (data.get("sourceDoc") or "Manual"),
+                    source_document_number=grn.grn_number if grn else (data.get("grnNo") or None),
+                    source_document_id=grn.id if grn else None,
+                    source_line_id=grn.lines.first().id if (grn and grn.lines.exists()) else None,
+                    location=target_location,
+                    received_date=rec_date,
+                    received_quantity=taka_qty,
+                    available_quantity=ZERO,
+                    uom=item.uom,
+                    qc_status=qc_status,
+                    status="Active",
+                    barcode=taka_code,
+                    tag_status="Pending",
+                    print_count=0,
+                    roll_weight=roll_weight,
+                    width=t_width,
+                    pieces=1,
+                    gsm=t_gsm,
+                    rate=rate,
+                    remarks=t_remarks,
+                    tags=data.get("tags") or [],
+                    image_url=data.get("imageUrl") or None,
+                    created_by=request.user,
+                )
+
+                mov = stock.post_movement(
+                    client_id=client_id,
+                    item=item,
+                    location=target_location,
+                    type="PURCHASE",
+                    quantity=taka_qty,
+                    unit_cost=rate,
+                    batch_number=lot_no,
+                    lot_taka=lot_taka,
+                    reference_type="GoodsReceipt" if grn else "LotRegister",
+                    reference_id=grn.id if grn else lot_taka.id,
+                    reference_number=grn.grn_number if grn else f"{lot_no}/{t_roll}",
+                    source_document_type="GoodsReceipt" if grn else "LotRegister",
+                    source_document_id=grn.id if grn else lot_taka.id,
+                    movement_date=rec_date,
+                    notes=f"GRN intake {lot_no} / {t_roll} ({taka_code})",
+                    user=request.user,
+                )
+                lot_taka.stock_movement = mov
+                lot_taka.save(update_fields=["stock_movement", "updated_at"])
+                created_takas.append({
+                    "id": str(lot_taka.id),
+                    "takaId": lot_taka.taka_id,
+                    "lotNo": lot_taka.lot_number,
+                    "takaRoll": lot_taka.taka_number,
+                    "barcode": lot_taka.barcode,
+                    "receivedQty": float(taka_qty),
+                })
+
+            from apps.core.audit import record_audit
+            record_audit(
+                client=client_id, actor=request.user, action="create", entity_type="LotTaka",
+                entity_id=created_takas[0]["id"] if created_takas else None,
+                entity_label=lot_no,
+                description=f"Created {len(created_takas)} takas for Lot {lot_no} from GRN {grn.grn_number if grn else 'manual'}",
+            )
+            return Response({
+                "success": True,
+                "message": f"Successfully created {len(created_takas)} Taka rolls for Lot {lot_no} ({total_taka_meters} m) assigned to QC Hold.",
+                "lotNo": lot_no,
+                "takas": created_takas,
+            }, status=status.HTTP_201_CREATED)
+
         try:
             received_qty = round4(D(data.get("receivedQty")))
         except Exception:  # noqa: BLE001

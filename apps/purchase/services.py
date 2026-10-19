@@ -16,6 +16,7 @@ from django.db import transaction
 from django.db.models import DecimalField, F, Q, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 
 from apps.accounting import services as ledger
 from apps.core.exceptions import (
@@ -36,6 +37,8 @@ from apps.sales.services import (
 )
 
 from .models import (
+    PURCHASE_TYPE_GREY_STOCK,
+    GREY_STOCK_PURCHASE_TYPES,
     GoodsReceipt,
     GoodsReceiptLine,
     PaymentOut,
@@ -44,6 +47,7 @@ from .models import (
     PurchaseOrder,
     PurchaseOrderLine,
     VendorBill,
+    VendorBillLine,
 )
 
 #: api.md §6.3 -- tolerancePct resolution order: line -> item -> 2.
@@ -1019,10 +1023,21 @@ def cancel_bill(bill, *, reason=None, user=None):
 # Vendor-bill matching (VendorBill -> PO + GRN, read-only computation)
 # ---------------------------------------------------------------------------
 def compute_vendor_bill_matching(client_id, bill):
-    """Compare a vendor bill's lines against its PO and GRN.
+    """Three-way match of a vendor bill against its PO and goods receipts.
 
     Pure computation -- performs no DB writes. All Decimal values are
     converted to float in the output so the result is JSON-serializable.
+
+    Per line, three checks:
+
+    1. PO vs GRN quantity -- receiving more than was ordered is a variance
+       (a short / partial delivery is not; it is simply billed later).
+    2. PO rate and tax vs the vendor bill.
+    3. Received quantity vs billed quantity -- this bill plus every other
+       live vendor bill on the same receipt may not exceed what was received.
+
+    Receipts: the bill's own GRN when it names one, otherwise every GRN on
+    the PO, so partial deliveries across several GRNs add up.
     """
     if not isinstance(bill, VendorBill):
         bill = VendorBill.objects.filter(pk=getattr(bill, "pk", bill)).first()
@@ -1031,6 +1046,7 @@ def compute_vendor_bill_matching(client_id, bill):
                 "That vendor bill no longer exists.",
                 field_errors={"vendorBill": ["Not found."]},
             )
+    client_id = client_id or bill.client_id
 
     bill_lines = list(
         bill.line_items.filter(deleted_at__isnull=True)
@@ -1051,85 +1067,87 @@ def compute_vendor_bill_matching(client_id, bill):
             .order_by("line_no")
         )
 
-    grn = None
+    grns = []
     if bill.goods_receipt_id is not None:
-        grn = (
+        grns = list(
             GoodsReceipt.objects.filter(
-                pk=bill.goods_receipt_id, deleted_at__isnull=True
-            )
-            .prefetch_related("lines__item")
-            .first()
+                client_id=client_id, pk=bill.goods_receipt_id, deleted_at__isnull=True
+            ).prefetch_related("lines__item")
         )
-    if grn is None and po is not None:
-        grn = (
+    elif po is not None:
+        grns = list(
             GoodsReceipt.objects.filter(
-                client_id=client_id or bill.client_id,
-                purchase_order=po,
-                deleted_at__isnull=True,
+                client_id=client_id, purchase_order=po, deleted_at__isnull=True
             )
-            .order_by("-receipt_date", "-created_at")
+            .order_by("receipt_date", "created_at")
             .prefetch_related("lines__item")
-            .first()
         )
-    grn_lines = list(grn.lines.all()) if grn is not None else []
+    grn_lines = [line for grn in grns for line in grn.lines.all() if line.deleted_at is None]
+    # Ready grey stock is billed against what was received. Vendor A / final
+    # job work POs have no GRN -- their PO quantity is the verified production
+    # quantity, so it is the billing baseline instead.
+    receipt_based = po is None or po.purchase_type in GREY_STOCK_PURCHASE_TYPES
+
+    # Other live vendor bills against the same receipt(s): what they bill is
+    # no longer available to bill here.
+    other_bills = VendorBill.objects.filter(
+        client_id=client_id, deleted_at__isnull=True
+    ).exclude(pk=bill.pk).exclude(status="Rejected")
+    if bill.goods_receipt_id is not None:
+        other_bills = other_bills.filter(goods_receipt_id=bill.goods_receipt_id)
+    elif po is not None:
+        other_bills = other_bills.filter(purchase_order=po)
+    else:
+        other_bills = other_bills.none()
+    other_bill_lines = list(
+        VendorBillLine.objects.filter(
+            vendor_bill__in=other_bills, deleted_at__isnull=True
+        ).select_related("item")
+    )
 
     def _sku(value):
         return (value or "").strip().lower() or None
 
-    def _po_line_key(line):
+    def _key(line):
         item_id = getattr(line, "item_id", None)
+        if item_id is not None:
+            return f"id:{item_id}"
         sku = _sku(getattr(line, "sku", None)) or _sku(
             getattr(getattr(line, "item", None), "sku", None)
         )
-        return item_id, sku, getattr(line, "line_no", None)
+        return f"sku:{sku}" if sku else None
 
-    po_by_item = {}
-    po_by_sku = {}
+    po_by_key = {}
     po_by_line_no = {}
     for po_line in po_lines:
-        item_id, sku, line_no = _po_line_key(po_line)
-        if item_id is not None:
-            po_by_item.setdefault(str(item_id), po_line)
-        if sku is not None:
-            po_by_sku.setdefault(sku, po_line)
-        if line_no is not None:
-            po_by_line_no.setdefault(line_no, po_line)
+        key = _key(po_line)
+        if key is not None:
+            po_by_key.setdefault(key, po_line)
+        if po_line.line_no is not None:
+            po_by_line_no.setdefault(po_line.line_no, po_line)
 
-    grn_by_item = {}
-    grn_by_sku = {}
-    for grn_line in grn_lines:
-        item_id = getattr(grn_line, "item_id", None)
-        sku = _sku(getattr(getattr(grn_line, "item", None), "sku", None))
-        if item_id is not None:
-            grn_by_item.setdefault(str(item_id), grn_line)
-        if sku is not None:
-            grn_by_sku.setdefault(sku, grn_line)
+    def _sum_by_key(lines, field):
+        totals = {}
+        for line in lines:
+            key = _key(line)
+            if key is None:
+                continue
+            totals[key] = totals.get(key, ZERO) + D(getattr(line, field, 0) or 0)
+        return totals
+
+    grn_qty_by_key = _sum_by_key(grn_lines, "received_qty")
+    grn_rejected_by_key = _sum_by_key(grn_lines, "rejected_qty")
+    other_billed_by_key = _sum_by_key(other_bill_lines, "qty")
 
     def _match_po(bill_line):
-        item_id = getattr(bill_line, "item_id", None)
-        if item_id is not None and str(item_id) in po_by_item:
-            return po_by_item[str(item_id)]
-        sku = _sku(getattr(bill_line, "sku", None)) or _sku(
-            getattr(getattr(bill_line, "item", None), "sku", None)
-        )
-        if sku is not None and sku in po_by_sku:
-            return po_by_sku[sku]
-        line_no = getattr(bill_line, "line_no", None)
-        if line_no is not None and line_no in po_by_line_no:
-            return po_by_line_no[line_no]
+        key = _key(bill_line)
+        if key is not None and key in po_by_key:
+            return po_by_key[key]
+        if bill_line.line_no is not None:
+            return po_by_line_no.get(bill_line.line_no)
         return None
 
-    def _match_grn(bill_line):
-        item_id = getattr(bill_line, "item_id", None)
-        if item_id is not None and str(item_id) in grn_by_item:
-            return grn_by_item[str(item_id)]
-        sku = _sku(getattr(bill_line, "sku", None)) or _sku(
-            getattr(getattr(bill_line, "item", None), "sku", None)
-        )
-        if sku is not None and sku in grn_by_sku:
-            return grn_by_sku[sku]
-        return None
-
+    bill_tax_pct = D(bill.gst_pct or 0)
     rows = []
     total_po_qty = ZERO
     total_bill_qty = ZERO
@@ -1138,31 +1156,64 @@ def compute_vendor_bill_matching(client_id, bill):
     total_bill_amount = ZERO
     first_rate_diff = None
     all_match = True
+    reasons = []
 
     for bill_line in bill_lines:
         po_line = _match_po(bill_line) if po is not None else None
-        grn_line = _match_grn(bill_line) if grn is not None else None
+        key = _key(bill_line) or (_key(po_line) if po_line is not None else None)
 
         bill_qty = D(getattr(bill_line, "qty", 0))
         bill_rate = D(getattr(bill_line, "rate", 0))
         bill_amount = D(getattr(bill_line, "amount", 0))
-        po_qty = D(getattr(po_line, "qty", 0)) if po_line is not None else ZERO
-        po_rate = D(getattr(po_line, "rate", 0)) if po_line is not None else ZERO
-        po_amount = D(getattr(po_line, "amount", 0)) if po_line is not None else ZERO
-        grn_qty = (
-            D(getattr(grn_line, "received_qty", 0))
-            if grn_line is not None
-            else ZERO
-        )
+        po_qty = D(po_line.qty) if po_line is not None else ZERO
+        po_rate = D(po_line.rate) if po_line is not None else ZERO
+        po_tax_pct = D(po_line.tax_pct or 0) if po_line is not None else None
+        grn_qty = grn_qty_by_key.get(key, ZERO) if key else ZERO
+        grn_rejected = grn_rejected_by_key.get(key, ZERO) if key else ZERO
+        previously_billed = other_billed_by_key.get(key, ZERO) if key else ZERO
+        baseline_qty = grn_qty if receipt_based else po_qty
+        billable_qty = max(ZERO, baseline_qty - previously_billed)
+        # What this bill should cost at the PO rate.
+        po_amount = round2(bill_qty * po_rate) if po_line is not None else ZERO
 
-        qty_match = bill_qty == po_qty
-        rate_match = bill_rate == po_rate
-        amount_match = bill_amount == po_amount
-        line_status = "Match" if (qty_match and rate_match and amount_match) else "Mismatch"
-        if line_status != "Match":
+        variances = []
+        if po_line is None:
+            variances.append("Item is not on the purchase order.")
+        if receipt_based:
+            if grns and grn_qty > po_qty and po_line is not None:
+                variances.append(f"Received {grn_qty} against {po_qty} ordered (excess {grn_qty - po_qty}).")
+            if not grns:
+                variances.append("No goods receipt (GRN) has been posted for this bill.")
+            elif bill_qty > billable_qty:
+                variances.append(
+                    f"Billed {bill_qty} but only {billable_qty} received and not yet billed "
+                    f"(received {grn_qty}, billed on other bills {previously_billed})."
+                )
+        elif bill_qty > billable_qty:
+            variances.append(
+                f"Billed {bill_qty} but only {billable_qty} on the PO is not yet billed "
+                f"(PO {po_qty}, billed on other bills {previously_billed})."
+            )
+        rate_match = po_line is not None and bill_rate == po_rate
+        if po_line is not None and not rate_match:
+            variances.append(f"Bill rate {bill_rate} differs from PO rate {po_rate}.")
+        tax_match = po_tax_pct is None or bill_tax_pct == po_tax_pct
+        if not tax_match:
+            variances.append(f"Bill GST {bill_tax_pct}% differs from PO GST {po_tax_pct}%.")
+        amount_match = po_line is not None and abs(bill_amount - po_amount) <= ROUNDING_TOLERANCE
+        if po_line is not None and not amount_match:
+            variances.append(f"Line amount {bill_amount} differs from {po_amount} at the PO rate.")
+
+        if receipt_based:
+            qty_match = bool(grns) and bill_qty <= billable_qty and (po_line is None or grn_qty <= po_qty)
+        else:
+            qty_match = po_line is not None and bill_qty <= billable_qty
+        line_status = "Match" if not variances else "Mismatch"
+        if variances:
             all_match = False
-            if first_rate_diff is None:
+            if first_rate_diff is None and po_line is not None:
                 first_rate_diff = bill_rate - po_rate
+            reasons.extend(f"Line {bill_line.line_no}: {text}" for text in variances)
 
         total_po_qty += po_qty
         total_bill_qty += bill_qty
@@ -1185,16 +1236,41 @@ def compute_vendor_bill_matching(client_id, bill):
                 "sku": sku,
                 "poQty": float(po_qty),
                 "grnQty": float(grn_qty),
+                "grnRejectedQty": float(grn_rejected),
+                "previouslyBilledQty": float(previously_billed),
+                "billableQty": float(billable_qty),
                 "billQty": float(bill_qty),
                 "poRate": float(po_rate),
                 "billRate": float(bill_rate),
+                "poTaxPct": float(po_tax_pct) if po_tax_pct is not None else None,
+                "billTaxPct": float(bill_tax_pct),
                 "poAmount": float(po_amount),
                 "billAmount": float(bill_amount),
                 "qtyMatch": qty_match,
                 "rateMatch": rate_match,
+                "taxMatch": tax_match,
                 "amountMatch": amount_match,
+                "variances": variances,
                 "status": line_status,
             }
+        )
+
+    if not bill_lines:
+        all_match = False
+        reasons.append("The vendor bill has no lines.")
+
+    # Header totals: the bill's GST and grand total must follow from its lines.
+    expected_gst = round2(total_bill_amount * bill_tax_pct / Decimal("100"))
+    expected_total = round2(total_bill_amount + expected_gst)
+    total_match = (
+        abs(D(bill.gst_amount or 0) - expected_gst) <= ROUNDING_TOLERANCE
+        and abs(D(bill.total or 0) - expected_total) <= ROUNDING_TOLERANCE
+    )
+    if bill_lines and not total_match:
+        all_match = False
+        reasons.append(
+            f"Invoice total {D(bill.total or 0)} (GST {D(bill.gst_amount or 0)}) does not equal "
+            f"lines {total_bill_amount} + GST {expected_gst} = {expected_total}."
         )
 
     overall = "Match" if all_match else "Mismatch"
@@ -1204,19 +1280,26 @@ def compute_vendor_bill_matching(client_id, bill):
         "grnQty": float(total_grn_qty),
         "poAmount": float(total_po_amount),
         "billAmount": float(total_bill_amount),
-        "qtyDiff": float(total_bill_qty - total_po_qty),
+        "qtyDiff": float(total_bill_qty - total_grn_qty),
         "rateDiff": float(first_rate_diff) if first_rate_diff is not None else 0.0,
         "amountDiff": float(total_bill_amount - total_po_amount),
+        "billGst": float(D(bill.gst_amount or 0)),
+        "expectedGst": float(expected_gst),
+        "billTotal": float(D(bill.total or 0)),
+        "expectedTotal": float(expected_total),
+        "totalMatch": total_match,
     }
 
     result = {
         "poNumber": getattr(po, "po_number", None),
-        "grnNumber": getattr(grn, "grn_number", None),
+        "grnNumber": ", ".join(g.grn_number for g in grns) or None,
+        "grnNumbers": [g.grn_number for g in grns],
         "lines": rows,
         "summary": summary,
+        "reasons": reasons,
         "overallStatus": overall,
     }
-    if grn is None:
+    if receipt_based and not grns:
         result["note"] = "No GRN found for this purchase order."
     return result
 
@@ -1264,8 +1347,39 @@ def create_standalone_grn(
 
     po = None
     if purchase_order_id:
-        po = PurchaseOrder.objects.filter(pk=purchase_order_id, client_id=client.id, deleted_at__isnull=True).first()
+        # Locked so two GRNs posted at once cannot both read the old
+        # received quantities.
+        po = (
+            PurchaseOrder.objects.select_for_update()
+            .filter(pk=purchase_order_id, client_id=client.id, deleted_at__isnull=True)
+            .first()
+        )
+        if po is None:
+            raise ValidationFailed(
+                "Purchase order not found.",
+                field_errors={"purchaseOrderId": ["Not found."]},
+            )
+        _assert_po_receivable(po, party)
 
+    if supplier_challan_no:
+        duplicate = GoodsReceipt.objects.filter(
+            client_id=client.id,
+            party_id=party.id,
+            supplier_challan_no=supplier_challan_no,
+            deleted_at__isnull=True,
+        ).first()
+        if duplicate is not None:
+            raise Conflict(
+                f"Supplier challan {supplier_challan_no} is already received on {duplicate.grn_number}.",
+                code="DUPLICATE_GRN",
+                payload={"grnId": str(duplicate.id), "grnNumber": duplicate.grn_number},
+            )
+
+    # The API hands the dates over as strings; the number series needs a date.
+    if isinstance(receipt_date, str):
+        receipt_date = parse_date(receipt_date)
+    if isinstance(supplier_challan_date, str):
+        supplier_challan_date = parse_date(supplier_challan_date) if supplier_challan_date else None
     receipt_date = receipt_date or timezone.localdate()
     grn_number = allocate_number(client, "GRN", receipt_date)
 
@@ -1299,7 +1413,14 @@ def create_standalone_grn(
         )
         po_line = None
         if po_line_id:
-            po_line = PurchaseOrderLine.objects.filter(pk=po_line_id, deleted_at__isnull=True).first()
+            po_line = PurchaseOrderLine.objects.filter(
+                pk=po_line_id, client_id=client.id, deleted_at__isnull=True
+            ).first()
+            if po_line is not None and po is not None and po_line.purchase_order_id != po.id:
+                raise ValidationFailed(
+                    f"Line {idx + 1}: that PO line belongs to a different purchase order.",
+                    field_errors={"lines": [f"Line {idx + 1}: PO line does not belong to {po.po_number}."]},
+                )
             if po_line and not item_id:
                 item_id = po_line.item_id
 
@@ -1467,7 +1588,50 @@ def create_standalone_grn(
             taka_obj.stock_movement = movement
             taka_obj.save(update_fields=["stock_movement", "updated_at"])
 
+    if po is not None:
+        refresh_po_receipt_status(po)
     return receipt
+
+
+def _assert_po_receivable(po, party):
+    """A GRN only lands on an approved ready-grey-stock PO of the same supplier."""
+    from .models import PO_RECEIVABLE_STATUSES, GREY_STOCK_PURCHASE_TYPES
+
+    if po.purchase_type not in GREY_STOCK_PURCHASE_TYPES:
+        raise Conflict(
+            f"{po.po_number} is a {po.purchase_type} PO. Fabric for it is not received "
+            "through a grey stock GRN.",
+            code="WRONG_PURCHASE_TYPE",
+        )
+    if po.status not in PO_RECEIVABLE_STATUSES:
+        raise Conflict(
+            f"{po.po_number} is {po.status}; only an approved PO can be received.",
+            code=Codes.DRAFT_ONLY,
+        )
+    if po.party_id and party is not None and po.party_id != party.id:
+        raise ValidationFailed(
+            f"{po.po_number} was raised on a different supplier.",
+            field_errors={"party": ["Supplier must match the purchase order."]},
+        )
+
+
+def refresh_po_receipt_status(po):
+    """Partially / Fully Received from the PO lines' received quantities.
+
+    Each line is compared in its own unit, so metres and kilograms never mix.
+    """
+    if po.status not in ("Approved", "Issued", "Partially Received", "Fully Received"):
+        return po
+    lines = list(po.line_items.filter(deleted_at__isnull=True))
+    if not lines:
+        return po
+    received_any = any(D(line.received_qty) > ZERO for line in lines)
+    fully = all(D(line.received_qty) >= D(line.qty) for line in lines if D(line.qty) > ZERO)
+    new_status = "Fully Received" if (received_any and fully) else ("Partially Received" if received_any else po.status)
+    if new_status != po.status:
+        po.status = new_status
+        po.save(update_fields=["status", "updated_at"])
+    return po
 
 
 def supplier_reconciliation(client_id, *, vendor_id=None, date_from=None, date_to=None):

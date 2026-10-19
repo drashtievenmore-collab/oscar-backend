@@ -39,12 +39,14 @@ STAGE_2_PROCUREMENT_DEF = {
 }
 
 PURCHASE_PO_STAGES = [
-    {"name": "Create Grey Purchase PO", "department_name": "Purchase", "branch": "branch_purchase", "default_weight": Decimal("5.00"), "icon": "FileText"},
-    {"name": "Supplier Delivery", "department_name": "Purchase", "branch": "branch_purchase", "default_weight": Decimal("5.00"), "icon": "Truck"},
-    {"name": "GRN / Inward", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("5.00"), "icon": "Boxes"},
-    {"name": "Lot & Taka Creation", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("5.00"), "icon": "Layers"},
-    {"name": "Grey QC", "department_name": "Quality Control", "branch": "branch_purchase", "default_weight": Decimal("5.00"), "icon": "ShieldCheck"},
-    {"name": "Grey Stock Updated", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("5.00"), "icon": "Building2"},
+    {"name": "Create Grey Purchase PO", "department_name": "Purchase", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "FileText"},
+    {"name": "Supplier Delivery", "department_name": "Purchase", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "Truck"},
+    {"name": "GRN / Inward", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "Boxes"},
+    {"name": "Lot & Taka Creation", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "Layers"},
+    {"name": "Grey QC", "department_name": "Quality Control", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "ShieldCheck"},
+    {"name": "Grey Stock Updated", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "Building2"},
+    {"name": "Supplier Bill Matching", "department_name": "Accounts", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "FileSpreadsheet"},
+    {"name": "Payment", "department_name": "Accounts", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "IndianRupee"},
 ]
 
 VENDOR_PRODUCTION_STAGES = [
@@ -243,9 +245,17 @@ def sync_project_pipeline_stages(project):
     from apps.inventory.models import QCInspection
     from apps.sales.models import DeliveryChallan, SalesInvoice
 
-    po = PurchaseOrder.objects.filter(client_id=client_id).filter(
-        Q(reference_number=project.code) | Q(reference_number=getattr(order, "order_number", ""))
-    ).first()
+    linked_po_ids = cfv.get("linked_purchase_order_ids", [])
+    po = PurchaseOrder.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(
+        Q(project=project) | Q(reference_number=project.code) | Q(reference_number=getattr(order, "order_number", "")) | Q(id__in=linked_po_ids) | Q(notes__icontains=project.code)
+    ).order_by("-created_at").first()
+
+    if not po and cfv.get("grey_stock_po"):
+        gpo = cfv.get("grey_stock_po")
+        if gpo.get("id"):
+            po = PurchaseOrder.objects.filter(client_id=client_id, id=gpo["id"], deleted_at__isnull=True).first()
+        if not po and gpo.get("orderNumber"):
+            po = PurchaseOrder.objects.filter(client_id=client_id, po_number=gpo["orderNumber"], deleted_at__isnull=True).first()
 
     plan = ProcessPlan.objects.filter(client_id=client_id).filter(
         Q(remarks__icontains=project.code) | Q(plan_no__icontains=project.code)
@@ -348,21 +358,27 @@ def sync_project_pipeline_stages(project):
         elif name == "Create Grey Purchase PO":
             quantities["input"] = float(shortage_qty)
             po_data = cfv.get("grey_stock_po")
-            if po and po.status in ("Received", "Fully Received", "Closed"):
+            if po and po.status != "Cancelled":
                 status = "Completed"
                 pct = 100
-                remarks = f"Received PO {po.po_number}"
+                po_num = po.po_number or f"PO-{po.id}"
+                fl = po.line_items.first()
+                po_qty = float(fl.qty) if fl else float(shortage_qty)
+                quantities["good"] = po_qty
+                remarks = f"PO {po_num} created"
                 document = {
                     "type": "PurchaseOrder",
-                    "number": po.po_number or str(po.id),
+                    "number": po_num,
                     "url": f"/purchase/orders?id={po.id}",
-                    "label": f"PO: {po.po_number}",
+                    "label": f"PO: {po_num}",
                 }
-            elif po_data or po:
-                status = "In Progress"
-                pct = 50
-                po_num = (po_data and po_data.get("orderNumber")) or (po and po.po_number) or "PO-2026-0881"
-                remarks = f"PO {po_num} drafted"
+            elif po_data and po_data.get("orderNumber"):
+                status = "Completed"
+                pct = 100
+                po_num = po_data.get("orderNumber")
+                po_qty = float(po_data.get("quantity") or shortage_qty)
+                quantities["good"] = po_qty
+                remarks = f"PO {po_num} created"
                 document = {
                     "type": "PurchaseOrder",
                     "number": po_num,
@@ -374,10 +390,278 @@ def sync_project_pipeline_stages(project):
                 pct = 0
                 remarks = "PO pending"
 
-        elif name in ("Supplier Delivery", "GRN / Inward", "Lot & Taka Creation", "Grey QC", "Grey Stock Updated"):
-            status = "Pending"
-            pct = 0
-            remarks = f"{name} pending"
+        elif name == "Supplier Bill Matching":
+            quantities["input"] = float(shortage_qty)
+            from apps.purchase.models import VendorBill
+            vbill = None
+            if po:
+                vbill = VendorBill.objects.filter(client_id=client_id, purchase_order=po, deleted_at__isnull=True).first()
+            if not vbill:
+                vbill = VendorBill.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(
+                    Q(remarks__icontains=project.code) | Q(purchase_order__reference_number=project.code)
+                ).first()
+
+            if vbill and getattr(vbill, "status", "") in ("Approved", "Paid", "Matched"):
+                status = "Completed"
+                pct = 100
+                bill_no = getattr(vbill, "vendor_bill_number", None) or str(vbill.id)
+                remarks = f"Bill {bill_no} matched"
+                document = {
+                    "type": "VendorBill",
+                    "number": bill_no,
+                    "url": f"/purchase/bill-matching?bill={vbill.id}",
+                    "label": f"Bill: {bill_no}",
+                }
+            elif vbill:
+                status = "In Progress"
+                pct = 50
+                bill_no = getattr(vbill, "vendor_bill_number", None) or str(vbill.id)
+                remarks = f"Bill {bill_no} pending match"
+                document = {
+                    "type": "VendorBill",
+                    "number": bill_no,
+                    "url": f"/purchase/bill-matching?bill={vbill.id}",
+                    "label": f"Bill: {bill_no}",
+                }
+            else:
+                status = "Pending"
+                pct = 0
+                remarks = "Supplier bill matching pending"
+                document = {
+                    "type": "VendorBill",
+                    "number": "Bill Match",
+                    "url": "/purchase/bill-matching",
+                    "label": "Bill Matching",
+                }
+
+        elif name == "Supplier Delivery":
+            from apps.purchase.models import SupplierDelivery
+            quantities["input"] = float(shortage_qty)
+            deliv = None
+            if po:
+                deliv = SupplierDelivery.objects.filter(client_id=client_id, purchase_order=po, deleted_at__isnull=True).order_by("-dispatch_date").first()
+            if not deliv:
+                deliv = SupplierDelivery.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(
+                    Q(supplier_challan_no__icontains=project.code) | Q(remarks__icontains=project.code)
+                ).first()
+            if deliv and deliv.status in ("Delivered", "Partially Delivered"):
+                status = "Completed"
+                pct = 100
+                quantities["good"] = float(deliv.dispatched_qty or 0)
+                remarks = f"{deliv.delivery_number} Delivered ({float(deliv.dispatched_qty or 0):,} M)"
+                document = {
+                    "type": "SupplierDelivery",
+                    "number": deliv.delivery_number,
+                    "url": f"/purchase/supplier-delivery?po={po.id if po else ''}",
+                    "label": f"Delivery: {deliv.delivery_number}",
+                }
+            elif deliv:
+                status = "In Progress"
+                pct = 50
+                quantities["good"] = float(deliv.dispatched_qty or 0)
+                remarks = f"{deliv.delivery_number} {deliv.status}"
+                document = {
+                    "type": "SupplierDelivery",
+                    "number": deliv.delivery_number,
+                    "url": f"/purchase/supplier-delivery?po={po.id if po else ''}",
+                    "label": f"Delivery: {deliv.delivery_number}",
+                }
+            else:
+                status = "Pending"
+                pct = 0
+                remarks = "Supplier delivery pending"
+                document = {
+                    "type": "SupplierDelivery",
+                    "number": "Delivery Pending",
+                    "url": f"/purchase/supplier-delivery?po={po.id if po else ''}",
+                    "label": "Supplier Delivery",
+                }
+
+        elif name == "GRN / Inward":
+            from apps.purchase.models import GoodsReceipt
+            quantities["input"] = float(shortage_qty)
+            grn = None
+            if po:
+                grn = GoodsReceipt.objects.filter(client_id=client_id, purchase_order=po, deleted_at__isnull=True).order_by("-receipt_date").first()
+            if not grn:
+                grn = GoodsReceipt.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(
+                    Q(supplier_challan_no__icontains=project.code) | Q(party_id=po.party_id if po else None)
+                ).order_by("-receipt_date").first()
+            if grn:
+                rec_lines = grn.lines.all()
+                total_rec = sum((Decimal(str(l.received_qty or 0)) for l in rec_lines), Decimal("0"))
+                quantities["good"] = float(total_rec)
+                status = "Completed"
+                pct = 100
+                remarks = f"GRN {grn.grn_number} received ({float(total_rec):,} M)"
+                document = {
+                    "type": "GoodsReceipt",
+                    "number": grn.grn_number,
+                    "url": f"/purchase/receipts?id={grn.id}",
+                    "label": f"GRN: {grn.grn_number}",
+                }
+            else:
+                status = "Pending"
+                pct = 0
+                remarks = "GRN inward pending"
+                document = {
+                    "type": "GoodsReceipt",
+                    "number": "GRN Pending",
+                    "url": "/purchase/receipts",
+                    "label": "GRN Inward",
+                }
+
+        elif name in ("Lot & Taka Creation", "Lot / Taka Creation"):
+            from apps.inventory.models import LotTaka
+            from apps.purchase.models import GoodsReceipt
+            quantities["input"] = float(shortage_qty)
+            grn = None
+            if po:
+                grn = GoodsReceipt.objects.filter(client_id=client_id, purchase_order=po, deleted_at__isnull=True).first()
+            takas = LotTaka.objects.filter(client_id=client_id, deleted_at__isnull=True)
+            if grn:
+                takas = takas.filter(Q(source_document_id=grn.id) | Q(source_document_number=grn.grn_number))
+            else:
+                takas = takas.filter(Q(lot_number__icontains=project.code) | Q(remarks__icontains=project.code))
+            taka_count = takas.count()
+            if taka_count > 0:
+                taka_qty = sum((Decimal(str(t.received_quantity or 0)) for t in takas), Decimal("0"))
+                quantities["good"] = float(taka_qty)
+                status = "Completed"
+                pct = 100
+                remarks = f"{taka_count} takas created ({float(taka_qty):,} M)"
+                document = {
+                    "type": "LotTaka",
+                    "number": f"{taka_count} Takas",
+                    "url": "/inventory/lots-takas",
+                    "label": f"{taka_count} Takas",
+                }
+            else:
+                status = "Pending"
+                pct = 0
+                remarks = "Lot / taka creation pending"
+                document = {
+                    "type": "LotTaka",
+                    "number": "Takas Pending",
+                    "url": "/inventory/lots-takas",
+                    "label": "Lot & Taka",
+                }
+
+        elif name in ("Grey QC", "Grey Fabric QC"):
+            from apps.purchase.models import GoodsReceipt
+            quantities["input"] = float(shortage_qty)
+            grn = None
+            if po:
+                grn = GoodsReceipt.objects.filter(client_id=client_id, purchase_order=po, deleted_at__isnull=True).first()
+            if grn and grn.qc_status in ("Approved", "Partially Approved"):
+                status = "Completed"
+                pct = 100
+                remarks = f"QC {grn.qc_status}"
+                document = {
+                    "type": "QCInspection",
+                    "number": grn.qc_status,
+                    "url": "/inventory/qc",
+                    "label": f"QC: {grn.qc_status}",
+                }
+            elif grn and grn.qc_status in ("Pending", "On Hold"):
+                status = "In Progress"
+                pct = 50
+                remarks = f"QC {grn.qc_status}"
+                document = {
+                    "type": "QCInspection",
+                    "number": grn.qc_status,
+                    "url": "/inventory/qc",
+                    "label": f"QC: {grn.qc_status}",
+                }
+            elif grn and grn.qc_status in ("Rejected", "Rework"):
+                status = "Delayed"
+                pct = 30
+                remarks = f"QC {grn.qc_status}"
+                document = {
+                    "type": "QCInspection",
+                    "number": grn.qc_status,
+                    "url": "/inventory/qc",
+                    "label": f"QC: {grn.qc_status}",
+                }
+            else:
+                status = "Pending"
+                pct = 0
+                remarks = "Grey fabric QC pending"
+                document = {
+                    "type": "QCInspection",
+                    "number": "QC Pending",
+                    "url": "/inventory/qc",
+                    "label": "Grey Fabric QC",
+                }
+
+        elif name == "Grey Stock Updated":
+            from apps.purchase.models import GoodsReceipt
+            quantities["input"] = float(shortage_qty)
+            grn = None
+            if po:
+                grn = GoodsReceipt.objects.filter(client_id=client_id, purchase_order=po, deleted_at__isnull=True).first()
+            if grn and grn.qc_status in ("Approved", "Partially Approved"):
+                status = "Completed"
+                pct = 100
+                remarks = "Warehouse grey stock updated"
+                document = {
+                    "type": "StockPosition",
+                    "number": "Stock Updated",
+                    "url": "/inventory/stock-position",
+                    "label": "Warehouse Stock",
+                }
+            else:
+                status = "Pending"
+                pct = 0
+                remarks = "Grey stock update pending"
+                document = {
+                    "type": "StockPosition",
+                    "number": "Stock Pending",
+                    "url": "/inventory/stock-position",
+                    "label": "Stock Position",
+                }
+
+        elif name in ("Payment", "Supplier Payment"):
+            quantities["input"] = float(shortage_qty)
+            from apps.purchase.models import VendorBill, PurchaseBill, PaymentOut
+            vbill = None
+            if po:
+                vbill = VendorBill.objects.filter(client_id=client_id, purchase_order=po, deleted_at__isnull=True).first()
+            pb = None
+            if po:
+                pb = PurchaseBill.objects.filter(client_id=client_id, purchase_order=po, deleted_at__isnull=True).first()
+            is_paid = (vbill and vbill.status == "Paid") or (pb and pb.status == "Paid")
+            if is_paid:
+                status = "Completed"
+                pct = 100
+                remarks = "Supplier payment settled"
+                document = {
+                    "type": "PaymentOut",
+                    "number": "Paid",
+                    "url": "/purchase/payments",
+                    "label": "Payment: Settled",
+                }
+            elif (vbill and vbill.status == "Approved") or (pb and pb.status in ("Approved", "Partially Paid")):
+                status = "In Progress"
+                pct = 50
+                remarks = "Payment approved / pending disbursement"
+                document = {
+                    "type": "PaymentOut",
+                    "number": "Approved",
+                    "url": "/purchase/payments",
+                    "label": "Payment Pending",
+                }
+            else:
+                status = "Pending"
+                pct = 0
+                remarks = "Payment pending"
+                document = {
+                    "type": "PaymentOut",
+                    "number": "Pending",
+                    "url": "/purchase/payments",
+                    "label": "Supplier Payment",
+                }
+
 
         elif name == "Production Work Instruction":
             quantities["input"] = float(shortage_qty)

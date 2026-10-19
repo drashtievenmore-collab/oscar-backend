@@ -29,6 +29,28 @@ PO_STATUSES = [
     "Pending Approval", "Approved", "In Production",
     "Partially Received", "Fully Received",
 ]
+#: Which downstream workflow a PO drives. A ready grey stock purchase goes
+#: GRN -> lot/taka -> QC -> stock -> bill matching; a Vendor A production PO
+#: goes through the production instruction / daily entry cycle; a final job
+#: work PO is generated from a verified production instruction.
+PURCHASE_TYPE_GREY_STOCK = "Grey Stock Purchase"
+PURCHASE_TYPE_READY_GREY = "Ready Grey Fabric Purchase"
+PURCHASE_TYPE_VENDOR_A = "Vendor A Production"
+PURCHASE_TYPE_FINAL_JOB_WORK = "Final Job Work"
+PURCHASE_TYPES = [
+    PURCHASE_TYPE_GREY_STOCK,
+    PURCHASE_TYPE_READY_GREY,
+    PURCHASE_TYPE_VENDOR_A,
+    PURCHASE_TYPE_FINAL_JOB_WORK,
+]
+GREY_STOCK_PURCHASE_TYPES = {
+    PURCHASE_TYPE_GREY_STOCK,
+    PURCHASE_TYPE_READY_GREY,
+    "Ready Grey",
+    "Grey Fabric",
+}
+#: A GRN may only be posted against an issued, approved order.
+PO_RECEIVABLE_STATUSES = ("Approved", "Partially Received", "Fully Received", "Issued")
 BILL_STATUSES = ["Draft", "Unpaid", "Partially Paid", "Paid", "Cancelled"]
 #: api.md §6.4 -- only `Approved` releases stock for sale or dispatch.
 #: "Partially Approved" -- QC passed part of the goods and routed the rest
@@ -67,6 +89,15 @@ class PurchaseOrder(DocumentHeader):
     reference_number = models.TextField(null=True, blank=True)
     #: Set when the AutoPOModal reorder flow produced this PO.
     auto_generated = models.BooleanField(default=False)
+    purchase_type = models.TextField(
+        choices=choices(PURCHASE_TYPES), default=PURCHASE_TYPE_GREY_STOCK
+    )
+    #: Optional -- a general grey stock purchase has no project and lands in
+    #: general warehouse stock, allocated to projects later.
+    project = models.ForeignKey(
+        "pms.Project", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="linked_purchase_orders",
+    )
 
     class Meta:
         db_table = "purchase_orders"
@@ -178,9 +209,48 @@ class PurchaseBillLine(DocumentLine):
         ]
 
 
-# ---------------------------------------------------------------------------
-# Goods receipts and QC (db.md §6.1)
-# ---------------------------------------------------------------------------
+DELIVERY_STATUSES = [
+    "Pending Dispatch",
+    "Dispatched",
+    "In Transit",
+    "Partially Delivered",
+    "Delivered",
+    "Delayed",
+]
+
+
+class SupplierDelivery(TenantModel, LegacyIdMixin):
+    delivery_number = models.TextField()
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, on_delete=models.CASCADE, related_name="deliveries"
+    )
+    supplier_challan_no = models.TextField(null=True, blank=True)
+    supplier_challan_date = models.DateField(null=True, blank=True)
+    dispatch_date = models.DateField()
+    expected_delivery_date = models.DateField(null=True, blank=True)
+    actual_delivery_date = models.DateField(null=True, blank=True)
+    transporter_name = models.TextField(null=True, blank=True)
+    vehicle_number = models.TextField(null=True, blank=True)
+    lr_bilty_number = models.TextField(null=True, blank=True)
+    dispatched_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    status = models.TextField(choices=choices(DELIVERY_STATUSES), default="Dispatched")
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "purchase_supplier_deliveries"
+        ordering = ["-dispatch_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "delivery_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_supplier_delivery_number",
+            )
+        ]
+
+    def __str__(self):
+        return self.delivery_number
+
+
 class GoodsReceipt(TenantModel, LegacyIdMixin):
     GRN_QC_STATUSES = [
         "Pending", "Approved", "Partially Approved", "Rework", "Rejected", "On Hold",

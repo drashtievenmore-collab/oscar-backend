@@ -1,7 +1,7 @@
 """PMS endpoints (api.md §10)."""
 import hashlib
 import secrets
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from decimal import Decimal
 from django.db import transaction
@@ -767,127 +767,410 @@ class ProjectViewSet(TenantModelViewSet):
         returns_data = serializer.data.get("customerReturns", [])
         return Response(envelope(returns_data))
 
+    def _create_real_purchase_order(self, project, data, user=None):
+        from apps.purchase.models import PurchaseOrder, PurchaseOrderLine
+        from apps.masters.models import Party, Item
+        from apps.sales.services import recalculate_document
+        from apps.pms.pipeline_services import get_project_cfv, sync_project_pipeline_stages
+        import json
+
+        vendor_id = data.get("vendorId") or data.get("supplierId")
+        supplier_name = data.get("supplierName")
+        quantity = Decimal(str(data.get("quantity") or data.get("qty") or 0))
+        rate = Decimal(str(data.get("ratePerMeter") or data.get("rate") or 0))
+        expected_date = data.get("deliveryDate") or data.get("expectedDate") or None
+        notes = data.get("notes") or f"Grey Purchase PO for Project {project.code}"
+        item_id = data.get("itemId")
+        fabric_quality = data.get("fabricQuality")
+
+        vendor = None
+        if vendor_id:
+            try:
+                vendor = Party.objects.filter(client_id=project.client_id, pk=vendor_id, deleted_at__isnull=True).first()
+            except Exception:
+                vendor = None
+        if not vendor and supplier_name:
+            vendor = Party.objects.filter(client_id=project.client_id, name__iexact=supplier_name.strip(), deleted_at__isnull=True).first()
+        if not vendor:
+            vendor = Party.objects.filter(client_id=project.client_id, type__in=["Vendor", "Both"], deleted_at__isnull=True).first()
+        if not vendor:
+            vendor = Party.objects.filter(client_id=project.client_id, deleted_at__isnull=True).first()
+
+        if not vendor:
+            raise ValidationFailed("No vendor available in the system.", field_errors={"vendorId": ["No vendor found."]})
+
+        if quantity <= Decimal("0"):
+            raise ValidationFailed("Order quantity must be greater than zero.", field_errors={"quantity": ["Invalid quantity."]})
+
+        fabric_item = None
+        if item_id:
+            try:
+                fabric_item = Item.objects.filter(client_id=project.client_id, pk=item_id, deleted_at__isnull=True).first()
+            except Exception:
+                fabric_item = None
+        if not fabric_item and fabric_quality:
+            fabric_item = Item.objects.filter(client_id=project.client_id, name__icontains=fabric_quality, deleted_at__isnull=True).first()
+        if not fabric_item and project.product_name:
+            fabric_item = Item.objects.filter(client_id=project.client_id, name__icontains=project.product_name, deleted_at__isnull=True).first()
+        if not fabric_item:
+            fabric_item = Item.objects.filter(client_id=project.client_id, item_kind="Fabric", deleted_at__isnull=True).first()
+        if not fabric_item:
+            fabric_item = Item.objects.filter(client_id=project.client_id, deleted_at__isnull=True).first()
+
+        po_no = allocate_number(project.client, "PO", timezone.localdate())
+        po = PurchaseOrder(
+            client=project.client,
+            po_number=po_no,
+            party=vendor,
+            doc_date=timezone.localdate(),
+            expected_date=expected_date,
+            status="Draft",
+            reference_number=project.code,
+            purchase_type="Grey Stock Purchase",
+            project=project,
+            notes=notes,
+            created_by=user if getattr(user, "is_authenticated", False) else None,
+        )
+        po.freeze_party_snapshot()
+        po.save()
+
+        if fabric_item:
+            tax_pct = fabric_item.tax_pct if fabric_item.tax_pct is not None else Decimal("5.00")
+            line = PurchaseOrderLine(
+                client=project.client,
+                purchase_order=po,
+                line_no=1,
+                item=fabric_item,
+                qty=quantity,
+                rate=rate,
+                tax_pct=tax_pct,
+                uom=fabric_item.uom or "Meters",
+            )
+            line.freeze_item_snapshot()
+            line.save()
+            recalculate_document(po)
+
+        cfv = get_project_cfv(project)
+        cfv["shortage_action"] = "PURCHASE_PO"
+        linked_ids = cfv.get("linked_purchase_order_ids", [])
+        if str(po.id) not in linked_ids:
+            linked_ids.append(str(po.id))
+        cfv["linked_purchase_order_ids"] = linked_ids
+        cfv["grey_stock_po"] = {
+            "id": str(po.id),
+            "orderNumber": po.po_number,
+            "supplierName": vendor.name,
+            "vendorId": str(vendor.id),
+            "quantity": float(quantity),
+            "rate": float(rate),
+            "total": float(getattr(po, "total", None) or (quantity * rate)),
+            "status": po.status,
+            "date": str(po.doc_date),
+            "expectedDate": str(po.expected_date) if po.expected_date else None,
+        }
+        project.specifications = json.dumps(cfv)
+        project.save(update_fields=["specifications", "updated_at"])
+
+        sync_project_pipeline_stages(project)
+
+        stage2 = project.stages.filter(Q(sequence=2) | Q(name="Create Grey Purchase PO")).first()
+        if stage2:
+            stage2.status = "Completed"
+            stage2.completion_pct = 100
+            stage2.save(update_fields=["status", "completion_pct", "updated_at"])
+
+        return po, vendor, fabric_item
+
+    @action(detail=True, methods=["get", "post"], url_path="purchase-orders")
+    @transaction.atomic
+    def purchase_orders(self, request, pk=None):
+        project = self.get_object()
+        from apps.purchase.models import PurchaseOrder
+        from apps.pms.pipeline_services import get_project_cfv
+        from apps.masters.models import Party, Item
+
+        if request.method == "POST":
+            po, vendor, fabric_item = self._create_real_purchase_order(project, request.data, request.user)
+            fl = po.line_items.first()
+            po_total = float(getattr(po, "total", None) or ((fl.qty * fl.rate) if fl else 0.0))
+            po_data = {
+                "id": str(po.id),
+                "poNumber": po.po_number,
+                "vendorName": vendor.name if vendor else "Supplier",
+                "vendorId": str(vendor.id) if vendor else None,
+                "quantity": float(fl.qty) if fl else 0.0,
+                "rate": float(fl.rate) if fl else 0.0,
+                "grandTotal": po_total,
+                "total": po_total,
+                "status": po.status,
+                "docDate": str(po.doc_date),
+                "expectedDate": str(po.expected_date) if po.expected_date else None,
+                "itemName": fabric_item.name if fabric_item else "Grey Fabric",
+                "notes": po.notes or "",
+                "message": f"Purchase Order {po.po_number} successfully created for {vendor.name if vendor else 'Supplier'}.",
+            }
+            return Response({
+                "success": True,
+                "data": po_data,
+                **po_data,
+            })
+
+        cfv = get_project_cfv(project)
+        linked_ids = cfv.get("linked_purchase_order_ids", [])
+        real_pos = PurchaseOrder.objects.filter(
+            client_id=project.client_id,
+            deleted_at__isnull=True,
+        ).filter(
+            Q(project=project) |
+            Q(reference_number=project.code) |
+            Q(id__in=linked_ids) |
+            Q(notes__icontains=project.code)
+        ).select_related("party").prefetch_related("line_items__item").order_by("-created_at")
+
+        data = []
+        for rpo in real_pos:
+            fl = rpo.line_items.first()
+            rpo_total = float(getattr(rpo, "total", None) or ((fl.qty * fl.rate) if fl else 0.0))
+            data.append({
+                "id": str(rpo.id),
+                "poNumber": rpo.po_number or f"PO-{rpo.id}",
+                "docDate": str(rpo.doc_date),
+                "expectedDate": str(rpo.expected_date) if rpo.expected_date else None,
+                "vendorId": str(rpo.party_id) if rpo.party else None,
+                "vendorName": rpo.party_name or (rpo.party.name if rpo.party else "—"),
+                "status": rpo.status,
+                "itemName": fl.item.name if (fl and fl.item) else "Grey Fabric",
+                "qty": float(fl.qty) if fl else 0.0,
+                "rate": float(fl.rate) if fl else 0.0,
+                "grandTotal": rpo_total,
+                "total": rpo_total,
+                "notes": rpo.notes or "",
+            })
+
+        # Fetch active vendors from real Party table
+        vendors_qs = Party.objects.filter(
+            client_id=project.client_id,
+            deleted_at__isnull=True,
+        ).filter(Q(type__in=["Vendor", "Both", "Processor"]) | Q(is_processor=True)).order_by("name")
+        if not vendors_qs.exists():
+            vendors_qs = Party.objects.filter(
+                client_id=project.client_id,
+                deleted_at__isnull=True,
+            ).order_by("name")
+
+        # Fetch active fabric items from real Item table
+        items_qs = Item.objects.filter(
+            client_id=project.client_id,
+            deleted_at__isnull=True,
+        ).order_by("name")
+
+        available_vendors = [
+            {"id": str(v.id), "name": v.name, "code": v.code or "", "type": v.type}
+            for v in vendors_qs
+        ]
+        available_items = [
+            {
+                "id": str(i.id),
+                "name": i.name,
+                "sku": i.sku or "",
+                "itemKind": i.item_kind or "Fabric",
+                "costPrice": float(i.cost_price or 0),
+            }
+            for i in items_qs
+        ]
+
+        env = envelope(data)
+        env["orders"] = data
+        env["availableVendors"] = available_vendors
+        env["availableItems"] = available_items
+        return Response(env)
+
     @action(detail=True, methods=["get", "post"], url_path="grey-stock-allocation")
     @transaction.atomic
     def grey_stock_allocation(self, request, pk=None):
+        """Stage 1 workspace: real grey stock allocation for this project.
+
+        ``allocations`` carries the desired metres per lot; each change goes
+        through the allocation service (row lock, QC-passed stock only, never
+        beyond unallocated stock) instead of being stored as JSON.
+        """
         project = self.get_object()
-        from apps.inventory.models import LotTaka
+        from apps.core.permissions import require_permission
+        from apps.inventory import allocation_services as allocations_svc
         from apps.pms.pipeline_services import evaluate_stock_and_route, sync_project_pipeline_stages, get_project_cfv
         import json
 
         if request.method == "POST":
-            allocations = request.data.get("allocations", [])
-            total_allocated = Decimal("0.00")
-            for item in allocations:
-                qty = Decimal(str(item.get("allocateQty") or 0))
-                total_allocated += qty
-
             cfv = get_project_cfv(project)
-            cfv["grey_stock_allocations"] = allocations
+            if "allocations" in request.data:
+                require_permission(request.user, "create_transfer")
+                for row in request.data.get("allocations") or []:
+                    lot_id = row.get("lotTakaId") or row.get("id")
+                    if not lot_id:
+                        continue
+                    allocations_svc.set_project_lot_allocation(
+                        client_id=project.client_id,
+                        project=project,
+                        lot_taka_id=lot_id,
+                        target_qty=row.get("allocateQty") or 0,
+                        user=request.user,
+                        remarks=row.get("remarks"),
+                    )
+                # Superseded by the allocation table; dropped so it cannot drift.
+                cfv.pop("grey_stock_allocations", None)
+                cfv.pop("grey_stock_allocated_meters", None)
             if "subStep" in request.data:
                 cfv["grey_stock_sub_step"] = request.data["subStep"]
-            cfv["grey_stock_allocated_meters"] = float(total_allocated)
             if "shortageAction" in request.data:
                 cfv["shortage_action"] = request.data["shortageAction"]
-            if "purchaseOrder" in request.data:
+            if "createPurchaseOrder" in request.data or ("purchaseOrder" in request.data and isinstance(request.data["purchaseOrder"], dict) and (request.data["purchaseOrder"].get("vendorId") or request.data["purchaseOrder"].get("ratePerMeter") or request.data["purchaseOrder"].get("quantity"))):
+                project.specifications = json.dumps(cfv)
+                project.save(update_fields=["specifications", "updated_at"])
+                po_data = request.data.get("createPurchaseOrder") or request.data["purchaseOrder"]
+                self._create_real_purchase_order(project, po_data, request.user)
+                cfv = get_project_cfv(project)
+            elif "purchaseOrder" in request.data:
                 cfv["grey_stock_po"] = request.data["purchaseOrder"]
             if "productionOrder" in request.data:
                 cfv["grey_stock_production_order"] = request.data["productionOrder"]
 
             project.specifications = json.dumps(cfv)
             project.save(update_fields=["specifications", "updated_at"])
-
-            sync_res = sync_project_pipeline_stages(project)
-            stage1 = project.stages.filter(sequence=1).first()
-            if stage1:
-                req_qty_d = Decimal(str(project.requirement_meters or project.quantity or 3000))
-                if total_allocated >= req_qty_d and req_qty_d > Decimal("0"):
-                    stage1.status = "Completed"
-                    stage1.completion_pct = 100
-                elif total_allocated > Decimal("0"):
-                    stage1.status = "In Progress"
-                    stage1.completion_pct = min(99, int(round((float(total_allocated) / float(req_qty_d)) * 100)))
-                stage1.save(update_fields=["status", "completion_pct", "updated_at"])
+            sync_project_pipeline_stages(project)
 
         stock_eval = evaluate_stock_and_route(project)
-        req_qty = float(stock_eval.get("required_meters") or project.requirement_meters or project.quantity or 3000)
+        req_qty = float(stock_eval.get("required_meters") or project.requirement_meters or project.quantity or 0)
         cfv = get_project_cfv(project)
-        saved_allocations = cfv.get("grey_stock_allocations", [])
-        saved_alloc_map = {}
-        for a in saved_allocations:
-            if a.get("id"):
-                saved_alloc_map[str(a["id"])] = float(a.get("allocateQty", 0))
-            if a.get("lotNumber"):
-                saved_alloc_map[str(a["lotNumber"])] = float(a.get("allocateQty", 0))
 
-        order_map = {"LOT-COT-018": 1, "LOT-COT-021": 2, "LOT-COT-011": 3, "LOT-COT-033": 4, "LOT-COT-025": 5}
-        lot_rows = list(
-            LotTaka.objects.filter(client_id=project.client_id, deleted_at__isnull=True)
-            .select_related("item", "location", "fabric_quality")
-        )
-        lot_rows.sort(key=lambda lt: order_map.get(lt.lot_number, 999))
+        active = allocations_svc.project_allocations(project.client_id, project)
+        mine_by_lot = {}
+        for allocation in active:
+            mine_by_lot[allocation.lot_taka_id] = mine_by_lot.get(allocation.lot_taka_id, Decimal("0")) + allocation.quantity
 
         lots_data = []
-        for lt in lot_rows:
-            tot = float(lt.received_quantity or 0)
-            avail = float(lt.available_quantity or 0)
-            reserved = max(0.0, tot - avail)
-            usable = max(0.0, avail)
-            if saved_allocations:
-                alloc_qty = saved_alloc_map.get(str(lt.id), saved_alloc_map.get(lt.lot_number, 0.0))
-            else:
-                alloc_qty = usable if lt.lot_number in ["LOT-COT-018", "LOT-COT-021"] else 0.0
-            balance = max(0.0, usable - alloc_qty)
+        seen = set()
+        for lot, allocated_total, unallocated in allocations_svc.allocatable_lots(project.client_id):
+            mine = mine_by_lot.get(lot.id, Decimal("0"))
+            seen.add(lot.id)
+            others = max(Decimal("0"), allocated_total - mine)
+            usable = unallocated + mine
             lots_data.append({
-                "id": str(lt.id),
-                "fabricQuality": (lt.fabric_quality.name if lt.fabric_quality else None) or (lt.item.name if lt.item else "Cotton Grey Fabric"),
-                "lotNumber": lt.lot_number or f"LOT-{lt.id}",
-                "location": lt.location.name if lt.location else "Main Godown",
-                "totalStock": tot,
-                "reserved": reserved,
-                "usable": usable,
-                "allocateQty": alloc_qty,
-                "balance": balance,
-                "status": "Selected" if alloc_qty > 0 else "Available",
+                "id": str(lot.id),
+                "lotTakaId": str(lot.id),
+                "takaId": lot.taka_id,
+                "fabricQuality": (lot.fabric_quality.name if lot.fabric_quality else None) or (lot.item.name if lot.item else None),
+                "lotNumber": lot.lot_number,
+                "takaNumber": lot.taka_number,
+                "location": lot.location.name if lot.location else None,
+                "uom": lot.uom,
+                "totalStock": float(lot.available_quantity),
+                "reserved": float(others),
+                "usable": float(usable),
+                "allocateQty": float(mine),
+                "balance": float(max(Decimal("0"), usable - mine)),
+                "status": "Selected" if mine > 0 else "Available",
+            })
+        # A lot this project holds but that is no longer allocatable (e.g.
+        # issued onward) still shows, so the allocation is never invisible.
+        for allocation in active:
+            if allocation.lot_taka_id in seen:
+                continue
+            seen.add(allocation.lot_taka_id)
+            lot = allocation.lot_taka
+            mine = mine_by_lot.get(lot.id, Decimal("0"))
+            lots_data.append({
+                "id": str(lot.id),
+                "lotTakaId": str(lot.id),
+                "takaId": lot.taka_id,
+                "fabricQuality": lot.item.name if lot.item else None,
+                "lotNumber": lot.lot_number,
+                "takaNumber": lot.taka_number,
+                "location": None,
+                "uom": lot.uom,
+                "totalStock": float(lot.available_quantity),
+                "reserved": 0.0,
+                "usable": float(mine),
+                "allocateQty": float(mine),
+                "balance": 0.0,
+                "status": "Selected",
             })
 
-        total_allocated = sum(l["allocateQty"] for l in lots_data)
+        total_allocated = float(sum(mine_by_lot.values(), Decimal("0")))
         shortage = max(0.0, req_qty - total_allocated)
         alloc_pct = round((total_allocated / req_qty) * 100) if req_qty > 0 else 0
         shortage_pct = round((shortage / req_qty) * 100) if req_qty > 0 else 0
 
         stage1 = project.stages.filter(sequence=1).first()
+        if request.method == "POST" and stage1 and req_qty > 0:
+            if total_allocated >= req_qty:
+                stage1.status = "Completed"
+                stage1.completion_pct = 100
+            elif total_allocated > 0:
+                stage1.status = "In Progress"
+                stage1.completion_pct = min(99, int(round((total_allocated / req_qty) * 100)))
+            stage1.save(update_fields=["status", "completion_pct", "updated_at"])
 
-        user_name = getattr(request.user, "name", "System")
-        stage_logs = [
-            {
-                "timestamp": (project.start_date.strftime("%d/%m/%Y 10:30 AM") if project.start_date else "01/10/2026 10:30 AM"),
-                "user": user_name,
-                "action": f"Stock check initiated for Cotton Grey fabric ({req_qty:,.0f} m required).",
+        # Activity comes from what actually happened -- allocation rows and
+        # linked POs -- never from canned timestamps.
+        stage_logs = []
+        for allocation in allocations_svc.project_allocations(project.client_id, project, include_released=True):
+            actor = allocation.created_by
+            stage_logs.append({
+                "timestamp": timezone.localtime(allocation.created_at).strftime("%d/%m/%Y %I:%M %p"),
+                "user": (getattr(actor, "name", None) or getattr(actor, "email", None) or "System") if actor else "System",
+                "action": f"{allocation.quantity:,.2f} {allocation.uom or ''} allocated from {allocation.lot_taka.lot_number}/{allocation.lot_taka.taka_number}.",
+                "status": "Success",
+            })
+            if allocation.released_at:
+                releaser = allocation.released_by
+                stage_logs.append({
+                    "timestamp": timezone.localtime(allocation.released_at).strftime("%d/%m/%Y %I:%M %p"),
+                    "user": (getattr(releaser, "name", None) or getattr(releaser, "email", None) or "System") if releaser else "System",
+                    "action": f"Allocation of {allocation.quantity:,.2f} {allocation.uom or ''} from {allocation.lot_taka.lot_number}/{allocation.lot_taka.taka_number} released.",
+                    "status": "Info",
+                })
+
+        from apps.purchase.models import PurchaseOrder
+        linked_ids = cfv.get("linked_purchase_order_ids", [])
+        real_pos = PurchaseOrder.objects.filter(
+            client_id=project.client_id,
+            deleted_at__isnull=True,
+        ).filter(
+            Q(project=project) |
+            Q(reference_number=project.code) |
+            Q(id__in=linked_ids)
+        ).select_related("party").prefetch_related("line_items__item").order_by("-created_at")
+
+        linked_pos_list = []
+        for rpo in real_pos:
+            fl = rpo.line_items.first()
+            rpo_total = float(getattr(rpo, "total", None) or ((fl.qty * fl.rate) if fl else 0.0))
+            linked_pos_list.append({
+                "id": str(rpo.id),
+                "poNumber": rpo.po_number or f"PO-{rpo.id}",
+                "docDate": str(rpo.doc_date),
+                "expectedDate": str(rpo.expected_date) if rpo.expected_date else None,
+                "vendorId": str(rpo.party_id) if rpo.party else None,
+                "vendorName": rpo.party_name or (rpo.party.name if rpo.party else "—"),
+                "status": rpo.status,
+                "purchaseType": rpo.purchase_type,
+                "itemName": fl.item.name if (fl and fl.item) else None,
+                "qty": float(fl.qty) if fl else 0.0,
+                "rate": float(fl.rate) if fl else 0.0,
+                "grandTotal": rpo_total,
+                "total": rpo_total,
+                "notes": rpo.notes or "",
+            })
+            stage_logs.append({
+                "timestamp": timezone.localtime(rpo.created_at).strftime("%d/%m/%Y %I:%M %p"),
+                "user": (getattr(rpo.created_by, "name", None) or "System") if rpo.created_by_id else "System",
+                "action": f"{rpo.purchase_type} PO {rpo.po_number} raised on {rpo.party_name or 'supplier'} ({rpo.status}).",
                 "status": "Info",
-            },
-            {
-                "timestamp": (project.start_date.strftime("%d/%m/%Y 11:15 AM") if project.start_date else "01/10/2026 11:15 AM"),
-                "user": "Warehouse Manager",
-                "action": f"Warehouse stock scanned. {total_allocated:,.0f} m identified and allocated from eligible lots.",
-                "status": "Success",
-            },
-        ]
-        if shortage > 0:
-            stage_logs.append({
-                "timestamp": (project.start_date.strftime("%d/%m/%Y 11:30 AM") if project.start_date else "01/10/2026 11:30 AM"),
-                "user": "System (Route Engine)",
-                "action": f"Shortage detected for {shortage:,.0f} m ({shortage_pct}%). Procurement branch activated.",
-                "status": "Warning",
             })
-        if cfv.get("grey_stock_po"):
-            po = cfv["grey_stock_po"]
-            stage_logs.append({
-                "timestamp": (project.start_date.strftime("%d/%m/%Y 02:45 PM") if project.start_date else "01/10/2026 02:45 PM"),
-                "user": user_name,
-                "action": f"Purchase PO {po.get('orderNumber', 'PO-2026-0881')} drafted for {po.get('quantity', shortage):,.0f} m to {po.get('supplierName', 'Supplier')}.",
-                "status": "Success",
-            })
+        stage_logs.sort(key=lambda entry: datetime.strptime(entry["timestamp"], "%d/%m/%Y %I:%M %p"))
+
+        def _fmt(value):
+            return value.strftime("%d/%m/%Y") if value else None
 
         res_payload = {
             "projectId": str(project.id),
@@ -897,8 +1180,8 @@ class ProjectViewSet(TenantModelViewSet):
             "stageSubtitle": "Check available grey fabric stock in OSCAR and allocate for this project.",
             "stageWeight": 10,
             "plannedDurationDays": 5,
-            "startDate": stage1.start_datetime.strftime("%d/%m/%Y") if (stage1 and stage1.start_datetime) else (project.start_date.strftime("%d/%m/%Y") if project.start_date else "01/10/2026"),
-            "expectedCompletionDate": stage1.expected_completion_datetime.strftime("%d/%m/%Y") if (stage1 and stage1.expected_completion_datetime) else (project.expected_completion_date.strftime("%d/%m/%Y") if project.expected_completion_date else "05/10/2026"),
+            "startDate": _fmt(stage1.start_datetime if stage1 and stage1.start_datetime else project.start_date),
+            "expectedCompletionDate": _fmt(stage1.expected_completion_datetime if stage1 and stage1.expected_completion_datetime else project.expected_completion_date),
             "requiredMeters": req_qty,
             "allocatedMeters": total_allocated,
             "shortageMeters": shortage,
@@ -907,12 +1190,39 @@ class ProjectViewSet(TenantModelViewSet):
             "subStep": cfv.get("grey_stock_sub_step", 1),
             "shortageAction": cfv.get("shortage_action", None),
             "purchaseOrder": cfv.get("grey_stock_po", None),
+            "linkedPurchaseOrders": linked_pos_list,
             "productionOrder": cfv.get("grey_stock_production_order", None),
             "stageLogs": stage_logs,
             "lots": lots_data,
+            "allocations": [allocations_svc.serialize_allocation(a) for a in active],
         }
         return Response(res_payload)
 
+    @action(detail=True, methods=["post"], url_path=r"grey-stock-allocation/(?P<allocation_id>[^/.]+)/release")
+    @transaction.atomic
+    def release_grey_stock_allocation(self, request, pk=None, allocation_id=None):
+        project = self.get_object()
+        from apps.core.permissions import require_permission
+        from apps.inventory import allocation_services as allocations_svc
+        from apps.inventory.models import GreyStockAllocation
+        import uuid
+
+        require_permission(request.user, "create_transfer")
+        try:
+            uuid.UUID(str(allocation_id))
+        except ValueError:
+            raise NotFound("That allocation does not exist.")
+        if not GreyStockAllocation.objects.filter(
+            client_id=project.client_id, project=project, pk=allocation_id
+        ).exists():
+            raise NotFound("That allocation does not belong to this project.")
+        allocation = allocations_svc.release_allocation(
+            client_id=project.client_id,
+            allocation_id=allocation_id,
+            user=request.user,
+            remarks=request.data.get("remarks"),
+        )
+        return Response(allocations_svc.serialize_allocation(allocation))
 
     def _get_stage(self, project, stage_id):
         from django.core.exceptions import ValidationError as DjangoValidationError

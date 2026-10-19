@@ -129,7 +129,9 @@ class ProductionInstructionViewSet(TenantModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="generate-po")
     def generate_po(self, request, pk=None):
-        instruction = services.generate_final_job_work_po(self.get_object(), user=request.user)
+        instruction = services.generate_final_job_work_po(
+            self.get_object(), user=request.user, custom_data=request.data
+        )
         return Response(self.get_serializer(instruction).data)
 
     @action(detail=True, methods=["post"], url_path="three-way-match")

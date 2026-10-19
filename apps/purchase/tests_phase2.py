@@ -95,6 +95,10 @@ class Phase2PurchaseTests(TestCase):
         )
         self.assertEqual(po_res.status_code, 201, po_res.content)
         self.po = PurchaseOrder.objects.get(pk=po_res.json()["id"])
+        # A GRN may only be posted against an approved ready grey stock PO.
+        self.assertEqual(self.po.purchase_type, "Grey Stock Purchase")
+        self.po.status = "Approved"
+        self.po.save(update_fields=["status"])
         self.po_line = self.po.line_items.first()
 
     def test_standalone_grn_creation_with_takas(self):

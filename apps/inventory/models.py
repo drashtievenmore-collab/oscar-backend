@@ -1003,3 +1003,51 @@ class TripMaterialLine(TenantModel):
 
 
 
+
+
+class GreyStockAllocation(TenantModel):
+    """General grey stock earmarked for a project (a reservation, not a move).
+
+    The fabric stays where it is and ``LotTaka.available_quantity`` -- which
+    mirrors the movement ledger -- is untouched. Unallocated stock is
+    ``available_quantity`` minus the Active allocations on the lot, and the
+    allocation service locks the lot row so two allocations can never take
+    the same metres.
+    """
+
+    STATUS_ACTIVE = "Active"
+    STATUS_RELEASED = "Released"
+    STATUSES = [(STATUS_ACTIVE, STATUS_ACTIVE), (STATUS_RELEASED, STATUS_RELEASED)]
+
+    project = models.ForeignKey(
+        "pms.Project", on_delete=models.PROTECT, related_name="grey_stock_allocations"
+    )
+    lot_taka = models.ForeignKey(
+        LotTaka, on_delete=models.PROTECT, related_name="project_allocations"
+    )
+    item = models.ForeignKey("masters.Item", on_delete=models.PROTECT, related_name="+")
+    quantity = models.DecimalField(max_digits=18, decimal_places=4)
+    uom = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default=STATUS_ACTIVE)
+    remarks = models.TextField(null=True, blank=True)
+    released_at = models.DateTimeField(null=True, blank=True)
+    released_by = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="+",
+    )
+
+    class Meta:
+        db_table = "grey_stock_allocations"
+        ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(quantity__gt=0), name="ck_grey_alloc_qty_positive"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["client", "project", "status"], name="ix_grey_alloc_project"),
+            models.Index(fields=["client", "lot_taka", "status"], name="ix_grey_alloc_lot"),
+        ]
+
+    def __str__(self):
+        return f"{self.lot_taka} -> {self.project} ({self.quantity})"

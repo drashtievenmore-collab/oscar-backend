@@ -28,6 +28,7 @@ SERIES_DEFAULTS = {
     "WC": ("WC", "fy", 5, "-"),
     # Purchase
     "PO": ("PO", "fy", 4, "-"),
+    "SD": ("SD", "fy", 4, "-"),
     "BILL": ("BILL", "fy", 4, "-"),
     "GRN": ("GRN", "fy", 4, "-"),
     "PAY-OUT": ("PAY-OUT", "fy", 4, "-"),
@@ -67,6 +68,7 @@ SERIES_DEFAULTS = {
     # Job work
     "PP": ("PP", "fy", 3, "-"),
     "JWO": ("JWO", "fy", 3, "-"),
+    "JWPO": ("JWPO", "fy", 4, "-"),
     "VPI": ("VPI", "fy", 4, "-"),
 }
 
