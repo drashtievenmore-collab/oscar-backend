@@ -824,7 +824,7 @@ class ProjectViewSet(TenantModelViewSet):
             party=vendor,
             doc_date=timezone.localdate(),
             expected_date=expected_date,
-            status="Draft",
+            status="Approved",
             reference_number=project.code,
             purchase_type="Grey Stock Purchase",
             project=project,
@@ -931,6 +931,17 @@ class ProjectViewSet(TenantModelViewSet):
         for rpo in real_pos:
             fl = rpo.line_items.first()
             rpo_total = float(getattr(rpo, "total", None) or ((fl.qty * fl.rate) if fl else 0.0))
+            po_lines = [
+                {
+                    "id": str(l.id),
+                    "itemId": str(l.item_id) if l.item_id else None,
+                    "itemName": l.item_name or (l.item.name if l.item else "Grey Fabric"),
+                    "qty": float(l.qty),
+                    "rate": float(l.rate),
+                    "uom": l.uom or "Mtr",
+                }
+                for l in rpo.line_items.all()
+            ]
             data.append({
                 "id": str(rpo.id),
                 "poNumber": rpo.po_number or f"PO-{rpo.id}",
@@ -938,13 +949,18 @@ class ProjectViewSet(TenantModelViewSet):
                 "expectedDate": str(rpo.expected_date) if rpo.expected_date else None,
                 "vendorId": str(rpo.party_id) if rpo.party else None,
                 "vendorName": rpo.party_name or (rpo.party.name if rpo.party else "—"),
+                "vendor": rpo.party_name or (rpo.party.name if rpo.party else "—"),
                 "status": rpo.status,
+                "itemId": str(fl.item_id) if (fl and fl.item_id) else None,
                 "itemName": fl.item.name if (fl and fl.item) else "Grey Fabric",
                 "qty": float(fl.qty) if fl else 0.0,
+                "quantity": float(fl.qty) if fl else 0.0,
                 "rate": float(fl.rate) if fl else 0.0,
                 "grandTotal": rpo_total,
                 "total": rpo_total,
                 "notes": rpo.notes or "",
+                "items": po_lines,
+                "lineItems": po_lines,
             })
 
         # Fetch active vendors from real Party table
@@ -1047,53 +1063,9 @@ class ProjectViewSet(TenantModelViewSet):
         for allocation in active:
             mine_by_lot[allocation.lot_taka_id] = mine_by_lot.get(allocation.lot_taka_id, Decimal("0")) + allocation.quantity
 
-        lots_data = []
-        seen = set()
-        for lot, allocated_total, unallocated in allocations_svc.allocatable_lots(project.client_id):
-            mine = mine_by_lot.get(lot.id, Decimal("0"))
-            seen.add(lot.id)
-            others = max(Decimal("0"), allocated_total - mine)
-            usable = unallocated + mine
-            lots_data.append({
-                "id": str(lot.id),
-                "lotTakaId": str(lot.id),
-                "takaId": lot.taka_id,
-                "fabricQuality": (lot.fabric_quality.name if lot.fabric_quality else None) or (lot.item.name if lot.item else None),
-                "lotNumber": lot.lot_number,
-                "takaNumber": lot.taka_number,
-                "location": lot.location.name if lot.location else None,
-                "uom": lot.uom,
-                "totalStock": float(lot.available_quantity),
-                "reserved": float(others),
-                "usable": float(usable),
-                "allocateQty": float(mine),
-                "balance": float(max(Decimal("0"), usable - mine)),
-                "status": "Selected" if mine > 0 else "Available",
-            })
-        # A lot this project holds but that is no longer allocatable (e.g.
-        # issued onward) still shows, so the allocation is never invisible.
-        for allocation in active:
-            if allocation.lot_taka_id in seen:
-                continue
-            seen.add(allocation.lot_taka_id)
-            lot = allocation.lot_taka
-            mine = mine_by_lot.get(lot.id, Decimal("0"))
-            lots_data.append({
-                "id": str(lot.id),
-                "lotTakaId": str(lot.id),
-                "takaId": lot.taka_id,
-                "fabricQuality": lot.item.name if lot.item else None,
-                "lotNumber": lot.lot_number,
-                "takaNumber": lot.taka_number,
-                "location": None,
-                "uom": lot.uom,
-                "totalStock": float(lot.available_quantity),
-                "reserved": 0.0,
-                "usable": float(mine),
-                "allocateQty": float(mine),
-                "balance": 0.0,
-                "status": "Selected",
-            })
+        fabrics_data, lots_data = allocations_svc.fabric_stock_summary(
+            project.client_id, project=project
+        )
 
         total_allocated = float(sum(mine_by_lot.values(), Decimal("0")))
         shortage = max(0.0, req_qty - total_allocated)
@@ -1193,6 +1165,7 @@ class ProjectViewSet(TenantModelViewSet):
             "linkedPurchaseOrders": linked_pos_list,
             "productionOrder": cfv.get("grey_stock_production_order", None),
             "stageLogs": stage_logs,
+            "fabrics": fabrics_data,
             "lots": lots_data,
             "allocations": [allocations_svc.serialize_allocation(a) for a in active],
         }

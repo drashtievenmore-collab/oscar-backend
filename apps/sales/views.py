@@ -199,6 +199,7 @@ def _clone_document(source, target_model, overrides, *, number_field, series,
         "client_id", "party_id", "party_name", "party_gstin", "billing_address",
         "shipping_address", "place_of_supply", "notes", "terms",
         "freight_charges", "other_charges", "discount_override",
+        "broker", "broker_fk_id", "salesperson", "salesperson_fk_id",
     ]
     payload = {field: getattr(source, field) for field in copied_fields}
     payload["doc_date"] = timezone.localdate()
@@ -1662,8 +1663,17 @@ class BrokerCommissionViewSet(TenantModelViewSet):
         comm = self.get_object()
         amount = request.data.get("amount")
         payment_ref = request.data.get("paymentReference") or request.data.get("payment_reference")
+        payment_method = request.data.get("paymentMethod") or request.data.get("payment_method")
+        bank_account = request.data.get("bankAccount") or request.data.get("bank_account")
+        remarks = request.data.get("remarks")
         comm = broker_services.pay_broker_commission(
-            comm, amount=amount, payment_ref=payment_ref, user=request.user
+            comm,
+            amount=amount,
+            payment_ref=payment_ref,
+            payment_method=payment_method,
+            bank_account=bank_account,
+            user=request.user,
+            remarks=remarks,
         )
         return Response(self.get_serializer(comm).data)
 
@@ -1682,6 +1692,215 @@ class BrokerCommissionViewSet(TenantModelViewSet):
             "totalPaid": str(round2(total_paid)),
             "pendingBalance": str(pending_balance),
             "commissions": self.get_serializer(commissions, many=True).data,
+        })
+
+    @action(detail=False, methods=["get"], url_path="leads")
+    def leads(self, request):
+        """Returns all CRM leads with broker attribution, linked sales pipeline, and commission status."""
+        from apps.crm.models import Lead
+        from apps.masters.models import Broker
+        from apps.sales.models import Quotation, SalesOrder, SalesInvoice
+
+        client_id = self.get_client_id()
+        leads_qs = Lead.objects.filter(
+            client_id=client_id,
+            deleted_at__isnull=True,
+        ).select_related("stage", "source", "party", "owner", "lost_reason").order_by("-is_pinned", "-created_at")
+
+        broker_id_filter = request.query_params.get("brokerId") or request.query_params.get("broker_id")
+        status_filter = request.query_params.get("status")
+        search = (request.query_params.get("search") or "").strip().lower()
+
+        results = []
+        for lead in leads_qs:
+            cv = lead.custom_values or {}
+            lead_broker_id = cv.get("broker_id") or cv.get("brokerId")
+            source_name = (lead.source.name if lead.source else "") or ""
+            is_broker_lead = bool(lead_broker_id or cv.get("broker_name") or cv.get("brokerName") or source_name.lower() == "broker")
+            if not is_broker_lead:
+                continue
+
+            if broker_id_filter and str(lead_broker_id) != str(broker_id_filter):
+                continue
+
+            stage_name = lead.stage.name if lead.stage else "New Lead"
+            if status_filter and stage_name.lower() != status_filter.lower():
+                continue
+
+            broker_name = cv.get("broker_name") or cv.get("brokerName") or ""
+            broker_code = cv.get("broker_code") or cv.get("brokerCode") or ""
+            if (not broker_name or not broker_code) and lead_broker_id:
+                try:
+                    b_obj = Broker.objects.filter(id=lead_broker_id).first()
+                    if b_obj:
+                        broker_name = broker_name or b_obj.name
+                        broker_code = broker_code or b_obj.code
+                except Exception:
+                    pass
+
+            party_name = lead.company or (lead.party.name if lead.party else lead.name)
+            fabric_quality = cv.get("fabric_quality") or cv.get("fabric") or cv.get("quality") or "Grey Fabric"
+            expected_meters = cv.get("expected_meters") or cv.get("meters") or 0
+            expected_takas = cv.get("expected_takas") or cv.get("takas") or 0
+            commission_basis = cv.get("commission_basis") or cv.get("commissionType") or "percent"
+            commission_rate = cv.get("commission_rate") or cv.get("agreed_rate") or cv.get("rate") or 0
+            commission_notes = cv.get("commission_notes") or cv.get("notes") or ""
+
+            # Check linked quotations, orders, invoices
+            linked_quotations = []
+            for q in Quotation.objects.filter(client_id=client_id, crm_lead=lead).only("id", "quotation_number", "doc_date", "total", "status"):
+                linked_quotations.append({
+                    "id": str(q.id),
+                    "number": q.quotation_number,
+                    "date": q.doc_date.isoformat() if q.doc_date else None,
+                    "total": str(q.total),
+                    "status": q.status,
+                })
+
+            linked_orders = []
+            q_ids = [q["id"] for q in linked_quotations]
+            for so in SalesOrder.objects.filter(client_id=client_id, quotation_id__in=q_ids).only("id", "order_number", "doc_date", "total", "stage"):
+                linked_orders.append({
+                    "id": str(so.id),
+                    "number": so.order_number,
+                    "date": so.doc_date.isoformat() if so.doc_date else None,
+                    "total": str(so.total),
+                    "stage": so.stage,
+                })
+
+            linked_invoices = []
+            so_ids = [so["id"] for so in linked_orders]
+            for inv in SalesInvoice.objects.filter(client_id=client_id, sales_order_id__in=so_ids).only("id", "invoice_number", "doc_date", "total", "status"):
+                linked_invoices.append({
+                    "id": str(inv.id),
+                    "number": inv.invoice_number,
+                    "date": inv.doc_date.isoformat() if inv.doc_date else None,
+                    "total": str(inv.total),
+                    "status": inv.status,
+                })
+
+            # Check linked commission
+            inv_ids = [inv["id"] for inv in linked_invoices]
+            linked_commissions = BrokerCommission.objects.filter(client_id=client_id, invoice_id__in=inv_ids)
+            total_comm_earned = ZERO
+            total_comm_paid = ZERO
+            comm_status = "Unearned (In Pipeline)"
+            if linked_commissions.exists():
+                total_comm_earned = linked_commissions.aggregate(val=Sum("commission_amount"))["val"] or ZERO
+                total_comm_paid = linked_commissions.aggregate(val=Sum("paid_amount"))["val"] or ZERO
+                comm_status = linked_commissions.first().status
+            elif lead.stage and lead.stage.is_lost:
+                comm_status = "Lost Deal (No Commission)"
+
+            text_pool = f"{lead.lead_number} {lead.name} {party_name} {broker_name} {fabric_quality}".lower()
+            if search and search not in text_pool:
+                continue
+
+            results.append({
+                "id": str(lead.id),
+                "leadNumber": lead.lead_number or f"LEAD-{lead.id}",
+                "leadDate": lead.created_on.isoformat() if lead.created_on else None,
+                "customerName": party_name,
+                "contactPerson": lead.name,
+                "phone": lead.phone,
+                "stage": stage_name,
+                "isLost": bool(lead.stage and lead.stage.is_lost),
+                "brokerId": str(lead_broker_id) if lead_broker_id else None,
+                "brokerName": broker_name or "Unassigned",
+                "brokerCode": broker_code or "BRK-N/A",
+                "fabricQuality": fabric_quality,
+                "expectedMeters": expected_meters,
+                "expectedTakas": expected_takas,
+                "expectedSaleValue": str(lead.amount or 0),
+                "commissionBasis": commission_basis,
+                "commissionRate": commission_rate,
+                "commissionNotes": commission_notes,
+                "quotations": linked_quotations,
+                "orders": linked_orders,
+                "invoices": linked_invoices,
+                "earnedCommission": str(round2(total_comm_earned)),
+                "paidCommission": str(round2(total_comm_paid)),
+                "commissionStatus": comm_status,
+                "lostReason": lead.lost_reason.name if lead.lost_reason else None,
+                "salesperson": lead.owner.name if lead.owner else None,
+            })
+
+        return Response(results)
+
+    @action(detail=False, methods=["get"], url_path="analytics")
+    def analytics(self, request):
+        """Returns broker performance KPIs, pipeline volume, conversion rates, and comparative statistics."""
+        from apps.crm.models import Lead
+        from apps.masters.models import Broker
+
+        client_id = self.get_client_id()
+        brokers = Broker.objects.filter(client_id=client_id, deleted_at__isnull=True)
+        commissions = BrokerCommission.objects.filter(client_id=client_id)
+
+        all_leads = Lead.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related("stage", "source")
+        broker_leads = []
+        for l in all_leads:
+            cv = l.custom_values or {}
+            source_name = (l.source.name if l.source else "") or ""
+            if cv.get("broker_id") or cv.get("brokerId") or cv.get("broker_name") or source_name.lower() == "broker":
+                broker_leads.append(l)
+
+        total_broker_leads = len(broker_leads)
+        won_leads = [l for l in broker_leads if l.stage and (l.stage.name.lower() in ("won", "converted", "closed won") or not l.stage.is_lost and l.converted_at is not None)]
+        lost_leads = [l for l in broker_leads if l.stage and (l.stage.is_lost or l.stage.name.lower() in ("lost", "dropped", "cancelled"))]
+        active_leads = total_broker_leads - len(won_leads) - len(lost_leads)
+
+        conversion_rate = round((len(won_leads) / total_broker_leads * 100), 1) if total_broker_leads > 0 else 0
+
+        total_accrued = commissions.aggregate(v=Sum("commission_amount"))["v"] or ZERO
+        total_paid = commissions.aggregate(v=Sum("paid_amount"))["v"] or ZERO
+        pending_payable = round2(D(total_accrued) - D(total_paid))
+        total_invoiced_broker = commissions.aggregate(v=Sum("invoice_amount"))["v"] or ZERO
+
+        # Per-broker performance breakdown
+        broker_stats = []
+        for b in brokers:
+            b_leads = [
+                l for l in broker_leads
+                if str((l.custom_values or {}).get("broker_id") or (l.custom_values or {}).get("brokerId")) == str(b.id)
+            ]
+            b_won = [
+                l for l in b_leads
+                if l.stage and (l.stage.name.lower() in ("won", "converted", "closed won") or not l.stage.is_lost and l.converted_at is not None)
+            ]
+            b_comms = commissions.filter(broker=b)
+            b_accrued = b_comms.aggregate(v=Sum("commission_amount"))["v"] or ZERO
+            b_paid = b_comms.aggregate(v=Sum("paid_amount"))["v"] or ZERO
+            b_invoiced = b_comms.aggregate(v=Sum("invoice_amount"))["v"] or ZERO
+
+            broker_stats.append({
+                "brokerId": str(b.id),
+                "brokerCode": b.code,
+                "brokerName": b.name,
+                "phone": b.phone or "-",
+                "commissionType": b.commission_type,
+                "defaultValue": str(b.default_value),
+                "totalLeads": len(b_leads),
+                "convertedLeads": len(b_won),
+                "conversionRate": round((len(b_won) / len(b_leads) * 100), 1) if len(b_leads) > 0 else 0,
+                "invoicedValue": str(round2(b_invoiced)),
+                "accruedCommission": str(round2(b_accrued)),
+                "paidCommission": str(round2(b_paid)),
+                "pendingBalance": str(round2(D(b_accrued) - D(b_paid))),
+            })
+
+        return Response({
+            "totalBrokers": brokers.count(),
+            "totalBrokerLeads": total_broker_leads,
+            "activeLeads": active_leads,
+            "wonLeads": len(won_leads),
+            "lostLeads": len(lost_leads),
+            "conversionRate": conversion_rate,
+            "totalInvoicedBroker": str(round2(total_invoiced_broker)),
+            "totalAccrued": str(round2(total_accrued)),
+            "totalPaid": str(round2(total_paid)),
+            "pendingPayable": str(round2(pending_payable)),
+            "brokerStats": broker_stats,
         })
 
 

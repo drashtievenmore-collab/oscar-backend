@@ -4637,7 +4637,11 @@ class LotTakaRegisterView(APIView):
             linked_grns = list(GoodsReceipt.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(po_q).values_list("id", "grn_number"))
             grn_ids = [g[0] for g in linked_grns]
             grn_nums = [g[1] for g in linked_grns if g[1]]
-            qs = qs.filter(Q(source_document_id__in=grn_ids) | Q(source_document_number__in=grn_nums))
+            qs = qs.filter(
+                Q(source_document_id__in=grn_ids)
+                | Q(source_document_number__in=grn_nums)
+                | Q(source_document_number__iexact=str(po_filter))
+            )
 
         if search_query:
             qs = qs.filter(

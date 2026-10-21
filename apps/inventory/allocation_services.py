@@ -81,6 +81,187 @@ def allocatable_lots(client_id, *, item_id=None, fabric_quality_id=None):
     return result
 
 
+def fabric_stock_summary(client_id, *, project=None, item_id=None, fabric_quality_id=None):
+    """Fabric-wise summary and drill-down takas for Available Grey Stock.
+
+    Groups grey fabric stock by fabric identity (item, quality, design, shade).
+    Computes reconciled physical, QC-passed, QC-hold, rejected, reserved,
+    usable, project-allocated, and balance quantities. Excludes QC-hold and
+    rejected stock from usable allocations and avoids double-counting reservations.
+    """
+    qs = (
+        LotTaka.objects.filter(
+            client_id=client_id,
+            deleted_at__isnull=True,
+            available_quantity__gt=0,
+        )
+        .select_related("item", "location", "fabric_quality", "design", "shade", "supplier")
+        .order_by("item__name", "received_date", "lot_number", "taka_number")
+    )
+    if item_id:
+        qs = qs.filter(item_id=item_id)
+    if fabric_quality_id:
+        qs = qs.filter(fabric_quality_id=fabric_quality_id)
+    lots = list(qs)
+
+    mine_by_lot = {}
+    if project:
+        active_allocations = project_allocations(client_id, project)
+        for a in active_allocations:
+            mine_by_lot[a.lot_taka_id] = mine_by_lot.get(a.lot_taka_id, ZERO) + a.quantity
+
+        existing_lot_ids = {lot.id for lot in lots}
+        missing_ids = [a.lot_taka_id for a in active_allocations if a.lot_taka_id not in existing_lot_ids]
+        if missing_ids:
+            extra_lots = list(
+                LotTaka.objects.filter(client_id=client_id, id__in=missing_ids)
+                .select_related("item", "location", "fabric_quality", "design", "shade", "supplier")
+            )
+            lots.extend(extra_lots)
+
+    allocated_map = allocated_quantities(client_id, [lot.id for lot in lots])
+    fabrics_map = {}
+    lots_data = []
+
+    for lot in lots:
+        quality = (
+            (lot.fabric_quality.name if lot.fabric_quality else None)
+            or (lot.item.fabric_quality if lot.item else None)
+            or "Standard"
+        )
+        design = (
+            (lot.design.name if lot.design else None)
+            or (lot.item.fabric_design if lot.item else None)
+            or "—"
+        )
+        shade = (
+            (lot.shade.name if lot.shade else None)
+            or (lot.item.fabric_color if lot.item else None)
+            or "—"
+        )
+        uom = lot.uom or (lot.item.uom if lot.item else "Meters")
+        fabric_name = lot.item.name if lot.item else "Fabric"
+        fabric_key = f"{lot.item_id}_{quality}_{design}_{shade}"
+
+        is_passed = (
+            (lot.qc_status in ALLOCATABLE_QC_STATUSES)
+            and (lot.status not in NON_ALLOCATABLE_STATUSES)
+            and (not (lot.location and lot.location.code in BLOCKED_LOCATION_CODES))
+        )
+        is_rejected = (
+            (lot.qc_status in ("Rejected", "Reject"))
+            or (lot.status == LotTaka.STATUS_REJECT)
+        )
+        is_hold = (not is_passed) and (not is_rejected)
+        is_allocatable = is_passed
+
+        physical = D(lot.available_quantity)
+        total_taken = allocated_map.get(lot.id, ZERO)
+        mine = mine_by_lot.get(lot.id, ZERO)
+        reserved_others = max(ZERO, total_taken - mine)
+
+        if is_allocatable:
+            usable = round4(max(ZERO, physical - reserved_others))
+            balance = round4(max(ZERO, usable - mine))
+        else:
+            usable = ZERO
+            balance = ZERO
+
+        if mine > ZERO:
+            status_label = "Selected"
+        elif not is_allocatable:
+            status_label = "QC Hold" if is_hold else ("Rejected" if is_rejected else "Unavailable")
+        else:
+            status_label = "Available"
+
+        lot_dict = {
+            "id": str(lot.id),
+            "lotTakaId": str(lot.id),
+            "fabricKey": fabric_key,
+            "fabricQuality": quality,
+            "fabricName": fabric_name,
+            "design": design,
+            "shade": shade,
+            "takaId": lot.taka_id,
+            "lotNumber": lot.lot_number,
+            "takaNumber": lot.taka_number,
+            "location": lot.location.name if lot.location else None,
+            "uom": uom,
+            "totalStock": float(physical),
+            "reserved": float(reserved_others),
+            "usable": float(usable),
+            "allocateQty": float(mine),
+            "balance": float(balance),
+            "status": status_label,
+            "qcStatus": lot.qc_status or ("Passed" if is_passed else "Pending"),
+            "isAllocatable": is_allocatable,
+            "supplier": lot.supplier.name if lot.supplier else None,
+            "receivedDate": str(lot.received_date) if lot.received_date else None,
+        }
+        lots_data.append(lot_dict)
+
+        if fabric_key not in fabrics_map:
+            fabrics_map[fabric_key] = {
+                "fabricKey": fabric_key,
+                "itemId": str(lot.item_id),
+                "fabricName": fabric_name,
+                "fabricQuality": quality,
+                "design": design,
+                "shade": shade,
+                "uom": uom,
+                "_physical": ZERO,
+                "_passed": ZERO,
+                "_hold": ZERO,
+                "_rejected": ZERO,
+                "_reserved": ZERO,
+                "_usable": ZERO,
+                "_allocated": ZERO,
+                "_balance": ZERO,
+                "takasCount": 0,
+                "_lot_numbers": set(),
+            }
+
+        fg = fabrics_map[fabric_key]
+        fg["_physical"] += physical
+        fg["takasCount"] += 1
+        fg["_lot_numbers"].add(lot.lot_number)
+
+        if is_passed:
+            fg["_passed"] += physical
+            fg["_reserved"] += reserved_others
+            fg["_usable"] += usable
+            fg["_allocated"] += mine
+            fg["_balance"] += balance
+        elif is_rejected:
+            fg["_rejected"] += physical
+        else:
+            fg["_hold"] += physical
+
+    fabrics_list = []
+    for fg in fabrics_map.values():
+        fabrics_list.append({
+            "fabricKey": fg["fabricKey"],
+            "itemId": fg["itemId"],
+            "fabricName": fg["fabricName"],
+            "fabricQuality": fg["fabricQuality"],
+            "design": fg["design"],
+            "shade": fg["shade"],
+            "uom": fg["uom"],
+            "physicalStock": float(fg["_physical"]),
+            "qcPassedStock": float(fg["_passed"]),
+            "qcHoldStock": float(fg["_hold"]),
+            "rejectedStock": float(fg["_rejected"]),
+            "reservedStock": float(fg["_reserved"]),
+            "usableStock": float(fg["_usable"]),
+            "allocatedToProject": float(fg["_allocated"]),
+            "balanceStock": float(fg["_balance"]),
+            "takasCount": fg["takasCount"],
+            "lotsCount": len(fg["_lot_numbers"]),
+        })
+
+    return fabrics_list, lots_data
+
+
 def _assert_allocatable(lot):
     if lot.qc_status not in ALLOCATABLE_QC_STATUSES:
         raise BusinessRuleViolation(
@@ -260,14 +441,9 @@ def set_project_lot_allocation(*, client_id, project, lot_taka_id, target_qty, u
     current = round4(sum((D(row.quantity) for row in current_rows), ZERO))
     if target_qty == current:
         return current
-    if target_qty > current:
-        allocate_to_project(
-            client_id=client_id, project=project, lot_taka_id=lot_taka_id,
-            quantity=target_qty - current, user=user, remarks=remarks,
-        )
-        return target_qty
+    # Consolidate: release older active rows and allocate exact target_qty in a single clean row
     for row in current_rows:
-        release_allocation(client_id=client_id, allocation_id=row.id, user=user, remarks=remarks or "Allocation reduced")
+        release_allocation(client_id=client_id, allocation_id=row.id, user=user, remarks=remarks or "Allocation updated")
     if target_qty > ZERO:
         allocate_to_project(
             client_id=client_id, project=project, lot_taka_id=lot_taka_id,

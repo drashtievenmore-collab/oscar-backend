@@ -34,7 +34,15 @@ class MeUserSerializer(BaseModelSerializer):
         fields = [
             "id", "name", "email", "phone", "avatar", "employeeId", "role",
             "department", "location", "reportingManager", "status", "lastLogin",
+            "is_superuser",
         ]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["roleCode"] = instance.role.code if instance.role_id else None
+        data["isSuperuser"] = bool(instance.is_superuser)
+        data["is_superuser"] = bool(instance.is_superuser)
+        return data
 
     def get_employeeId(self, user):
         return user.employee.employee_code if user.employee_id else None

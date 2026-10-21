@@ -243,7 +243,10 @@ class User(AbstractBaseUser, PermissionsMixin, AuditedModel):
 
     # -- permissions -------------------------------------------------------
     def effective_permissions(self):
-        """Role grants union user grants minus user denies (db.md §2.2)."""
+        if self.is_superuser:
+            all_perms = set(Permission.objects.values_list("id", flat=True))
+            all_perms.add("*")
+            return all_perms
         granted = set()
         if self.role_id:
             granted |= set(

@@ -133,6 +133,7 @@ class LeadSerializer(BaseModelSerializer):
     conversionReference = serializers.CharField(source="conversion_reference", read_only=True)
     customerId = serializers.CharField(source="party.id", read_only=True)
     customerName = serializers.CharField(source="party.name", read_only=True)
+    customValues = serializers.JSONField(source="custom_values", required=False)
 
     class Meta:
         model = Lead
@@ -144,7 +145,7 @@ class LeadSerializer(BaseModelSerializer):
             "customerId", "customerName",
             "convertedAt", "convertedByName", "conversionSource",
             "conversionReference",
-            "lost_reason", "custom_values",
+            "lost_reason", "custom_values", "customValues",
             "productsCount", "sourcesCount", "filesCount", "openTasksCount",
             "deliveryChallansCount",
             "salesInvoicesCount",

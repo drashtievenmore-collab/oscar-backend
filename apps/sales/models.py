@@ -706,6 +706,7 @@ class BrokerCommission(TenantModel, LegacyIdMixin):
     COMMISSION_TYPES = [
         ("percent", "percent"),
         ("per_meter", "per_meter"),
+        ("per_taka", "per_taka"),
         ("fixed", "fixed"),
     ]
     BASIS_CHOICES = [
