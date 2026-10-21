@@ -444,7 +444,7 @@ def sync_project_pipeline_stages(project):
                 deliv = SupplierDelivery.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(
                     Q(supplier_challan_no__icontains=project.code) | Q(remarks__icontains=project.code)
                 ).first()
-            if deliv and deliv.status in ("Delivered", "Partially Delivered"):
+            if deliv and deliv.status == "Delivered" and (shortage_qty <= Decimal("0") or Decimal(str(deliv.dispatched_qty or 0)) >= shortage_qty):
                 status = "Completed"
                 pct = 100
                 quantities["good"] = float(deliv.dispatched_qty or 0)
@@ -457,9 +457,9 @@ def sync_project_pipeline_stages(project):
                 }
             elif deliv:
                 status = "In Progress"
-                pct = 50
+                pct = min(99, int(round((float(deliv.dispatched_qty or 0) / float(shortage_qty)) * 100))) if shortage_qty > Decimal("0") else 50
                 quantities["good"] = float(deliv.dispatched_qty or 0)
-                remarks = f"{deliv.delivery_number} {deliv.status}"
+                remarks = f"{deliv.delivery_number} {deliv.status} ({float(deliv.dispatched_qty or 0):,} M)"
                 document = {
                     "type": "SupplierDelivery",
                     "number": deliv.delivery_number,
@@ -491,9 +491,18 @@ def sync_project_pipeline_stages(project):
                 rec_lines = grn.lines.all()
                 total_rec = sum((Decimal(str(l.received_qty or 0)) for l in rec_lines), Decimal("0"))
                 quantities["good"] = float(total_rec)
-                status = "Completed"
-                pct = 100
-                remarks = f"GRN {grn.grn_number} received ({float(total_rec):,} M)"
+                if shortage_qty > Decimal("0") and total_rec >= shortage_qty:
+                    status = "Completed"
+                    pct = 100
+                    remarks = f"GRN {grn.grn_number} fully received ({float(total_rec):,} M)"
+                elif total_rec > Decimal("0"):
+                    status = "In Progress"
+                    pct = min(99, int(round((float(total_rec) / float(shortage_qty)) * 100))) if shortage_qty > Decimal("0") else 50
+                    remarks = f"GRN {grn.grn_number} partially received ({float(total_rec):,} M / {float(shortage_qty):,} M)"
+                else:
+                    status = "In Progress"
+                    pct = 20
+                    remarks = f"GRN {grn.grn_number} pending intake"
                 document = {
                     "type": "GoodsReceipt",
                     "number": grn.grn_number,
@@ -527,9 +536,14 @@ def sync_project_pipeline_stages(project):
             if taka_count > 0:
                 taka_qty = sum((Decimal(str(t.received_quantity or 0)) for t in takas), Decimal("0"))
                 quantities["good"] = float(taka_qty)
-                status = "Completed"
-                pct = 100
-                remarks = f"{taka_count} takas created ({float(taka_qty):,} M)"
+                if shortage_qty > Decimal("0") and taka_qty >= shortage_qty:
+                    status = "Completed"
+                    pct = 100
+                    remarks = f"{taka_count} takas created ({float(taka_qty):,} M)"
+                else:
+                    status = "In Progress"
+                    pct = min(99, int(round((float(taka_qty) / float(shortage_qty)) * 100))) if shortage_qty > Decimal("0") else 50
+                    remarks = f"{taka_count} takas partially created ({float(taka_qty):,} M / {float(shortage_qty):,} M)"
                 document = {
                     "type": "LotTaka",
                     "number": f"{taka_count} Takas",
@@ -550,39 +564,40 @@ def sync_project_pipeline_stages(project):
         elif name in ("Grey QC", "Grey Fabric QC"):
             from apps.purchase.models import GoodsReceipt
             quantities["input"] = float(shortage_qty)
-            grn = None
-            if po:
-                grn = GoodsReceipt.objects.filter(client_id=client_id, purchase_order=po, deleted_at__isnull=True).first()
-            if grn and grn.qc_status in ("Approved", "Partially Approved"):
-                status = "Completed"
-                pct = 100
-                remarks = f"QC {grn.qc_status}"
-                document = {
-                    "type": "QCInspection",
-                    "number": grn.qc_status,
-                    "url": "/inventory/qc",
-                    "label": f"QC: {grn.qc_status}",
-                }
-            elif grn and grn.qc_status in ("Pending", "On Hold"):
-                status = "In Progress"
-                pct = 50
-                remarks = f"QC {grn.qc_status}"
-                document = {
-                    "type": "QCInspection",
-                    "number": grn.qc_status,
-                    "url": "/inventory/qc",
-                    "label": f"QC: {grn.qc_status}",
-                }
-            elif grn and grn.qc_status in ("Rejected", "Rework"):
-                status = "Delayed"
-                pct = 30
-                remarks = f"QC {grn.qc_status}"
-                document = {
-                    "type": "QCInspection",
-                    "number": grn.qc_status,
-                    "url": "/inventory/qc",
-                    "label": f"QC: {grn.qc_status}",
-                }
+            grns = GoodsReceipt.objects.filter(client_id=client_id, purchase_order=po, deleted_at__isnull=True) if po else GoodsReceipt.objects.none()
+            if grns.exists():
+                all_approved = not grns.exclude(qc_status__in=("Approved", "Partially Approved")).exists()
+                any_pending = grns.filter(qc_status__in=("Pending", "On Hold")).exists()
+                if all_approved:
+                    status = "Completed"
+                    pct = 100
+                    remarks = "QC completed for all receipts"
+                    document = {
+                        "type": "QCInspection",
+                        "number": "Approved",
+                        "url": "/inventory/qc",
+                        "label": "QC: Approved",
+                    }
+                elif any_pending:
+                    status = "In Progress"
+                    pct = 50
+                    remarks = "QC in progress"
+                    document = {
+                        "type": "QCInspection",
+                        "number": "In Progress",
+                        "url": "/inventory/qc",
+                        "label": "QC: In Progress",
+                    }
+                else:
+                    status = "Delayed"
+                    pct = 30
+                    remarks = "QC Rejected / Rework"
+                    document = {
+                        "type": "QCInspection",
+                        "number": "Rejected",
+                        "url": "/inventory/qc",
+                        "label": "QC: Rejected",
+                    }
             else:
                 status = "Pending"
                 pct = 0
@@ -597,10 +612,8 @@ def sync_project_pipeline_stages(project):
         elif name == "Grey Stock Updated":
             from apps.purchase.models import GoodsReceipt
             quantities["input"] = float(shortage_qty)
-            grn = None
-            if po:
-                grn = GoodsReceipt.objects.filter(client_id=client_id, purchase_order=po, deleted_at__isnull=True).first()
-            if grn and grn.qc_status in ("Approved", "Partially Approved"):
+            grns = GoodsReceipt.objects.filter(client_id=client_id, purchase_order=po, deleted_at__isnull=True) if po else GoodsReceipt.objects.none()
+            if grns.exists() and not grns.exclude(qc_status__in=("Approved", "Partially Approved")).exists():
                 status = "Completed"
                 pct = 100
                 remarks = "Warehouse grey stock updated"

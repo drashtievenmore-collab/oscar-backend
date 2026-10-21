@@ -181,6 +181,7 @@ class UserSerializer(BaseModelSerializer):
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
+        data["roleCode"] = instance.role.code if instance.role_id else None
         # An HR-sourced account inherits the employee photo and joining date
         # when nobody set them on the user itself -- the user row is a login
         # identity, the employee row is the person.

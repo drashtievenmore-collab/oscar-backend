@@ -63,6 +63,12 @@ class ApprovalRequestViewSet(viewsets.ModelViewSet):
         req = decide_approval_request(pk, request.user, "Rejected", comments=comments)
         return Response(ApprovalRequestSerializer(req).data)
 
+    @action(detail=True, methods=["post"], url_path="return-for-correction")
+    def return_correction(self, request, pk=None):
+        comments = request.data.get("comments", "")
+        req = decide_approval_request(pk, request.user, "Returned", comments=comments)
+        return Response(ApprovalRequestSerializer(req).data)
+
     @action(detail=False, methods=["get"])
     def badge(self, request):
         """Return count of pending requests for the current user."""

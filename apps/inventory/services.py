@@ -585,6 +585,12 @@ def relocate_lot(*, client_id, lot, quantity, to_location_id, out_type, in_type,
         target.stock_movement = in_movement
     if qc_status:
         target.qc_status = qc_status
+        if qc_status in ("Passed", "Approved"):
+            target.status = "Active"
+        elif qc_status in ("Rejected", "Reject"):
+            target.status = "Reject"
+        elif qc_status == "On Hold":
+            target.status = "QC Hold"
     target.save()
     return target, [out_movement, in_movement]
 
@@ -628,6 +634,12 @@ def receive_into_lot(*, client_id, lot, quantity, location_id, type, reference_t
         target.stock_movement = movement
     if qc_status:
         target.qc_status = qc_status
+        if qc_status in ("Passed", "Approved"):
+            target.status = "Active"
+        elif qc_status in ("Rejected", "Reject"):
+            target.status = "Reject"
+        elif qc_status == "On Hold":
+            target.status = "QC Hold"
     target.save()
     return target, movement
 

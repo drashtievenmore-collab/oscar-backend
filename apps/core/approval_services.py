@@ -143,13 +143,15 @@ def assert_not_pending_approval(client_id, document_type, document_id, action_de
 
 @transaction.atomic
 def decide_approval_request(request_id, user, decision, comments=""):
-    """Approve or Reject an existing ApprovalRequest."""
     req = ApprovalRequest.objects.select_for_update().get(id=request_id)
     if req.status != "Pending":
         raise ValidationError(f"Approval request is already in '{req.status}' state.")
 
-    if decision not in ("Approved", "Rejected"):
-        raise ValidationError("Decision must be either 'Approved' or 'Rejected'.")
+    if decision not in ("Approved", "Rejected", "Returned"):
+        raise ValidationError("Decision must be either 'Approved', 'Rejected', or 'Returned'.")
+
+    if req.requested_by_id and req.requested_by_id == getattr(user, "id", None) and not getattr(user, "is_superuser", False):
+        raise ValidationError("Separation of duties violation: You cannot decide an approval request you initiated.")
 
     req.status = decision
     req.decided_by = user
@@ -157,7 +159,21 @@ def decide_approval_request(request_id, user, decision, comments=""):
     req.comments = comments
     req.save()
 
-    # Record in audit log
+    if req.document_type == "purchase_order":
+        try:
+            from apps.purchase.models import PurchaseOrder
+            po = PurchaseOrder.objects.filter(client_id=req.client_id, id=req.document_id).first()
+            if po and po.status == "Pending Approval":
+                if decision == "Approved":
+                    po.status = "Approved"
+                elif decision == "Rejected":
+                    po.status = "Rejected"
+                elif decision == "Returned":
+                    po.status = "Draft"
+                po.save(update_fields=["status", "updated_at"])
+        except Exception:
+            pass
+
     record_audit(
         client=req.client,
         actor=user,
@@ -168,7 +184,6 @@ def decide_approval_request(request_id, user, decision, comments=""):
         comments=comments,
     )
 
-    # Notify requester
     if req.requested_by:
         Notification.objects.create(
             client_id=req.client_id,
@@ -192,4 +207,9 @@ def approve_request(req_or_id, approver, comments=""):
 def reject_request(req_or_id, approver, comments=""):
     req_id = getattr(req_or_id, "id", req_or_id)
     return decide_approval_request(req_id, approver, "Rejected", comments=comments)
+
+
+def return_request(req_or_id, approver, comments=""):
+    req_id = getattr(req_or_id, "id", req_or_id)
+    return decide_approval_request(req_id, approver, "Returned", comments=comments)
 

@@ -2985,14 +2985,13 @@ class QCCompleteInspectionView(APIView):
         from . import qc as qc_service
 
         client_id = request.client_id
-        receipt_id = request.data.get("receiptId")
+        receipt_id = request.data.get("receiptId") or request.data.get("grnId")
         bill_id = request.data.get("billId")
+        taka_items = request.data.get("takas")
         quantities = qc_service.parse_quantities(request.data)
 
         with transaction.atomic():
             if not receipt_id and bill_id:
-                # Goods not yet received on the bill: receive them (into QC
-                # Hold) first, then apply this result to the new GRN.
                 from apps.purchase import services as purchase_services
 
                 bill = PurchaseBill.objects.filter(
@@ -3030,6 +3029,7 @@ class QCCompleteInspectionView(APIView):
                 receipt,
                 quantities=quantities,
                 line_quantities=request.data.get("lines") or None,
+                taka_dispositions=taka_items,
                 user=request.user,
                 remarks=request.data.get("remarks") or None,
                 job_work_order=jwo,
@@ -3043,6 +3043,12 @@ class QCCompleteInspectionView(APIView):
                 f"QC recorded for {receipt.grn_number}: {result['verdict']}."
                 + ("" if result["stockPosted"] else " This receipt has no stock posted, so no stock moved.")
             ),
+            "goodQty": float(result["quantities"].get("good", 0)),
+            "secondQty": float(result["quantities"].get("second", 0)),
+            "reprocessQty": float(result["quantities"].get("reprocess", 0)),
+            "rejectQty": float(result["quantities"].get("reject", 0)),
+            "holdQty": float(result["quantities"].get("hold", 0)),
+            "postedStock": float(result["quantities"].get("good", 0)),
             **{f"{k}Qty": float(v) for k, v in result["quantities"].items()},
         })
 
@@ -4547,7 +4553,7 @@ class LotTakaRegisterView(APIView):
 
         # Base queryset
         qs = LotTaka.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related(
-            "item", "supplier", "location"
+            "item", "supplier", "location", "created_by", "updated_by"
         )
 
         # Filters
@@ -4750,6 +4756,12 @@ class LotTakaRegisterView(APIView):
                 "grnNo": lt.source_document_number or "-",
                 "sourceDocumentId": str(lt.source_document_id) if lt.source_document_id else None,
                 "stockMovements": mov_list,
+                "createdBy": (lt.created_by.name or lt.created_by.email) if lt.created_by else None,
+                "createdById": str(lt.created_by_id) if lt.created_by_id else None,
+                "updatedBy": (lt.updated_by.name or lt.updated_by.email) if lt.updated_by else None,
+                "updatedById": str(lt.updated_by_id) if lt.updated_by_id else None,
+                "createdAt": lt.created_at.isoformat() if lt.created_at else None,
+                "updatedAt": lt.updated_at.isoformat() if lt.updated_at else None,
             })
 
         # Summary Cards -- quantities are only summed in one unit.
@@ -4866,13 +4878,21 @@ class LotTakaRegisterView(APIView):
             grn = None
             if grn_id:
                 from apps.purchase.models import GoodsReceipt
-                grn = GoodsReceipt.objects.filter(client_id=client_id, id=grn_id, deleted_at__isnull=True).first()
+                grn = GoodsReceipt.objects.select_for_update().filter(client_id=client_id, id=grn_id, deleted_at__isnull=True).first()
             if not grn and data.get("grnNo"):
                 from apps.purchase.models import GoodsReceipt
-                grn = GoodsReceipt.objects.filter(client_id=client_id, grn_number__iexact=data.get("grnNo"), deleted_at__isnull=True).first()
+                grn = GoodsReceipt.objects.select_for_update().filter(client_id=client_id, grn_number__iexact=data.get("grnNo"), deleted_at__isnull=True).first()
 
+            submitted_rolls = set()
             total_taka_meters = ZERO
             for idx, t in enumerate(takas_list):
+                r_num = str(t.get("takaRoll") or t.get("takaNumber") or (idx + 1)).strip()
+                if r_num in submitted_rolls:
+                    field_errors[f"takas_{idx}"] = [f"Duplicate roll number '{r_num}' in submission."]
+                submitted_rolls.add(r_num)
+                t_code = t.get("takaId") or t.get("barcode")
+                if t_code and LotTaka.objects.filter(Q(taka_id=t_code) | Q(barcode=t_code), client_id=client_id, deleted_at__isnull=True).exists():
+                    field_errors[f"takas_{idx}"] = [f"Taka identifier or barcode '{t_code}' already exists."]
                 t_qty = round4(D(str(t.get("receivedQty") or t.get("qty") or 0)))
                 if t_qty <= ZERO:
                     field_errors[f"takas_{idx}"] = [f"Taka #{t.get('takaRoll') or idx+1} quantity must be greater than 0."]
@@ -4971,7 +4991,7 @@ class LotTakaRegisterView(APIView):
                     available_quantity=ZERO,
                     uom=item.uom,
                     qc_status=qc_status,
-                    status="Active",
+                    status="QC Hold" if qc_status == "Pending" else "Active",
                     barcode=taka_code,
                     tag_status="Pending",
                     print_count=0,
@@ -4984,6 +5004,7 @@ class LotTakaRegisterView(APIView):
                     tags=data.get("tags") or [],
                     image_url=data.get("imageUrl") or None,
                     created_by=request.user,
+                    updated_by=request.user,
                 )
 
                 mov = stock.post_movement(
@@ -5016,11 +5037,12 @@ class LotTakaRegisterView(APIView):
                 })
 
             from apps.core.audit import record_audit
+            user_label = getattr(request.user, "name", None) or getattr(request.user, "email", "Authorized Manager")
             record_audit(
                 client=client_id, actor=request.user, action="create", entity_type="LotTaka",
                 entity_id=created_takas[0]["id"] if created_takas else None,
                 entity_label=lot_no,
-                description=f"Created {len(created_takas)} takas for Lot {lot_no} from GRN {grn.grn_number if grn else 'manual'}",
+                description=f"Created {len(created_takas)} takas ({total_taka_meters} m) for Lot {lot_no} by {user_label} from GRN {grn.grn_number if grn else 'manual'}",
             )
             return Response({
                 "success": True,
@@ -5172,11 +5194,18 @@ class LotTakaRegisterView(APIView):
             raise ValidationFailed("Lot record not found.", field_errors={"id": ["Not found."]})
 
         data = request.data
+        is_manager = bool(
+            getattr(request.user, "is_staff", False)
+            or getattr(request.user, "is_superuser", False)
+            or request.user.has_perm("inventory.adjust_stock")
+            or (getattr(request.user, "role", None) and any(m in request.user.role.name.lower() for m in ("manager", "admin", "lead")))
+        )
         disallowed = [
-            f for f in ("locationId", "location", "rate", "status", "qcStatus", "qc_status",
-                        "availableQty", "receivedQty")
+            f for f in ("locationId", "location", "rate", "status", "qcStatus", "qc_status", "availableQty")
             if f in data
         ]
+        if not is_manager and ("receivedQty" in data or "qty" in data):
+            disallowed.append("receivedQty")
         if disallowed:
             raise ValidationFailed(
                 f"Direct edits to {', '.join(disallowed)} are not allowed. "
@@ -5186,7 +5215,15 @@ class LotTakaRegisterView(APIView):
             )
 
         before = {"remarks": lot_taka.remarks, "rollWeight": str(lot_taka.roll_weight),
-                  "width": str(lot_taka.width), "gsm": str(lot_taka.gsm)}
+                  "width": str(lot_taka.width), "gsm": str(lot_taka.gsm), "receivedQty": str(lot_taka.received_quantity)}
+        if is_manager and ("receivedQty" in data or "qty" in data):
+            new_qty = round4(D(str(data.get("receivedQty") or data.get("qty"))))
+            if new_qty <= ZERO:
+                raise ValidationFailed("Taka quantity must be greater than zero.", field_errors={"receivedQty": ["Must be > 0."]})
+            lot_taka.received_quantity = new_qty
+            if lot_taka.stock_movement:
+                lot_taka.stock_movement.quantity = new_qty
+                lot_taka.stock_movement.save(update_fields=["quantity", "updated_at"])
         if "remarks" in data:
             lot_taka.remarks = data["remarks"]
         if "tags" in data:

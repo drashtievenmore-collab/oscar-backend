@@ -1413,7 +1413,7 @@ def create_standalone_grn(
         )
         po_line = None
         if po_line_id:
-            po_line = PurchaseOrderLine.objects.filter(
+            po_line = PurchaseOrderLine.objects.select_for_update().filter(
                 pk=po_line_id, client_id=client.id, deleted_at__isnull=True
             ).first()
             if po_line is not None and po is not None and po_line.purchase_order_id != po.id:
@@ -1423,6 +1423,10 @@ def create_standalone_grn(
                 )
             if po_line and not item_id:
                 item_id = po_line.item_id
+        elif po is not None and item_id:
+            po_line = PurchaseOrderLine.objects.select_for_update().filter(
+                purchase_order=po, item_id=item_id, deleted_at__isnull=True
+            ).first()
 
         item = Item.objects.filter(pk=item_id, client_id=client.id, deleted_at__isnull=True).first()
         if not item:
@@ -1438,6 +1442,15 @@ def create_standalone_grn(
                 f"Line {idx + 1}: Received quantity must be greater than zero.",
                 field_errors={"lines": [f"Line {idx + 1}: received_qty must be > 0."]},
             )
+
+        if po_line:
+            ordered_qty = round4(po_line.qty)
+            remaining_po_qty = max(ZERO, round4(D(po_line.qty) - D(po_line.received_qty)))
+            if received_qty > remaining_po_qty + Decimal("0.001"):
+                raise ValidationFailed(
+                    f"Line {idx + 1}: Received quantity ({received_qty} m) exceeds remaining unreceived PO quantity ({remaining_po_qty} m) for {po.po_number}.",
+                    field_errors={"lines": [f"Line {idx + 1}: cannot receive {received_qty} m; only {remaining_po_qty} m remaining on {po.po_number}."]},
+                )
 
         unit_cost = round4(D(line_data.get("unit_cost") or line_data.get("unitCost") or line_data.get("rate") or (po_line.rate if po_line else item.cost_price) or 0))
         fabric_width = line_data.get("fabric_width") or line_data.get("fabricWidth")

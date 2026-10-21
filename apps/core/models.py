@@ -604,6 +604,7 @@ class ApprovalRequest(TenantModel):
         ("Pending", "Pending"),
         ("Approved", "Approved"),
         ("Rejected", "Rejected"),
+        ("Returned", "Returned for Correction"),
         ("Cancelled", "Cancelled"),
     ]
 

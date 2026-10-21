@@ -96,15 +96,102 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
     @action(detail=True, methods=["post"], url_path="submit-for-approval")
     @transaction.atomic
     def submit_for_approval(self, request, pk=None):
-        """Draft -> Pending Approval."""
-        return self._transition(request, from_statuses=("Draft", "Issued"), to_status="Pending Approval")
+        from apps.core import approval_services
+        res = self._transition(request, from_statuses=("Draft", "Issued"), to_status="Pending Approval")
+        order = PurchaseOrder.objects.get(pk=self.get_object().pk)
+        approval_services.create_approval_request(
+            client_id=order.client_id,
+            document_type="purchase_order",
+            document_id=order.id,
+            document_number=order.po_number,
+            requested_by=request.user,
+            reason=request.data.get("remarks") or f"Purchase Order {order.po_number} submitted for approval",
+            force=True,
+        )
+        return res
 
     @action(detail=True, methods=["post"])
     @transaction.atomic
     def approve(self, request, pk=None):
-        """Pending Approval -> Approved. Only an approved PO can be received
-        (grey stock) or start production (Vendor A)."""
-        return self._transition(request, from_statuses=("Pending Approval",), to_status="Approved")
+        from apps.core.permissions import require_permission, PermissionDenied
+        from apps.core.models import ApprovalRequest
+        order = PurchaseOrder.objects.select_for_update().get(pk=self.get_object().pk)
+        if order.created_by_id and order.created_by_id == getattr(request.user, "id", None) and not getattr(request.user, "is_superuser", False):
+            raise PermissionDenied(
+                "Separation of duties: You cannot approve a Purchase Order you created.",
+                code="SELF_APPROVAL_NOT_PERMITTED",
+            )
+        try:
+            require_permission(request.user, "approve_purchase_order")
+        except PermissionDenied:
+            require_permission(request.user, "manage_approvals", message="You do not have permission to approve Purchase Orders.")
+
+        res = self._transition(request, from_statuses=("Pending Approval",), to_status="Approved")
+        appr_req = ApprovalRequest.objects.filter(
+            client_id=order.client_id,
+            document_type="purchase_order",
+            document_id=str(order.id),
+            status="Pending",
+        ).first()
+        if appr_req:
+            appr_req.status = "Approved"
+            appr_req.decided_by = request.user
+            appr_req.decided_at = timezone.now()
+            appr_req.comments = request.data.get("remarks", "")
+            appr_req.save(update_fields=["status", "decided_by", "decided_at", "comments"])
+        return res
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def reject(self, request, pk=None):
+        from apps.core.permissions import require_permission, PermissionDenied
+        from apps.core.models import ApprovalRequest
+        try:
+            require_permission(request.user, "approve_purchase_order")
+        except PermissionDenied:
+            require_permission(request.user, "manage_approvals", message="You do not have permission to reject Purchase Orders.")
+
+        order = PurchaseOrder.objects.select_for_update().get(pk=self.get_object().pk)
+        res = self._transition(request, from_statuses=("Pending Approval",), to_status="Rejected")
+        appr_req = ApprovalRequest.objects.filter(
+            client_id=order.client_id,
+            document_type="purchase_order",
+            document_id=str(order.id),
+            status="Pending",
+        ).first()
+        if appr_req:
+            appr_req.status = "Rejected"
+            appr_req.decided_by = request.user
+            appr_req.decided_at = timezone.now()
+            appr_req.comments = request.data.get("remarks", "")
+            appr_req.save(update_fields=["status", "decided_by", "decided_at", "comments"])
+        return res
+
+    @action(detail=True, methods=["post"], url_path="return-for-correction")
+    @transaction.atomic
+    def return_correction(self, request, pk=None):
+        from apps.core.permissions import require_permission, PermissionDenied
+        from apps.core.models import ApprovalRequest
+        try:
+            require_permission(request.user, "approve_purchase_order")
+        except PermissionDenied:
+            require_permission(request.user, "manage_approvals", message="You do not have permission to return Purchase Orders for correction.")
+
+        order = PurchaseOrder.objects.select_for_update().get(pk=self.get_object().pk)
+        res = self._transition(request, from_statuses=("Pending Approval",), to_status="Draft")
+        appr_req = ApprovalRequest.objects.filter(
+            client_id=order.client_id,
+            document_type="purchase_order",
+            document_id=str(order.id),
+            status="Pending",
+        ).first()
+        if appr_req:
+            appr_req.status = "Returned"
+            appr_req.decided_by = request.user
+            appr_req.decided_at = timezone.now()
+            appr_req.comments = request.data.get("remarks", "")
+            appr_req.save(update_fields=["status", "decided_by", "decided_at", "comments"])
+        return res
 
     def _transition(self, request, *, from_statuses, to_status):
         order = PurchaseOrder.objects.select_for_update().get(pk=self.get_object().pk)

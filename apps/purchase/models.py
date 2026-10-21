@@ -25,7 +25,7 @@ from apps.core.models import LegacyIdMixin, TenantModel
 # following so the UI can track the real lifecycle (Draft -> Pending Approval
 # -> Approved -> In Production -> Partially/Fully Received -> Cancelled).
 PO_STATUSES = [
-    "Draft", "Issued", "Pending", "Received", "Cancelled",
+    "Draft", "Issued", "Pending", "Received", "Cancelled", "Rejected",
     "Pending Approval", "Approved", "In Production",
     "Partially Received", "Fully Received",
 ]
