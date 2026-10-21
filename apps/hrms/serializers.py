@@ -254,7 +254,7 @@ class RegularizationSerializer(BaseModelSerializer):
             "requestedCheckOut", "requestedStatus", "reason", "status",
             "approver", "decided_at", "remark", "created_at",
         ]
-        read_only_fields = ["status", "approver", "decided_at", "created_at"]
+        read_only_fields = ["approver", "decided_at", "created_at"]
 
 
 # ---------------------------------------------------------------------------

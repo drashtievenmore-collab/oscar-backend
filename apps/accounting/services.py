@@ -42,6 +42,13 @@ SYSTEM_ACCOUNTS = [
     ("stock_adjustment", "5400", "Stock Adjustment", "Expense", None),
     ("salary_expense", "5500", "Salaries and Wages", "Expense", None),
     ("general_expense", "5900", "General Expenses", "Expense", None),
+    ("pf_payable", "2310", "Provident Fund Payable", "Liability", "Payable"),
+    ("esi_payable", "2320", "ESIC Payable", "Liability", "Payable"),
+    ("pt_payable", "2330", "Professional Tax Payable", "Liability", "Payable"),
+    ("tds_payable", "2340", "TDS on Salaries Payable", "Liability", "Payable"),
+    ("employee_advances", "1150", "Employee Advances", "Asset", "Receivable"),
+    ("incentive_expense", "5510", "Sales Incentives & Commissions", "Expense", None),
+    ("incentive_payable", "2350", "Incentive Payable", "Liability", "Payable"),
 ]
 
 
@@ -70,6 +77,23 @@ def system_account(client_id, system_key):
         client_id=client_id, system_key=system_key, deleted_at__isnull=True
     ).first()
     if account is None:
+        spec = next((item for item in SYSTEM_ACCOUNTS if item[0] == system_key), None)
+        if spec:
+            from apps.core.models import Client
+            client = Client.objects.filter(id=client_id).first()
+            if client:
+                account, _ = Account.objects.get_or_create(
+                    client=client,
+                    system_key=system_key,
+                    defaults={
+                        "code": spec[1],
+                        "name": spec[2],
+                        "type": spec[3],
+                        "subtype": spec[4],
+                        "is_system": True,
+                    },
+                )
+                return account
         raise BusinessRuleViolation(
             "The chart of accounts is not set up for this workspace.",
             code="MISSING_SYSTEM_ACCOUNT",
@@ -632,27 +656,125 @@ def post_stock_adjustment(movement, *, user=None, value=None):
 
 
 def post_payroll(payslip, *, user=None):
-    """Dr Salary expense | Cr Bank (api.md §11.4 -- payroll is the one HRMS
-    table that touches accounts)."""
+    """Itemized payroll posting (api.md §11.4).
+    Debits Salary Expense (Gross), Credits Bank (Net), Credits PF/ESI/PT/TDS/Advances.
+    """
     client_id = payslip.client_id
     account = (
         payslip.bank_account.account
         if payslip.bank_account_id
         else system_account(client_id, "cash")
     )
-    amount = round2(payslip.paid_amount or payslip.net_payable)
+    net_amount = round2(payslip.paid_amount or payslip.net_payable)
+    advance_amount = round2(payslip.advance_recovery or Decimal("0.00"))
+
+    components = list(payslip.components.all())
+    deduction_map = {
+        "pf": "pf_payable",
+        "provident fund": "pf_payable",
+        "epf": "pf_payable",
+        "esi": "esi_payable",
+        "esic": "esi_payable",
+        "pt": "pt_payable",
+        "professional tax": "pt_payable",
+        "tds": "tds_payable",
+        "tax": "tds_payable",
+        "income tax": "tds_payable",
+    }
+
+    statutory_credits = []
+    total_statutory = Decimal("0.00")
+
+    for comp in components:
+        if comp.kind == "deduction":
+            c_name = comp.name.lower().strip()
+            mapped_key = None
+            for pattern, sys_key in deduction_map.items():
+                if pattern in c_name:
+                    mapped_key = sys_key
+                    break
+            comp_amt = round2(comp.amount)
+            if comp_amt > Decimal("0.00"):
+                target_key = mapped_key or "salary_payable"
+                statutory_credits.append(
+                    credit(system_account(client_id, target_key), comp_amt, description=comp.name)
+                )
+                total_statutory += comp_amt
+
+    if advance_amount > Decimal("0.00"):
+        statutory_credits.append(
+            credit(system_account(client_id, "employee_advances"), advance_amount, description="Advance Recovery")
+        )
+        total_statutory += advance_amount
+
+    gross_salary = net_amount + total_statutory
+
+    if statutory_credits:
+        postings = [
+            debit(system_account(client_id, "salary_expense"), gross_salary),
+            credit(account, net_amount),
+        ] + statutory_credits
+    else:
+        postings = [
+            debit(system_account(client_id, "salary_expense"), net_amount),
+            credit(account, net_amount),
+        ]
+
     return post_entry(
         client=payslip.client,
-        postings=[
-            debit(system_account(client_id, "salary_expense"), amount),
-            credit(account, amount),
-        ],
+        postings=postings,
         entry_date=payslip.payment_date or timezone.localdate(),
         narration=f"Salary {payslip.period_month:%b %Y} - {payslip.employee.name}",
         source_document_type="Payslip",
         source_document_id=payslip.id,
         user=user,
     )
+
+
+def post_salary_advance(advance, *, bank_account=None, user=None):
+    """Dr Employee Advances | Cr Bank/Cash"""
+    client_id = advance.client_id
+    account = (
+        bank_account.account
+        if bank_account and getattr(bank_account, "account", None)
+        else system_account(client_id, "bank")
+    )
+    amount = round2(advance.amount)
+    return post_entry(
+        client=advance.client,
+        postings=[
+            debit(system_account(client_id, "employee_advances"), amount),
+            credit(account, amount),
+        ],
+        entry_date=advance.request_date or timezone.localdate(),
+        narration=f"Salary Advance Disbursed - {advance.employee.name} (Ref: {advance.advance_code or advance.id})",
+        source_document_type="SalaryAdvance",
+        source_document_id=advance.id,
+        user=user,
+    )
+
+
+def post_incentive_accrual(accrual, *, user=None):
+    """Dr Sales Incentive Expense | Cr Incentive Payable"""
+    client_id = accrual.client_id
+    amount = round2(accrual.calculated_incentive)
+    if amount <= Decimal("0.00"):
+        return None
+    entry = post_entry(
+        client=accrual.client,
+        postings=[
+            debit(system_account(client_id, "incentive_expense"), amount),
+            credit(system_account(client_id, "incentive_payable"), amount),
+        ],
+        entry_date=accrual.end_date or timezone.localdate(),
+        narration=f"Sales Incentive Accrual {accrual.period_name} - {accrual.employee.name}",
+        source_document_type="SalespersonIncentiveAccrual",
+        source_document_id=accrual.id,
+        user=user,
+    )
+    accrual.journal_entry = entry
+    accrual.save(update_fields=["journal_entry", "updated_at"])
+    return entry
 
 
 # ---------------------------------------------------------------------------

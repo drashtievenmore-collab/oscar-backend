@@ -128,6 +128,11 @@ def mark_attendance(
     remark=None, source="manual", user=None, leave_request=None,
 ):
     """Upsert against the one-row-per-employee-per-day constraint (db.md §11.2)."""
+    if getattr(employee, "status", None) in ["Resigned", "Terminated", "Exited"]:
+        raise Conflict(
+            f"Cannot mark attendance for {employee.status.lower()} employee {employee.name}.",
+            code=Codes.ALREADY_DONE,
+        )
     derived_status, hours = derive_attendance(
         client.id if hasattr(client, "id") else client,
         check_in=check_in,
@@ -543,15 +548,35 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
         )
         paid_leaves = Decimal(counts.get("On Leave", 0))
 
+        from apps.hrms.models import SalespersonIncentiveAccrual
+        incentive_accruals = list(
+            SalespersonIncentiveAccrual.objects.filter(
+                client=client,
+                employee=employee,
+                status="APPROVED",
+                paid_at__isnull=True,
+                end_date__lte=month_end,
+                deleted_at__isnull=True,
+            )
+        )
+        incentive_total = sum((round2(acc.calculated_incentive) for acc in incentive_accruals), ZERO)
+
         advance = _pending_advance_instalment(employee)
         result = compute_salary(
             standard_salary=employee.standard_salary,
             total_days=total_days,
             attended_days=attended,
             paid_leaves=paid_leaves,
+            additional_earnings=incentive_total,
             advance=advance,
         )
         split = split_structure(employee.salary_structure, result["earnedSalary"])
+        if incentive_total > ZERO:
+            split["components"].append({
+                "name": "Sales Incentive Payout",
+                "kind": "earning",
+                "amount": incentive_total,
+            })
 
         payslip, created = Payslip.objects.update_or_create(
             payroll_run=run,
@@ -568,7 +593,7 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
                 "basic": split["basic"],
                 "hra": split["hra"],
                 "allowances": split["allowances"],
-                "additional_earnings": ZERO,
+                "additional_earnings": incentive_total,
                 "deductions": ZERO,
                 "advance_recovery": advance,
                 "net_payable": result["netPayable"],
@@ -827,3 +852,23 @@ def assert_no_manager_cycle(employee, manager_id):
         current = (
             Employee.objects.filter(pk=current).values_list("manager_id", flat=True).first()
         )
+
+
+def process_employee_separation(employee, *, separation_type="Resigned", last_working_day=None, user=None):
+    """Lifecycle hook for Resignation/Termination.
+    Updates employee status, deactivates login User, and audits.
+    """
+    from apps.accounts.models import User
+    status_label = "Terminated" if str(separation_type).lower() == "terminated" else "Resigned"
+    employee.status = status_label
+    employee.save(update_fields=["status", "updated_at"])
+
+    # Deactivate linked user login account
+    if employee.email:
+        User.objects.filter(
+            client_id=employee.client_id,
+            email__iexact=str(employee.email).strip(),
+            deleted_at__isnull=True,
+        ).update(is_active=False, status="Inactive", updated_at=timezone.now())
+
+    return employee

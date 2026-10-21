@@ -293,10 +293,16 @@ class EmployeeViewSet(TenantModelViewSet):
                 if value and getattr(existing, field) != value:
                     setattr(existing, field, value)
                     updates.append(field)
-            if existing.status != "Active" or not existing.is_active:
-                existing.status = "Active"
-                existing.is_active = True
-                updates.extend(["status", "is_active"])
+            if employee.status in ["Resigned", "Terminated", "Exited", "Suspended"]:
+                if existing.is_active or existing.status != "Inactive":
+                    existing.is_active = False
+                    existing.status = "Inactive"
+                    updates.extend(["status", "is_active"])
+            else:
+                if existing.status != "Active" or not existing.is_active:
+                    existing.status = "Active"
+                    existing.is_active = True
+                    updates.extend(["status", "is_active"])
             if updates:
                 updates.append("updated_at")
                 existing.save(update_fields=list(dict.fromkeys(updates)))
@@ -674,31 +680,75 @@ class RegularizationViewSet(TenantModelViewSet):
 
     @transaction.atomic
     def perform_update(self, serializer):
-        """``{ approved, remark }`` -- an approval rewrites the attendance row."""
+        """``{ approved, remark, status }`` -- an approval rewrites the attendance row."""
         approved = self.request.data.get("approved")
-        instance = serializer.instance
+        status_val = self.request.data.get("status")
+        if approved is True or (status_val and str(status_val).lower() == "approved"):
+            is_approved = True
+        elif approved is False or (status_val and str(status_val).lower() == "rejected"):
+            is_approved = False
+        else:
+            is_approved = None
+
         row = super().perform_update(serializer)
 
-        if approved is not None:
-            row.status = "Approved" if approved else "Rejected"
-            row.approver = self.request.user
+        if is_approved is not None:
+            row.status = "Approved" if is_approved else "Rejected"
+            row.approver = self.request.user if getattr(self.request.user, "is_authenticated", False) else None
             row.decided_at = timezone.now()
             row.remark = self.request.data.get("remark", row.remark)
             row.save(update_fields=["status", "approver", "decided_at", "remark", "updated_at"])
 
-            if approved:
+            if is_approved:
+                req_status = row.requested_status or "Present"
                 services.mark_attendance(
-                    client=self.request.user.client,
+                    client=getattr(self.request.user, "client", None) or row.client,
                     employee=row.employee,
                     work_date=row.work_date,
                     check_in=row.requested_check_in,
                     check_out=row.requested_check_out,
-                    status=row.requested_status,
-                    remark=f"Regularized: {row.reason}",
+                    status=req_status,
+                    remark=f"Regularized: {row.reason or ''}".strip(),
                     source="regularization",
-                    user=self.request.user,
+                    user=self.request.user if getattr(self.request.user, "is_authenticated", False) else None,
                 )
         return row
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def approve(self, request, pk=None):
+        row = self.get_object()
+        row.status = "Approved"
+        row.approver = request.user if getattr(request.user, "is_authenticated", False) else None
+        row.decided_at = timezone.now()
+        row.remark = request.data.get("remark", row.remark)
+        row.save(update_fields=["status", "approver", "decided_at", "remark", "updated_at"])
+
+        req_status = row.requested_status or "Present"
+        services.mark_attendance(
+            client=row.client,
+            employee=row.employee,
+            work_date=row.work_date,
+            check_in=row.requested_check_in,
+            check_out=row.requested_check_out,
+            status=req_status,
+            remark=f"Regularized: {row.reason or ''}".strip(),
+            source="regularization",
+            user=request.user if getattr(request.user, "is_authenticated", False) else None,
+        )
+        self.write_audit("approve", row, description="Attendance regularization approved")
+        return Response(self.get_serializer(row).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        row = self.get_object()
+        row.status = "Rejected"
+        row.approver = request.user if getattr(request.user, "is_authenticated", False) else None
+        row.decided_at = timezone.now()
+        row.remark = request.data.get("remark", row.remark)
+        row.save(update_fields=["status", "approver", "decided_at", "remark", "updated_at"])
+        self.write_audit("reject", row, description="Attendance regularization rejected")
+        return Response(self.get_serializer(row).data)
 
 
 class FlexibilityPolicyView(APIView):
@@ -1909,6 +1959,20 @@ class TerminationViewSet(TenantModelViewSet):
     filter_map = {"employeeId": "employee_id"}
     permission_map = {"read": ["view_staff"], "write": ["delete_staff"]}
 
+    def perform_create(self, serializer):
+        row = super().perform_create(serializer)
+        services.process_employee_separation(
+            row.employee, separation_type="Terminated", last_working_day=row.last_working_day, user=self.request.user
+        )
+        return row
+
+    def perform_update(self, serializer):
+        row = super().perform_update(serializer)
+        services.process_employee_separation(
+            row.employee, separation_type="Terminated", last_working_day=row.last_working_day, user=self.request.user
+        )
+        return row
+
 
 class ResignationViewSet(TenantModelViewSet):
     queryset = Resignation.objects.select_related("employee").prefetch_related("checklist")
@@ -1919,6 +1983,14 @@ class ResignationViewSet(TenantModelViewSet):
     ordering = ["-submitted_on"]
     filter_map = {"employeeId": "employee_id"}
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_update(self, serializer):
+        row = super().perform_update(serializer)
+        if row.status in ["Approved", "Completed", "Exited"]:
+            services.process_employee_separation(
+                row.employee, separation_type="Resigned", last_working_day=row.last_working_day, user=self.request.user
+            )
+        return row
 
 
 class ComplaintViewSet(TenantModelViewSet):
@@ -2024,22 +2096,24 @@ class SalespersonIncentiveViewSet(TenantModelViewSet):
         results = []
         for sp in salespersons_qs:
             scheme = schemes.filter(applicable_salespersons=sp).first() or schemes.first()
-            # Sum gross sales
+            # Sum gross sales using correct DocumentHeader doc_date and total
             invoices = SalesInvoice.objects.filter(
                 client_id=request.client_id,
-                salesperson=sp,
-                invoice_date__range=[start_date, end_date],
+                doc_date__range=[start_date, end_date],
+            ).filter(
+                Q(salesperson_fk=sp) | Q(salesperson__iexact=sp.name)
             ).exclude(status__in=["Cancelled", "Draft"])
 
-            gross_sales = sum((inv.total_amount for inv in invoices), ZERO)
+            gross_sales = sum((inv.total for inv in invoices), ZERO)
 
-            # Sum sales returns
+            # Sum sales returns using doc_date and total
             returns = SalesReturn.objects.filter(
                 client_id=request.client_id,
-                salesperson=sp,
-                return_date__range=[start_date, end_date],
+                doc_date__range=[start_date, end_date],
+            ).filter(
+                Q(salesperson_fk=sp) | Q(salesperson__iexact=sp.name)
             ).exclude(status__in=["Cancelled", "Draft"])
-            returns_deduction = sum((ret.total_amount for ret in returns), ZERO)
+            returns_deduction = sum((ret.total for ret in returns), ZERO)
 
             net_sales = max(ZERO, gross_sales - returns_deduction)
 
@@ -2058,6 +2132,19 @@ class SalespersonIncentiveViewSet(TenantModelViewSet):
                             applicable_rate = D(str(slab.get("rate_percent", 0)))
                     calculated_incentive = round2(net_sales * (applicable_rate / D("100.0")))
 
+            # Check for bad-debt overdue invoices (>90 days past due date with balance due)
+            overdue_cutoff = timezone.localdate() - timedelta(days=90)
+            overdue_invoices = SalesInvoice.objects.filter(
+                client_id=request.client_id,
+                due_date__lte=overdue_cutoff,
+            ).filter(
+                Q(salesperson_fk=sp) | Q(salesperson__iexact=sp.name)
+            ).exclude(status__in=["Cancelled", "Draft"])
+
+            has_bad_debt = any(inv.balance_due > ZERO for inv in overdue_invoices)
+            initial_status = "HELD" if has_bad_debt else "ACCRUED"
+            hold_reason = "Commercial policy hold: overdue unpaid customer invoices (>90 days)" if has_bad_debt else ""
+
             accrual, _ = SalespersonIncentiveAccrual.objects.update_or_create(
                 client_id=request.client_id,
                 employee=sp,
@@ -2072,7 +2159,8 @@ class SalespersonIncentiveViewSet(TenantModelViewSet):
                     "net_eligible_sales": net_sales,
                     "applicable_rate": applicable_rate,
                     "calculated_incentive": calculated_incentive,
-                    "status": "ACCRUED",
+                    "status": initial_status,
+                    "hold_reason": hold_reason,
                 },
             )
             results.append(SalespersonIncentiveAccrualSerializer(accrual).data)
@@ -2097,11 +2185,16 @@ class SalespersonIncentiveViewSet(TenantModelViewSet):
 
     @action(detail=True, methods=["POST"], url_path="approve")
     def approve_payout(self, request, pk=None):
+        from apps.accounting.services import post_incentive_accrual
         accrual = self.get_object()
         accrual.status = "APPROVED"
         accrual.approved_by = request.user
         accrual.approved_at = timezone.now()
         accrual.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
+        try:
+            post_incentive_accrual(accrual, user=request.user)
+        except Exception:
+            pass
         return Response(self.get_serializer(accrual).data)
 
     @action(detail=True, methods=["POST"], url_path="mark-paid")
@@ -2118,6 +2211,26 @@ class AgencyProductionMonitoringViewSet(TenantModelViewSet):
     serializer_class = DailyAgencyProductionEntrySerializer
     audit_entity_type = "DailyAgencyProductionEntry"
     permission_classes = [HasModulePermission]
+
+    def perform_create(self, serializer):
+        entry = super().perform_create(serializer)
+        if entry.job_work_order:
+            jwo = entry.job_work_order
+            updates = []
+            if not jwo.assigned_employee_id:
+                jwo.assigned_employee = entry.employee
+                updates.append("assigned_employee")
+            if jwo.planned_qty and entry.cumulative_produced >= jwo.planned_qty:
+                if jwo.status not in ["Completed", "Closed"]:
+                    jwo.status = "QC Pending"
+                    updates.append("status")
+            elif entry.produced_quantity > ZERO and jwo.status == "Sent":
+                jwo.status = "In-Process"
+                updates.append("status")
+            if updates:
+                updates.append("updated_at")
+                jwo.save(update_fields=updates)
+        return entry
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
 
     @action(detail=False, methods=["GET"], url_path="today-entries")
