@@ -16,6 +16,7 @@ from django.contrib.postgres.fields import DateTimeRangeField, RangeOperators
 from django.db import models
 from django.db.models import Func, Q, F, Value
 
+from django.utils import timezone
 from apps.core.models import LegacyIdMixin, TenantModel
 
 EMPLOYEE_STATUSES = [
@@ -1370,3 +1371,302 @@ class Complaint(TenantModel):
     class Meta:
         db_table = "hrms_complaints"
         ordering = ["-created_at"]
+
+
+# =============================================================================
+# Textile Operational HR & Commercial Business Models (Oscar Letter Pad Scope)
+# =============================================================================
+
+class SalespersonIncentiveScheme(TenantModel, LegacyIdMixin):
+    """Salesperson Incentive Scheme configuration (Oscar Scope §12)."""
+
+    BASIS_CHOICES = [
+        ("INVOICE_VALUE", "Invoice Value"),
+        ("COLLECTIONS", "Collections"),
+        ("GROSS_PROFIT", "Gross Profit"),
+    ]
+    FREQUENCY_CHOICES = [
+        ("MONTHLY", "Monthly"),
+        ("QUARTERLY", "Quarterly"),
+        ("CUSTOM_3_MONTH", "Custom 3 Month"),
+    ]
+    SLAB_TYPES = [
+        ("FLAT", "Flat %"),
+        ("TIERED", "Tiered Slabs"),
+    ]
+
+    name = models.TextField()
+    code = models.TextField(null=True, blank=True)
+    basis = models.TextField(choices=BASIS_CHOICES, default="INVOICE_VALUE")
+    frequency = models.TextField(choices=FREQUENCY_CHOICES, default="QUARTERLY")
+    slab_type = models.TextField(choices=SLAB_TYPES, default="TIERED")
+    slabs = models.JSONField(default=list, blank=True)
+    flat_rate_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    deduct_returns = models.BooleanField(default=True)
+    deduct_bad_debts = models.BooleanField(default=True)
+    is_active = models.BooleanField(default=True)
+    description = models.TextField(null=True, blank=True)
+    applicable_salespersons = models.ManyToManyField(
+        Employee, blank=True, related_name="incentive_schemes"
+    )
+
+    class Meta:
+        db_table = "hrms_salesperson_incentive_schemes"
+        ordering = ["name"]
+
+    def __str__(self):
+        return f"{self.name} ({self.frequency})"
+
+
+class SalespersonIncentiveAccrual(TenantModel, LegacyIdMixin):
+    """Periodic incentive accrual calculation per salesperson (Oscar Scope §12)."""
+
+    STATUSES = [
+        ("DRAFT", "Draft"),
+        ("ACCRUED", "Accrued"),
+        ("APPROVED", "Approved"),
+        ("PAID", "Paid"),
+        ("HELD", "Held"),
+    ]
+
+    employee = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, related_name="incentive_accruals"
+    )
+    scheme = models.ForeignKey(
+        SalespersonIncentiveScheme,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="accruals",
+    )
+    period_type = models.TextField(
+        choices=SalespersonIncentiveScheme.FREQUENCY_CHOICES, default="QUARTERLY"
+    )
+    period_name = models.TextField()
+    start_date = models.DateField()
+    end_date = models.DateField()
+    gross_sales = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    returns_deduction = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    net_eligible_sales = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    applicable_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    calculated_incentive = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    status = models.TextField(choices=STATUSES, default="DRAFT")
+    hold_reason = models.TextField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
+    journal_entry = models.ForeignKey(
+        "accounting.JournalEntry", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    notes = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "hrms_salesperson_incentive_accruals"
+        ordering = ["-start_date", "-created_at"]
+
+    def __str__(self):
+        return f"{self.employee.name} - {self.period_name}: Rs. {self.calculated_incentive} ({self.status})"
+
+
+class AgencyStaffAssignment(TenantModel, LegacyIdMixin):
+    """Maps salaried employees to external weaving/dyeing/jobwork agencies (Oscar Scope §02, §05, §15)."""
+
+    employee = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, related_name="agency_assignments"
+    )
+    agency = models.ForeignKey(
+        "masters.Agency", on_delete=models.CASCADE, related_name="staff_assignments"
+    )
+    assigned_from = models.DateField(default=timezone.localdate)
+    assigned_to = models.DateField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    role_description = models.TextField(null=True, blank=True)
+    active_orders = models.ManyToManyField(
+        "jobwork.JobWorkOrder", blank=True, related_name="agency_staff_assignments"
+    )
+
+    class Meta:
+        db_table = "hrms_agency_staff_assignments"
+        ordering = ["-assigned_from"]
+
+    def __str__(self):
+        return f"{self.employee.name} -> {self.agency.name}"
+
+
+class DailyAgencyProductionEntry(TenantModel, LegacyIdMixin):
+    """Daily field monitoring records entered by salaried production staff (Oscar Scope §02, §05, §15)."""
+
+    employee = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, related_name="daily_production_entries"
+    )
+    agency = models.ForeignKey(
+        "masters.Agency", on_delete=models.CASCADE, related_name="daily_production_entries"
+    )
+    job_work_order = models.ForeignKey(
+        "jobwork.JobWorkOrder",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="daily_production_entries",
+    )
+    work_instruction_no = models.TextField(null=True, blank=True)
+    entry_date = models.DateField(default=timezone.localdate)
+    opening_pending_quantity = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    produced_quantity = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    good_quantity = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    reject_quantity = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    reprocess_quantity = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    cumulative_produced = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    remaining_balance = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    uom = models.TextField(default="Meter")
+    inspection_photo = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    photo_url = models.TextField(null=True, blank=True)
+    remarks = models.TextField(null=True, blank=True)
+    entered_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "hrms_daily_agency_production_entries"
+        ordering = ["-entry_date", "-entered_at"]
+
+    def __str__(self):
+        return f"{self.entry_date} - {self.agency.name}: {self.produced_quantity} {self.uom}"
+
+
+class PayrollCommercialAllocation(TenantModel, LegacyIdMixin):
+    """Links monthly payroll costs and incentive payouts to commercial leakage and lot costing (Oscar Scope §09, §11, §15)."""
+
+    ROLES = [
+        ("SALES", "Salesperson"),
+        ("PRODUCTION", "Production Staff"),
+        ("MANAGEMENT", "Management"),
+        ("OTHER", "Other"),
+    ]
+
+    period_name = models.TextField()
+    start_date = models.DateField()
+    end_date = models.DateField()
+    employee = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, related_name="commercial_allocations"
+    )
+    role_type = models.TextField(choices=ROLES, default="SALES")
+    salary_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    incentive_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    total_payroll_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    allocated_lot_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    lot_number = models.TextField(null=True, blank=True)
+    allocated_sales_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    notes = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "hrms_payroll_commercial_allocations"
+        ordering = ["-start_date", "-created_at"]
+
+    def __str__(self):
+        return f"{self.employee.name} - {self.period_name}: Rs. {self.total_payroll_cost}"
+
+
+class BrokerCommissionRecord(TenantModel, LegacyIdMixin):
+    """Broker Commission integration record (Oscar Scope §12, §14)."""
+
+    STATUSES = [
+        ("Accrued", "Accrued"),
+        ("Approved", "Approved"),
+        ("Payable", "Payable"),
+        ("Paid", "Paid"),
+        ("Hold", "Hold"),
+        ("Cancelled", "Cancelled"),
+    ]
+    COMMISSION_TYPES = [
+        ("percent", "percent"),
+        ("per_meter", "per_meter"),
+        ("per_taka", "per_taka"),
+        ("fixed", "fixed"),
+    ]
+    BASIS_CHOICES = [
+        ("INVOICE", "Invoice Value"),
+        ("COLLECTION", "Collection Value"),
+        ("QUANTITY", "Meters / Taka"),
+    ]
+
+    commission_number = models.TextField(null=True, blank=True, db_index=True)
+    broker = models.ForeignKey(
+        "masters.Broker", on_delete=models.PROTECT, related_name="hrms_commissions"
+    )
+    invoice = models.ForeignKey(
+        "sales.SalesInvoice",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="hrms_broker_commissions",
+    )
+    party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    salesperson = models.ForeignKey(
+        Employee, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    invoice_date = models.DateField(default=timezone.localdate)
+    invoice_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    commission_basis = models.TextField(choices=BASIS_CHOICES, default="INVOICE")
+    commission_type = models.TextField(choices=COMMISSION_TYPES, default="percent")
+    rate = models.DecimalField(max_digits=9, decimal_places=2, default=0)
+    commission_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    paid_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    status = models.TextField(choices=STATUSES, default="Accrued")
+    approved_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "hrms_broker_commission_records"
+        ordering = ["-invoice_date", "-created_at"]
+
+    def __str__(self):
+        return f"{self.commission_number or self.id} ({self.status}): Rs. {self.commission_amount}"
+
+
+# =============================================================================
+# COMMENTED OUT PER OSCAR LETTER PAD SCOPE (Kept for reference, do not delete):
+# =============================================================================
+
+# --- Live GPS / IP Attendance Punch Clock ---
+# class AttendancePunch(TenantModel, LegacyIdMixin):
+#     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="punches")
+#     punch_type = models.TextField(choices=[("IN", "Punch In"), ("OUT", "Punch Out")])
+#     punch_time = models.DateTimeField(default=timezone.now)
+#     ip_address = models.GenericIPAddressField(null=True, blank=True)
+#     latitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
+#     longitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
+#     early_departure_reason = models.TextField(blank=True, default="")
+#     is_regularized = models.BooleanField(default=False)
+
+# --- Company Meetings & Conference Room Booking ---
+# class MeetingRoom(TenantModel, LegacyIdMixin):
+#     name = models.CharField(max_digits=100)
+#     capacity = models.PositiveIntegerField(default=10)
+#     amenities = models.JSONField(default=list, blank=True)
+#     is_available = models.BooleanField(default=True)
+#
+# class CompanyMeeting(TenantModel, LegacyIdMixin):
+#     title = models.CharField(max_digits=200)
+#     room = models.ForeignKey(MeetingRoom, on_delete=models.SET_NULL, null=True, blank=True)
+#     organizer = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="organized_meetings")
+#     start_time = models.DateTimeField()
+#     end_time = models.DateTimeField()
+#     attendees = models.ManyToManyField(Employee, related_name="attended_meetings")
+#     mom_notes = models.TextField(blank=True, default="")
+
+# --- Recruitment & ATS (Applicant Tracking) (Retained in DB schema for backwards compatibility) ---
+# class Job(TenantModel, LegacyIdMixin): ...
+# class Candidate(TenantModel, LegacyIdMixin): ...
+# class Application(TenantModel, LegacyIdMixin): ...
+# class Interview(TenantModel, LegacyIdMixin): ...
+# class Offer(TenantModel, LegacyIdMixin): ...
+# class OnboardingTask(TenantModel, LegacyIdMixin): ...

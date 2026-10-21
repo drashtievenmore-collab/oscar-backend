@@ -75,6 +75,12 @@ from .models import (
     Training,
     TrainingParticipant,
     WorkingDay,
+    SalespersonIncentiveScheme,
+    SalespersonIncentiveAccrual,
+    AgencyStaffAssignment,
+    DailyAgencyProductionEntry,
+    PayrollCommercialAllocation,
+    BrokerCommissionRecord,
 )
 from .serializers import (
     AppraisalCycleSerializer,
@@ -124,6 +130,12 @@ from .serializers import (
     TrainingParticipantSerializer,
     TrainingSerializer,
     WorkingDaySerializer,
+    SalespersonIncentiveSchemeSerializer,
+    SalespersonIncentiveAccrualSerializer,
+    AgencyStaffAssignmentSerializer,
+    DailyAgencyProductionEntrySerializer,
+    PayrollCommercialAllocationSerializer,
+    BrokerCommissionRecordSerializer,
 )
 
 
@@ -1958,3 +1970,371 @@ class HrmsSettingsView(APIView):
             defaults={"value": request.data, "updated_by": request.user},
         )
         return Response(row.value)
+
+
+# =============================================================================
+# Textile Operational HR & Commercial ViewSets (Oscar Letter Pad Scope)
+# =============================================================================
+
+class SalespersonIncentiveSchemeViewSet(TenantModelViewSet):
+    queryset = SalespersonIncentiveScheme.objects.all()
+    serializer_class = SalespersonIncentiveSchemeSerializer
+    audit_entity_type = "SalespersonIncentiveScheme"
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+
+class SalespersonIncentiveViewSet(TenantModelViewSet):
+    queryset = SalespersonIncentiveAccrual.objects.select_related("employee", "scheme")
+    serializer_class = SalespersonIncentiveAccrualSerializer
+    audit_entity_type = "SalespersonIncentiveAccrual"
+    permission_classes = [HasModulePermission]
+    permission_map = {
+        "read": ["view_staff"],
+        "write": ["edit_staff"],
+        "approve": ["approve_payroll"],
+        "calculate_quarterly": ["edit_staff"],
+        "hold_payout": ["approve_payroll"],
+        "release_payout": ["approve_payroll"],
+    }
+
+    @action(detail=False, methods=["POST"], url_path="calculate-quarterly")
+    def calculate_quarterly(self, request):
+        from apps.sales.models import SalesInvoice, SalesReturn
+        import calendar
+        quarter = int(request.data.get("quarter", (timezone.localdate().month - 1) // 3 + 1))
+        year = int(request.data.get("year", timezone.localdate().year))
+        employee_id = request.data.get("employee_id")
+
+        start_month = (quarter - 1) * 3 + 1
+        end_month = quarter * 3
+        start_date = datetime(year, start_month, 1).date()
+        last_day = calendar.monthrange(year, end_month)[1]
+        end_date = datetime(year, end_month, last_day).date()
+        period_name = f"Q{quarter} {year}"
+
+        schemes = SalespersonIncentiveScheme.objects.filter(
+            client_id=request.client_id, is_active=True
+        ).prefetch_related("applicable_salespersons")
+
+        salespersons_qs = Employee.objects.filter(client_id=request.client_id, status="Active")
+        if employee_id:
+            salespersons_qs = salespersons_qs.filter(id=employee_id)
+
+        results = []
+        for sp in salespersons_qs:
+            scheme = schemes.filter(applicable_salespersons=sp).first() or schemes.first()
+            # Sum gross sales
+            invoices = SalesInvoice.objects.filter(
+                client_id=request.client_id,
+                salesperson=sp,
+                invoice_date__range=[start_date, end_date],
+            ).exclude(status__in=["Cancelled", "Draft"])
+
+            gross_sales = sum((inv.total_amount for inv in invoices), ZERO)
+
+            # Sum sales returns
+            returns = SalesReturn.objects.filter(
+                client_id=request.client_id,
+                salesperson=sp,
+                return_date__range=[start_date, end_date],
+            ).exclude(status__in=["Cancelled", "Draft"])
+            returns_deduction = sum((ret.total_amount for ret in returns), ZERO)
+
+            net_sales = max(ZERO, gross_sales - returns_deduction)
+
+            applicable_rate = D("0.0")
+            calculated_incentive = ZERO
+
+            if scheme:
+                if scheme.slab_type == "FLAT":
+                    applicable_rate = D(str(scheme.flat_rate_percent))
+                    calculated_incentive = round2(net_sales * (applicable_rate / D("100.0")))
+                else:
+                    slabs = scheme.slabs or []
+                    for slab in sorted(slabs, key=lambda s: float(s.get("min_amount", 0))):
+                        min_amt = D(str(slab.get("min_amount", 0)))
+                        if net_sales >= min_amt:
+                            applicable_rate = D(str(slab.get("rate_percent", 0)))
+                    calculated_incentive = round2(net_sales * (applicable_rate / D("100.0")))
+
+            accrual, _ = SalespersonIncentiveAccrual.objects.update_or_create(
+                client_id=request.client_id,
+                employee=sp,
+                period_name=period_name,
+                defaults={
+                    "scheme": scheme,
+                    "period_type": "QUARTERLY",
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "gross_sales": gross_sales,
+                    "returns_deduction": returns_deduction,
+                    "net_eligible_sales": net_sales,
+                    "applicable_rate": applicable_rate,
+                    "calculated_incentive": calculated_incentive,
+                    "status": "ACCRUED",
+                },
+            )
+            results.append(SalespersonIncentiveAccrualSerializer(accrual).data)
+
+        return Response({"period_name": period_name, "count": len(results), "accruals": results})
+
+    @action(detail=True, methods=["POST"], url_path="hold")
+    def hold_payout(self, request, pk=None):
+        accrual = self.get_object()
+        accrual.status = "HELD"
+        accrual.hold_reason = request.data.get("reason", "Management hold")
+        accrual.save(update_fields=["status", "hold_reason", "updated_at"])
+        return Response(self.get_serializer(accrual).data)
+
+    @action(detail=True, methods=["POST"], url_path="release")
+    def release_payout(self, request, pk=None):
+        accrual = self.get_object()
+        accrual.status = "ACCRUED"
+        accrual.hold_reason = ""
+        accrual.save(update_fields=["status", "hold_reason", "updated_at"])
+        return Response(self.get_serializer(accrual).data)
+
+    @action(detail=True, methods=["POST"], url_path="approve")
+    def approve_payout(self, request, pk=None):
+        accrual = self.get_object()
+        accrual.status = "APPROVED"
+        accrual.approved_by = request.user
+        accrual.approved_at = timezone.now()
+        accrual.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
+        return Response(self.get_serializer(accrual).data)
+
+    @action(detail=True, methods=["POST"], url_path="mark-paid")
+    def mark_paid(self, request, pk=None):
+        accrual = self.get_object()
+        accrual.status = "PAID"
+        accrual.paid_at = timezone.now()
+        accrual.save(update_fields=["status", "paid_at", "updated_at"])
+        return Response(self.get_serializer(accrual).data)
+
+
+class AgencyProductionMonitoringViewSet(TenantModelViewSet):
+    queryset = DailyAgencyProductionEntry.objects.select_related("employee", "agency", "job_work_order")
+    serializer_class = DailyAgencyProductionEntrySerializer
+    audit_entity_type = "DailyAgencyProductionEntry"
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    @action(detail=False, methods=["GET"], url_path="today-entries")
+    def today_entries(self, request):
+        today = timezone.localdate()
+        qs = self.get_queryset().filter(entry_date=today)
+        emp_id = request.query_params.get("employee")
+        if emp_id:
+            qs = qs.filter(employee_id=emp_id)
+        return Response(self.get_serializer(qs, many=True).data)
+
+    @action(detail=False, methods=["POST"], url_path="submit-daily-entry")
+    def submit_daily_entry(self, request):
+        data = request.data.copy()
+        emp = None
+        emp_id = data.get("employee") or data.get("employeeId")
+        if emp_id:
+            emp = Employee.objects.filter(client_id=request.client_id, id=emp_id).first()
+        if not emp:
+            emp = Employee.objects.filter(client_id=request.client_id, user=request.user).first()
+        if not emp:
+            emp = Employee.objects.filter(client_id=request.client_id).first()
+
+        agency_id = data.get("agency") or data.get("agencyId")
+        from apps.masters.models import Agency
+        agency = Agency.objects.filter(client_id=request.client_id, id=agency_id).first()
+        if not agency:
+            return Response({"error": "Agency not found"}, status=status.HTTP_400_BAD_REQUEST)
+
+        jwo_id = data.get("job_work_order") or data.get("jobWorkOrderId")
+        from apps.jobwork.models import JobWorkOrder
+        jwo = JobWorkOrder.objects.filter(client_id=request.client_id, id=jwo_id).first() if jwo_id else None
+
+        entry_date = data.get("entry_date") or timezone.localdate()
+        produced_qty = D(str(data.get("produced_quantity", 0)))
+        opening_qty = D(str(data.get("opening_pending_quantity", 0)))
+        good_qty = D(str(data.get("good_quantity", produced_qty)))
+        reject_qty = D(str(data.get("reject_quantity", 0)))
+        reprocess_qty = D(str(data.get("reprocess_quantity", 0)))
+
+        last_entry = DailyAgencyProductionEntry.objects.filter(
+            client_id=request.client_id,
+            agency=agency,
+            job_work_order=jwo,
+        ).order_by("-entry_date", "-entered_at").first()
+
+        cumulative = (last_entry.cumulative_produced if last_entry else ZERO) + produced_qty
+        remaining = max(ZERO, opening_qty - produced_qty)
+
+        entry = DailyAgencyProductionEntry.objects.create(
+            client_id=request.client_id,
+            employee=emp,
+            agency=agency,
+            job_work_order=jwo,
+            work_instruction_no=data.get("work_instruction_no", jwo.jwo_no if jwo else ""),
+            entry_date=entry_date,
+            opening_pending_quantity=opening_qty,
+            produced_quantity=produced_qty,
+            good_quantity=good_qty,
+            reject_quantity=reject_qty,
+            reprocess_quantity=reprocess_qty,
+            cumulative_produced=cumulative,
+            remaining_balance=remaining,
+            uom=data.get("uom", "Meter"),
+            photo_url=data.get("photo_url", ""),
+            remarks=data.get("remarks", ""),
+        )
+        return Response(self.get_serializer(entry).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["GET"], url_path="agency-summary")
+    def agency_summary(self, request):
+        from apps.masters.models import Agency
+        from django.db.models import Sum, Max
+        agencies = Agency.objects.filter(client_id=request.client_id, is_active=True)
+        summaries = []
+        for ag in agencies:
+            entries = DailyAgencyProductionEntry.objects.filter(client_id=request.client_id, agency=ag)
+            agg = entries.aggregate(
+                total_produced=Sum("produced_quantity"),
+                total_good=Sum("good_quantity"),
+                total_reject=Sum("reject_quantity"),
+                latest_date=Max("entry_date"),
+            )
+            latest_entry = entries.order_by("-entry_date", "-entered_at").first()
+            summaries.append({
+                "agency_id": str(ag.id),
+                "agency_name": ag.name,
+                "agency_code": ag.code,
+                "total_produced": float(agg["total_produced"] or 0),
+                "total_good": float(agg["total_good"] or 0),
+                "total_reject": float(agg["total_reject"] or 0),
+                "latest_entry_date": agg["latest_date"].isoformat() if agg["latest_date"] else None,
+                "remaining_balance": float(latest_entry.remaining_balance if latest_entry else 0),
+                "entry_count": entries.count(),
+            })
+        return Response(summaries)
+
+    @action(detail=False, methods=["GET", "POST"], url_path="assignments")
+    def assignments(self, request):
+        if request.method == "POST":
+            serializer = AgencyStaffAssignmentSerializer(data=request.data, context={"request": request})
+            serializer.is_valid(raise_exception=True)
+            instance = serializer.save(client_id=request.client_id)
+            return Response(AgencyStaffAssignmentSerializer(instance).data, status=status.HTTP_201_CREATED)
+        qs = AgencyStaffAssignment.objects.filter(client_id=request.client_id).select_related("employee", "agency")
+        return Response(AgencyStaffAssignmentSerializer(qs, many=True).data)
+
+
+class BrokerCommissionViewSet(TenantModelViewSet):
+    queryset = BrokerCommissionRecord.objects.select_related("broker", "invoice", "party", "salesperson")
+    serializer_class = BrokerCommissionRecordSerializer
+    audit_entity_type = "BrokerCommissionRecord"
+    permission_classes = [HasModulePermission]
+    permission_map = {
+        "read": ["view_staff"],
+        "write": ["edit_staff"],
+        "approve": ["approve_payroll"],
+        "mark_payable": ["edit_staff"],
+        "mark_paid": ["approve_payroll"],
+        "hold": ["edit_staff"],
+    }
+
+    @action(detail=True, methods=["POST"], url_path="approve")
+    def approve(self, request, pk=None):
+        item = self.get_object()
+        item.status = "Approved"
+        item.approved_by = request.user
+        item.approved_at = timezone.now()
+        item.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["POST"], url_path="mark-payable")
+    def mark_payable(self, request, pk=None):
+        item = self.get_object()
+        item.status = "Payable"
+        item.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["POST"], url_path="mark-paid")
+    def mark_paid(self, request, pk=None):
+        item = self.get_object()
+        item.status = "Paid"
+        item.paid_at = timezone.now()
+        item.paid_amount = item.commission_amount
+        item.save(update_fields=["status", "paid_at", "paid_amount", "updated_at"])
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["POST"], url_path="hold")
+    def hold(self, request, pk=None):
+        item = self.get_object()
+        item.status = "Hold"
+        item.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(item).data)
+
+
+class CommercialLeakageViewSet(TenantModelViewSet):
+    queryset = PayrollCommercialAllocation.objects.select_related("employee")
+    serializer_class = PayrollCommercialAllocationSerializer
+    audit_entity_type = "PayrollCommercialAllocation"
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    @action(detail=False, methods=["GET"], url_path="annual-summary")
+    def annual_summary(self, request):
+        from apps.sales.models import SalesInvoice, SalesReturn
+        from apps.sales.models import BrokerCommission as SalesBrokerCommission
+        year = int(request.query_params.get("year", timezone.localdate().year))
+        start_date = datetime(year, 1, 1).date()
+        end_date = datetime(year, 12, 31).date()
+
+        invoices = SalesInvoice.objects.filter(
+            client_id=request.client_id, invoice_date__range=[start_date, end_date]
+        ).exclude(status__in=["Cancelled", "Draft"])
+        gross_sales = sum((inv.total_amount for inv in invoices), ZERO)
+
+        returns = SalesReturn.objects.filter(
+            client_id=request.client_id, return_date__range=[start_date, end_date]
+        ).exclude(status__in=["Cancelled", "Draft"])
+        sales_returns = sum((ret.total_amount for ret in returns), ZERO)
+
+        net_sales = max(ZERO, gross_sales - sales_returns)
+
+        broker_commissions = BrokerCommissionRecord.objects.filter(
+            client_id=request.client_id, invoice_date__range=[start_date, end_date]
+        ).exclude(status__in=["Cancelled"])
+        total_brokerage = sum((bc.commission_amount for bc in broker_commissions), ZERO)
+        if total_brokerage == ZERO:
+            sales_bc = SalesBrokerCommission.objects.filter(
+                client_id=request.client_id, invoice_date__range=[start_date, end_date]
+            ).exclude(status__in=["Cancelled"])
+            total_brokerage = sum((bc.commission_amount for bc in sales_bc), ZERO)
+
+        accruals = SalespersonIncentiveAccrual.objects.filter(
+            client_id=request.client_id, start_date__gte=start_date, end_date__lte=end_date
+        ).exclude(status__in=["DRAFT", "HELD"])
+        total_incentives = sum((acc.calculated_incentive for acc in accruals), ZERO)
+
+        payslips = Payslip.objects.filter(
+            client_id=request.client_id,
+            payroll_run__period_start__gte=start_date,
+            payroll_run__period_end__lte=end_date,
+        ).exclude(status__in=["Cancelled"])
+        total_salary = sum((ps.gross_pay for ps in payslips), ZERO)
+
+        total_leakage = sales_returns + total_brokerage + total_incentives + total_salary
+        net_margin = net_sales - (total_brokerage + total_incentives + total_salary)
+        leakage_percentage = round((float(total_leakage) / float(gross_sales) * 100), 2) if gross_sales > 0 else 0
+
+        return Response({
+            "year": year,
+            "gross_sales": float(gross_sales),
+            "sales_returns": float(sales_returns),
+            "net_sales": float(net_sales),
+            "total_brokerage": float(total_brokerage),
+            "total_incentives": float(total_incentives),
+            "total_salary": float(total_salary),
+            "total_commercial_leakage": float(total_leakage),
+            "net_margin": float(net_margin),
+            "leakage_percentage": leakage_percentage,
+        })
