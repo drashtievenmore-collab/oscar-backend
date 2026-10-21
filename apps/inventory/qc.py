@@ -214,6 +214,7 @@ def dispose_receipt(
     *,
     quantities,
     line_quantities=None,
+    taka_dispositions=None,
     user=None,
     remarks=None,
     measurements=None,
@@ -221,13 +222,6 @@ def dispose_receipt(
     require_job_work_order=True,
     movement_date=None,
 ):
-    """Apply a QC result to a goods receipt and move its stock accordingly.
-
-    ``quantities`` is ``{category: qty}`` for the whole receipt (in stock
-    units); ``line_quantities`` optionally gives the same per GRN line as
-    ``[{"lineId": .., "goodQty": .., ...}]`` and then takes precedence.
-    The quantities must account for exactly what is still at QC Hold.
-    """
     from apps.purchase.models import GoodsReceipt, PurchaseBill
 
     receipt = (
@@ -235,11 +229,76 @@ def dispose_receipt(
         .select_related("purchase_bill", "party")
         .get(pk=receipt.pk)
     )
+    if receipt.qc_status not in ("Pending", "Draft", "On Hold"):
+        raise Conflict(
+            f"QC inspection for {receipt.grn_number} has already been completed with status '{receipt.qc_status}'.",
+            code="QC_ALREADY_DONE",
+        )
+
     units, qc_location = receipt_pool(receipt)
     pool_total = round4(sum((unit["qty"] for unit in units), ZERO))
     record_only = False
 
-    if line_quantities:
+    if taka_dispositions and not line_quantities:
+        disposition_map = {
+            "passed": "good",
+            "pass": "good",
+            "good": "good",
+            "grade a": "good",
+            "approved": "good",
+            "rejected": "reject",
+            "reject": "reject",
+            "fail": "reject",
+            "failed": "reject",
+            "second": "second",
+            "second quality": "second",
+            "reprocess": "reprocess",
+            "rework": "reprocess",
+            "hold": "hold",
+            "on hold": "hold",
+        }
+        taka_lookup = {}
+        seen_taka_keys = set()
+        for t_entry in taka_dispositions:
+            t_key = str(t_entry.get("id") or t_entry.get("takaId") or t_entry.get("taka_id") or "").strip()
+            if not t_key:
+                t_key = str(t_entry.get("barcode") or t_entry.get("takaNumber") or t_entry.get("taka_number") or "").strip()
+            if t_key:
+                if t_key in seen_taka_keys:
+                    raise ValidationFailed(
+                        f"Duplicate taka identifier '{t_key}' in QC submission.",
+                        field_errors={"takas": [f"Duplicate taka identifier '{t_key}'."]}
+                    )
+                seen_taka_keys.add(t_key)
+            raw_disp = str(t_entry.get("disposition") or t_entry.get("qcStatus") or t_entry.get("status") or "Passed").strip().lower()
+            cat = disposition_map.get(raw_disp, "good")
+            if t_key:
+                taka_lookup[t_key] = cat
+                if t_entry.get("takaId"):
+                    taka_lookup[str(t_entry.get("takaId"))] = cat
+                if t_entry.get("id"):
+                    taka_lookup[str(t_entry.get("id"))] = cat
+                if t_entry.get("takaNumber") or t_entry.get("taka_number"):
+                    taka_lookup[str(t_entry.get("takaNumber") or t_entry.get("taka_number"))] = cat
+
+        plan = []
+        totals = {category: ZERO for category in CATEGORIES}
+        for unit in units:
+            lot = unit.get("lot")
+            cat = "good"
+            if lot:
+                matched_cat = (
+                    taka_lookup.get(str(lot.id))
+                    or taka_lookup.get(str(lot.taka_id))
+                    or taka_lookup.get(str(lot.barcode))
+                    or taka_lookup.get(str(lot.taka_number))
+                )
+                if matched_cat:
+                    cat = matched_cat
+            plan.append((unit, cat, round4(unit["qty"])))
+            totals[cat] += round4(unit["qty"])
+        quantities = totals
+    elif line_quantities:
         plan = []
         totals = {category: ZERO for category in CATEGORIES}
         for row in line_quantities:
@@ -275,11 +334,9 @@ def dispose_receipt(
                 "dispositioned.",
                 code="QC_ALREADY_DONE",
             )
-        # A manual register entry that never posted stock: record the result
-        # only. No movement is claimed.
         record_only = True
         plan = []
-    elif not line_quantities:
+    elif not line_quantities and not taka_dispositions:
         if abs(requested_total - pool_total) > TOLERANCE:
             raise ValidationFailed(
                 f"Disposition total ({requested_total}) must equal the quantity awaiting "

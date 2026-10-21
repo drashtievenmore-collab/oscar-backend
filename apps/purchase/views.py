@@ -16,6 +16,7 @@ from apps.core.exceptions import (
     NotFound,
     ValidationFailed,
 )
+from apps.core import idempotency
 from apps.core.money import ZERO, D, round2, round4
 from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
@@ -27,6 +28,8 @@ from apps.sales.views import SalesDocumentViewSet, _clone_document
 
 from . import services
 from .models import (
+    PURCHASE_TYPE_FINAL_JOB_WORK,
+    PURCHASE_TYPE_VENDOR_A,
     Expense,
     GoodsReceipt,
     PaymentOut,
@@ -36,6 +39,7 @@ from .models import (
     PurchaseOrderLine,
     PurchaseReturn,
     PurchaseReturnLine,
+    SupplierDelivery,
     VendorBill,
     VendorBillLine,
 )
@@ -48,6 +52,7 @@ from .serializers import (
     PurchaseReturnSerializer,
     QcSerializer,
     ReceiveGoodsSerializer,
+    SupplierDeliverySerializer,
     VendorBillSerializer,
 )
 
@@ -62,13 +67,18 @@ def money_sum(field, **kwargs):
 # Purchase orders (api.md §6.2)
 # ---------------------------------------------------------------------------
 class PurchaseOrderViewSet(SalesDocumentViewSet):
-    queryset = PurchaseOrder.objects.all()
+    queryset = PurchaseOrder.objects.select_related("project")
     serializer_class = PurchaseOrderSerializer
     audit_entity_type = "PurchaseOrder"
     audit_label_field = "po_number"
     status_field = "status"
     print_title = "Purchase Order"
-    filter_map = {"vendorId": "party_id", "vendor_id": "party_id"}
+    filter_map = {
+        "vendorId": "party_id",
+        "vendor_id": "party_id",
+        "purchaseType": "purchase_type",
+        "projectId": "project_id",
+    }
     permission_map = {"read": ["view_purchase"], "write": ["create_purchase_order"]}
     draft_values = ("Draft", "Issued")
 
@@ -82,6 +92,129 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
             self.request.user.client, "PO", serializer.validated_data.get("doc_date")
         )
         return super().perform_create(serializer)
+
+    @action(detail=True, methods=["post"], url_path="submit-for-approval")
+    @transaction.atomic
+    def submit_for_approval(self, request, pk=None):
+        from apps.core import approval_services
+        res = self._transition(request, from_statuses=("Draft", "Issued"), to_status="Pending Approval")
+        order = PurchaseOrder.objects.get(pk=self.get_object().pk)
+        approval_services.create_approval_request(
+            client_id=order.client_id,
+            document_type="purchase_order",
+            document_id=order.id,
+            document_number=order.po_number,
+            requested_by=request.user,
+            reason=request.data.get("remarks") or f"Purchase Order {order.po_number} submitted for approval",
+            force=True,
+        )
+        return res
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def approve(self, request, pk=None):
+        from apps.core.permissions import require_permission, PermissionDenied
+        from apps.core.models import ApprovalRequest
+        order = PurchaseOrder.objects.select_for_update().get(pk=self.get_object().pk)
+        if order.created_by_id and order.created_by_id == getattr(request.user, "id", None) and not getattr(request.user, "is_superuser", False):
+            raise PermissionDenied(
+                "Separation of duties: You cannot approve a Purchase Order you created.",
+                code="SELF_APPROVAL_NOT_PERMITTED",
+            )
+        try:
+            require_permission(request.user, "approve_purchase_order")
+        except PermissionDenied:
+            require_permission(request.user, "manage_approvals", message="You do not have permission to approve Purchase Orders.")
+
+        res = self._transition(request, from_statuses=("Pending Approval",), to_status="Approved")
+        appr_req = ApprovalRequest.objects.filter(
+            client_id=order.client_id,
+            document_type="purchase_order",
+            document_id=str(order.id),
+            status="Pending",
+        ).first()
+        if appr_req:
+            appr_req.status = "Approved"
+            appr_req.decided_by = request.user
+            appr_req.decided_at = timezone.now()
+            appr_req.comments = request.data.get("remarks", "")
+            appr_req.save(update_fields=["status", "decided_by", "decided_at", "comments"])
+        return res
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def reject(self, request, pk=None):
+        from apps.core.permissions import require_permission, PermissionDenied
+        from apps.core.models import ApprovalRequest
+        try:
+            require_permission(request.user, "approve_purchase_order")
+        except PermissionDenied:
+            require_permission(request.user, "manage_approvals", message="You do not have permission to reject Purchase Orders.")
+
+        order = PurchaseOrder.objects.select_for_update().get(pk=self.get_object().pk)
+        res = self._transition(request, from_statuses=("Pending Approval",), to_status="Rejected")
+        appr_req = ApprovalRequest.objects.filter(
+            client_id=order.client_id,
+            document_type="purchase_order",
+            document_id=str(order.id),
+            status="Pending",
+        ).first()
+        if appr_req:
+            appr_req.status = "Rejected"
+            appr_req.decided_by = request.user
+            appr_req.decided_at = timezone.now()
+            appr_req.comments = request.data.get("remarks", "")
+            appr_req.save(update_fields=["status", "decided_by", "decided_at", "comments"])
+        return res
+
+    @action(detail=True, methods=["post"], url_path="return-for-correction")
+    @transaction.atomic
+    def return_correction(self, request, pk=None):
+        from apps.core.permissions import require_permission, PermissionDenied
+        from apps.core.models import ApprovalRequest
+        try:
+            require_permission(request.user, "approve_purchase_order")
+        except PermissionDenied:
+            require_permission(request.user, "manage_approvals", message="You do not have permission to return Purchase Orders for correction.")
+
+        order = PurchaseOrder.objects.select_for_update().get(pk=self.get_object().pk)
+        res = self._transition(request, from_statuses=("Pending Approval",), to_status="Draft")
+        appr_req = ApprovalRequest.objects.filter(
+            client_id=order.client_id,
+            document_type="purchase_order",
+            document_id=str(order.id),
+            status="Pending",
+        ).first()
+        if appr_req:
+            appr_req.status = "Returned"
+            appr_req.decided_by = request.user
+            appr_req.decided_at = timezone.now()
+            appr_req.comments = request.data.get("remarks", "")
+            appr_req.save(update_fields=["status", "decided_by", "decided_at", "comments"])
+        return res
+
+    def _transition(self, request, *, from_statuses, to_status):
+        order = PurchaseOrder.objects.select_for_update().get(pk=self.get_object().pk)
+        if order.status == to_status:
+            return Response(self.get_serializer(order).data)
+        if order.status not in from_statuses:
+            raise Conflict(
+                f"{order.po_number} is {order.status}; it cannot move to {to_status}.",
+                code=Codes.DRAFT_ONLY,
+            )
+        if not order.line_items.filter(deleted_at__isnull=True).exists():
+            raise ValidationFailed(
+                "Add at least one line before submitting the purchase order.",
+                field_errors={"lineItems": ["Add at least one line."]},
+            )
+        previous = order.status
+        order.status = to_status
+        order.save(update_fields=["status", "updated_at"])
+        self.write_audit(
+            "status_change", order,
+            description=f"{previous} -> {to_status}" + (f": {request.data.get('remarks')}" if request.data.get("remarks") else ""),
+        )
+        return Response(self.get_serializer(order).data)
 
     @action(detail=True, methods=["get"], url_path="billed-status")
     def billed_status(self, request, pk=None):
@@ -133,6 +266,206 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    @action(detail=True, methods=["post"], url_path="start-production")
+    @transaction.atomic
+    def start_production(self, request, pk=None):
+        po = self.get_object()
+        from apps.pms.models import ProductionInstruction, Project
+        from apps.hrms.models import Employee
+        from apps.masters.models import Agency
+        from apps.pms.pipeline_services import sync_project_pipeline_stages
+
+        # Only a Vendor A production PO enters the production / daily-entry
+        # cycle; a ready grey stock purchase is received through a GRN.
+        if po.purchase_type != PURCHASE_TYPE_VENDOR_A:
+            raise Conflict(
+                f"{po.po_number} is a {po.purchase_type}; only a Vendor A Production PO can start production. "
+                "Receive ready grey fabric through a GRN instead.",
+                code="WRONG_PURCHASE_TYPE",
+            )
+        if po.status not in ("Approved", "In Production"):
+            raise Conflict(
+                f"Approve {po.po_number} before starting production (it is {po.status}).",
+                code=Codes.DRAFT_ONLY,
+            )
+
+        po.status = "In Production"
+        po.save(update_fields=["status", "updated_at"])
+
+        existing_pi = ProductionInstruction.objects.filter(
+            client_id=po.client_id,
+            order_reference=po.po_number,
+            deleted_at__isnull=True,
+        ).first()
+
+        if existing_pi:
+            if existing_pi.status in ("Draft", "Not Started", "Pending"):
+                existing_pi.status = "Running"
+                existing_pi.save(update_fields=["status", "updated_at"])
+            instruction = existing_pi
+        else:
+            first_line = po.line_items.first()
+            total_qty = sum((fl.qty for fl in po.line_items.all()), Decimal("0.00"))
+            fabric_name = (
+                first_line.item.name
+                if (first_line and first_line.item)
+                else getattr(po, "notes", "Grey Fabric") or "Grey Fabric"
+            )
+            unit_rate = first_line.rate if first_line else Decimal("0.00")
+
+            agency_name = po.party_name or (po.party.name if po.party else "Production Agency")
+            agency_obj = Agency.objects.filter(
+                client_id=po.client_id,
+                name__iexact=agency_name.strip(),
+                deleted_at__isnull=True,
+            ).first()
+
+            employee = Employee.objects.filter(
+                client_id=po.client_id,
+                status__in=["Active", "Probation"],
+                deleted_at__isnull=True,
+            ).first()
+
+            instruction = ProductionInstruction.objects.create(
+                client=po.client,
+                instruction_number=allocate_number(po.client, "PROD"),
+                agency=agency_obj,
+                agency_name=agency_name,
+                order_reference=po.po_number,
+                order_meter=total_qty,
+                tentative_rate=unit_rate,
+                agreed_rate=unit_rate,
+                rate_uom="Meter",
+                expected_start_date=po.expected_date or timezone.localdate(),
+                pi_date=po.doc_date or timezone.localdate(),
+                fabric=fabric_name,
+                process_type="Processing",
+                employee=employee,
+                status="Running",
+                notes=f"Auto-generated from Purchase Order {po.po_number}",
+                created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+            )
+
+        project = po.project
+        if project is None and po.reference_number:
+            project = Project.objects.filter(
+                client_id=po.client_id,
+                code=po.reference_number,
+                deleted_at__isnull=True,
+            ).first()
+        if project:
+            sync_project_pipeline_stages(project)
+
+        self.write_audit("start_production", po, description=f"Production Instruction {instruction.instruction_number} created.")
+
+        return Response({
+            "success": True,
+            "message": f"Production Instruction {instruction.instruction_number} generated for {instruction.agency_name}. Status moved to In Production.",
+            "instructionId": str(instruction.id),
+            "instructionNumber": instruction.instruction_number,
+            "status": po.status,
+            "po": self.get_serializer(po).data,
+        })
+
+    @action(detail=False, methods=["get"], url_path="next-jwpo-number")
+    def next_jwpo_number(self, request):
+        from apps.core.numbering import financial_year_label
+        client = getattr(request.user, "client", None)
+        year_str = financial_year_label(client, reset_policy="fy") if client else str(timezone.localdate().year)
+
+        last_po = PurchaseOrder.objects.filter(
+            client_id=request.client_id,
+            po_number__startswith="JWPO",
+        ).order_by("-po_number").first()
+
+        seq = 1
+        if last_po and last_po.po_number:
+            parts = last_po.po_number.split("-")
+            if len(parts) >= 3 and parts[-1].isdigit():
+                seq = int(parts[-1]) + 1
+
+        next_no = f"JWPO-{year_str}-{seq:04d}"
+        return Response({"nextPoNumber": next_no, "poNo": next_no})
+
+    @action(detail=False, methods=["post"], url_path="generate-final-job-work")
+    @transaction.atomic
+    def generate_final_job_work(self, request):
+        from apps.pms import production_services
+        from apps.pms.models import ProductionInstruction
+
+        instruction_id = request.data.get("instructionId") or request.data.get("instruction_id")
+        if instruction_id:
+            instruction = ProductionInstruction.objects.filter(
+                client_id=request.client_id, id=instruction_id, deleted_at__isnull=True
+            ).first()
+            if not instruction:
+                raise ValidationFailed(f"Production instruction {instruction_id} not found.")
+
+            instruction = production_services.generate_final_job_work_po(
+                instruction, user=request.user, custom_data=request.data
+            )
+            po = instruction.final_po
+            return Response(self.get_serializer(po).data, status=status.HTTP_201_CREATED)
+        else:
+            from apps.masters.models import Party, Item
+            vendor_id = request.data.get("vendorId")
+            vendor = Party.objects.filter(client_id=request.client_id, id=vendor_id).first() if vendor_id else None
+            if not vendor:
+                vendor = Party.objects.filter(client_id=request.client_id, type__in=["Vendor", "Both"]).first()
+
+            po_no = request.data.get("finalPoNo") or allocate_number(request.user.client, "JWPO")
+            po = PurchaseOrder(
+                client=request.user.client,
+                po_number=po_no,
+                party=vendor,
+                doc_date=request.data.get("poDate") or timezone.localdate(),
+                status="Pending Approval" if request.data.get("sendToApproval", True) else "Approved",
+                notes=request.data.get("remarks") or "Final Job Work Purchase Order",
+                purchase_type=PURCHASE_TYPE_FINAL_JOB_WORK,
+                other_charges=Decimal(str(request.data.get("otherCharges") or 0)),
+                created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+            )
+            po.freeze_party_snapshot()
+            po.save()
+
+            items = request.data.get("items") or []
+            default_item = Item.objects.filter(client_id=request.client_id, deleted_at__isnull=True).exclude(item_kind="Service").first()
+            from apps.sales.services import recalculate_document
+            for idx, it in enumerate(items, start=1):
+                qty = Decimal(str(it.get("billableQty") or it.get("qty") or 100))
+                rate = Decimal(str(it.get("rate") or 0))
+                tax_pct = Decimal(str(it.get("gstPct") or 5))
+                line = PurchaseOrderLine(
+                    client=request.user.client,
+                    purchase_order=po,
+                    line_no=idx,
+                    item=default_item,
+                    description=it.get("description") or f"Job Work - {default_item.name if default_item else 'Processing'}",
+                    qty=qty,
+                    rate=rate,
+                    tax_pct=tax_pct,
+                    uom=it.get("uom") or "Meter",
+                )
+                line.freeze_item_snapshot()
+                line.save()
+            recalculate_document(po)
+            return Response(self.get_serializer(po).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["get"], url_path="final-job-work-list")
+    def final_job_work_list(self, request):
+        qs = self.get_queryset().filter(
+            Q(po_number__startswith="JWPO")
+            | Q(reference_number__startswith="PROD-")
+            | Q(production_instructions__isnull=False)
+            | Q(notes__icontains="Job Work")
+        ).distinct()
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = self.get_serializer(qs, many=True)
+        return Response(serializer.data)
+
     @action(detail=False, methods=["get"], url_path="auto-suggestions")
     def auto_suggestions(self, request):
         """``GET /purchase/orders/auto-suggestions/`` -- the AutoPOModal feed."""
@@ -152,6 +485,8 @@ class PurchaseBillViewSet(SalesDocumentViewSet):
     filter_map = {
         "vendorId": "party_id",
         "purchaseOrderId": "purchase_order_id",
+        "poId": "purchase_order_id",
+        "po": "purchase_order_id",
         "goodsReceived": "goods_received",
         "qcStatus": "qc_status",
     }
@@ -324,6 +659,8 @@ class GoodsReceiptViewSet(TenantModelViewSet):
         "partyId": "party_id",
         "vendorId": "party_id",
         "purchaseOrderId": "purchase_order_id",
+        "poId": "purchase_order_id",
+        "po": "purchase_order_id",
         "qcStatus": "qc_status",
     }
 
@@ -392,20 +729,35 @@ class GoodsReceiptViewSet(TenantModelViewSet):
         purchase_order_id = data.get("purchase_order") or data.get("purchaseOrderId") or data.get("poId")
         lines = data.get("lines") or []
 
-        receipt = services.create_standalone_grn(
-            request.user.client,
-            party_id=party_id,
-            location_id=location_id,
-            receipt_date=receipt_date,
-            supplier_challan_no=supplier_challan_no,
-            supplier_challan_date=supplier_challan_date,
-            purchase_order_id=purchase_order_id,
-            lines_payload=lines,
-            user=request.user,
-        )
-        self.write_audit("create", receipt, description=f"Standalone GRN created: {receipt.grn_number}")
+        # A double-clicked Save replays the first response instead of posting
+        # the stock twice (api.md §1.8).
+        try:
+            record = idempotency.begin(request, request.client_id, request.path, request.data)
+        except idempotency.Replay as replay:
+            response = Response(replay.body, status=replay.status)
+            response["Idempotency-Replayed"] = "true"
+            return response
+        try:
+            with transaction.atomic():
+                receipt = services.create_standalone_grn(
+                    request.user.client,
+                    party_id=party_id,
+                    location_id=location_id,
+                    receipt_date=receipt_date,
+                    supplier_challan_no=supplier_challan_no,
+                    supplier_challan_date=supplier_challan_date,
+                    purchase_order_id=purchase_order_id,
+                    lines_payload=lines,
+                    user=request.user,
+                )
+                self.write_audit("create", receipt, description=f"Standalone GRN created: {receipt.grn_number}")
+        except Exception:
+            idempotency.fail(record)
+            raise
         serializer = self.get_serializer(receipt)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return idempotency.finish(
+            record, Response(serializer.data, status=status.HTTP_201_CREATED), receipt
+        )
 
     @action(detail=False, methods=["get"], url_path="reconciliation")
     def reconciliation(self, request):
@@ -874,29 +1226,46 @@ class VendorBillViewSet(TenantModelViewSet):
                 code=Codes.DRAFT_ONLY,
             )
         remarks = request.data.get("remarks")
+        # Approving releases the payable even though PO / GRN / bill disagree,
+        # so the variance and the reason are put on record. Nothing on the PO,
+        # GRN or bill is changed to force a match.
+        matching = services.compute_vendor_bill_matching(request.client_id, bill)
+        is_mismatch = matching.get("overallStatus") == "Mismatch"
+        if is_mismatch and not (remarks or "").strip():
+            raise ValidationFailed(
+                "This bill does not match the PO / GRN. Enter approval remarks explaining the variance.",
+                field_errors={"remarks": ["Required to approve a mismatched bill."]},
+                payload={"matching": matching},
+            )
         now = timezone.now()
         bill.status = "Approved"
         if remarks is not None:
             bill.approval_remarks = remarks
         bill.approved_by = request.user
         bill.approved_at = now
+        bill.match_result = matching
         history = list(bill.approval_history or [])
         history.append(
             {
                 "at": now.isoformat(),
                 "by": getattr(request.user, "name", None) or str(request.user),
-                "action": "Approved",
+                "action": "Approved with variance" if is_mismatch else "Approved",
                 "remarks": remarks,
+                "matchStatus": matching.get("overallStatus"),
+                "variances": matching.get("reasons") or [],
             }
         )
         bill.approval_history = history
         bill.save(
             update_fields=[
                 "status", "approval_remarks", "approved_by", "approved_at",
-                "approval_history", "updated_at",
+                "approval_history", "match_result", "updated_at",
             ]
         )
-        self.write_audit("approve", bill, description=remarks)
+        description = remarks
+        if is_mismatch:
+            description = f"Approved with variance: {remarks}. " + "; ".join(matching.get("reasons") or [])
+        self.write_audit("approve", bill, description=description)
         return Response(self.get_serializer(bill).data)
 
     @action(detail=True, methods=["post"])
@@ -990,3 +1359,36 @@ class VendorLookupViewSet(ReadOnlyTenantViewSet):
                 date_to=request.query_params.get("date_to"),
             )
         )
+
+
+class SupplierDeliveryViewSet(TenantModelViewSet):
+    queryset = SupplierDelivery.objects.select_related("purchase_order", "purchase_order__party").prefetch_related("purchase_order__line_items")
+    serializer_class = SupplierDeliverySerializer
+    required_permissions = ["view_purchase"]
+    permission_map = {"read": ["view_purchase"], "write": ["create_purchase_order"]}
+    status_field = "status"
+    default_date_field = "dispatch_date"
+    ordering = ["-dispatch_date", "-created_at"]
+    filter_map = {
+        "purchaseOrderId": "purchase_order_id",
+        "poId": "purchase_order_id",
+        "status": "status",
+    }
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        project_id = self.request.query_params.get("projectId") or self.request.query_params.get("project_id")
+        if project_id:
+            qs = qs.filter(purchase_order__project_id=project_id)
+        supplier_id = self.request.query_params.get("supplierId") or self.request.query_params.get("vendorId")
+        if supplier_id:
+            qs = qs.filter(purchase_order__party_id=supplier_id)
+        return qs
+
+    def perform_create(self, serializer):
+        from apps.core.numbering import allocate_number
+        serializer.validated_data["delivery_number"] = allocate_number(
+            self.request.user.client, "SD", serializer.validated_data.get("dispatch_date")
+        )
+        return super().perform_create(serializer)
+

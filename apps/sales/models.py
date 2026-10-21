@@ -314,6 +314,9 @@ class DeliveryChallan(DocumentHeader):
     transporter = models.TextField(null=True, blank=True)
     lr_number = models.TextField(null=True, blank=True)
     delivery_location = models.TextField(null=True, blank=True)
+    eway_bill_number = models.TextField(null=True, blank=True)
+    eway_bill_date = models.DateTimeField(null=True, blank=True)
+    eway_bill_valid_until = models.DateTimeField(null=True, blank=True)
     location = models.ForeignKey(
         "masters.Location", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
@@ -379,7 +382,13 @@ class SalesInvoice(DocumentHeader):
         "accounting.JournalEntry", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     irn = models.TextField(null=True, blank=True)
+    ack_no = models.TextField(null=True, blank=True)
+    ack_date = models.DateTimeField(null=True, blank=True)
+    signed_qrcode = models.TextField(null=True, blank=True)
+    einvoice_status = models.TextField(default="Not Applicable")
     eway_bill_number = models.TextField(null=True, blank=True)
+    eway_bill_date = models.DateTimeField(null=True, blank=True)
+    eway_bill_valid_until = models.DateTimeField(null=True, blank=True)
     dispatch_date = models.DateField(null=True, blank=True)
     vehicle_number = models.TextField(null=True, blank=True)
     transporter = models.TextField(null=True, blank=True)
@@ -697,6 +706,7 @@ class BrokerCommission(TenantModel, LegacyIdMixin):
     COMMISSION_TYPES = [
         ("percent", "percent"),
         ("per_meter", "per_meter"),
+        ("per_taka", "per_taka"),
         ("fixed", "fixed"),
     ]
     BASIS_CHOICES = [

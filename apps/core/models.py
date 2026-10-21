@@ -546,3 +546,183 @@ class ExportJob(TenantModel):
     class Meta:
         db_table = "export_jobs"
         ordering = ["-created_at"]
+
+
+# ---------------------------------------------------------------------------
+# db.md / PDF §16 -- Approval Engine
+# ---------------------------------------------------------------------------
+class ApprovalRule(TenantModel):
+    """Generic approval rule per document type, threshold condition, and approver role."""
+
+    DOCUMENT_TYPES = [
+        ("purchase_order_rate", "Purchase order rate change / excess qty"),
+        ("jobwork_order_rate", "Job-work rate change"),
+        ("jobwork_wastage", "Job-work / Process loss above tolerance"),
+        ("reprocess_order", "Reprocess order / write-off"),
+        ("discount_limit", "Sales discount above authority"),
+        ("below_margin_sale", "Sale below minimum margin / landed cost"),
+        ("credit_limit_exceeded", "Credit limit or credit days exceeded"),
+        ("stock_adjustment", "Manual stock adjustment"),
+        ("brokerage_rate_change", "Brokerage % change"),
+        ("incentive_adjustment", "Incentive manual adjustment"),
+        ("standalone_note", "Debit / Credit note"),
+        ("vendor_bill_mismatch", "Vendor bill three-way mismatch"),
+        ("production_final_po", "Final PO generation after production verification"),
+    ]
+
+    CONDITION_TYPES = [
+        ("always", "Always require approval"),
+        ("threshold_amount", "Amount exceeds threshold"),
+        ("threshold_percent", "Percentage exceeds threshold"),
+        ("variance_percent", "Variance % exceeds tolerance"),
+    ]
+
+    document_type = models.CharField(max_length=64, choices=DOCUMENT_TYPES)
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True, default="")
+    condition_type = models.CharField(max_length=32, choices=CONDITION_TYPES, default="always")
+    threshold_value = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    approver_role = models.ForeignKey(
+        "accounts.Role", null=True, blank=True, on_delete=models.SET_NULL, related_name="approval_rules"
+    )
+    approver_role_code = models.CharField(max_length=64, blank=True, default="")
+    min_level = models.IntegerField(default=1)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "approval_rules"
+        ordering = ["document_type", "min_level"]
+
+    def __str__(self):
+        return f"{self.name} ({self.document_type})"
+
+
+class ApprovalRequest(TenantModel):
+    """Instance of a document or sensitive action waiting for authorization."""
+
+    STATUSES = [
+        ("Pending", "Pending"),
+        ("Approved", "Approved"),
+        ("Rejected", "Rejected"),
+        ("Returned", "Returned for Correction"),
+        ("Cancelled", "Cancelled"),
+    ]
+
+    URGENCIES = [
+        ("Normal", "Normal"),
+        ("High", "High"),
+        ("Urgent", "Urgent"),
+    ]
+
+    rule = models.ForeignKey(
+        ApprovalRule, null=True, blank=True, on_delete=models.SET_NULL, related_name="requests"
+    )
+    document_type = models.CharField(max_length=64)
+    document_id = models.CharField(max_length=64, db_index=True)
+    document_number = models.CharField(max_length=128, blank=True, default="")
+    requested_by = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="submitted_approval_requests",
+    )
+    requested_at = models.DateTimeField(auto_now_add=True)
+    reason = models.TextField()
+    old_values = models.JSONField(default=dict, blank=True)
+    new_values = models.JSONField(default=dict, blank=True)
+    variance_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    variance_pct = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    status = models.CharField(max_length=32, choices=STATUSES, default="Pending", db_index=True)
+    urgency = models.CharField(max_length=16, choices=URGENCIES, default="Normal")
+    decided_by = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="decided_approval_requests",
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    comments = models.TextField(blank=True, default="")
+
+    class Meta:
+        db_table = "approval_requests"
+        ordering = ["-requested_at"]
+        indexes = [
+            models.Index(fields=["client", "status", "-requested_at"], name="ix_appr_req_status"),
+            models.Index(fields=["client", "document_type", "document_id"], name="ix_appr_req_doc"),
+        ]
+
+    def __str__(self):
+        return f"{self.document_type} {self.document_number} - {self.status}"
+
+
+# ---------------------------------------------------------------------------
+# db.md / PDF §19 -- Alerts & Exception Management
+# ---------------------------------------------------------------------------
+class AlertSetting(TenantModel):
+    """Configurable thresholds for exception alarms."""
+
+    alert_key = models.CharField(max_length=64)
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True, default="")
+    threshold_days = models.IntegerField(default=0)
+    threshold_pct = models.DecimalField(max_digits=8, decimal_places=2, default=0)
+    threshold_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    is_enabled = models.BooleanField(default=True)
+    channels = models.JSONField(default=list)  # e.g. ["in_app", "email", "whatsapp"]
+
+    class Meta:
+        db_table = "alert_settings"
+        constraints = [
+            models.UniqueConstraint(fields=["client", "alert_key"], name="uq_alert_setting_key")
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({'Enabled' if self.is_enabled else 'Disabled'})"
+
+
+class AlertIncident(TenantModel):
+    """An alert triggered by the scheduler or on-save checks."""
+
+    SEVERITIES = [
+        ("Info", "Info"),
+        ("Warning", "Warning"),
+        ("Critical", "Critical"),
+    ]
+
+    STATUSES = [
+        ("Active", "Active"),
+        ("Acknowledged", "Acknowledged"),
+        ("Resolved", "Resolved"),
+    ]
+
+    alert_key = models.CharField(max_length=64, db_index=True)
+    severity = models.CharField(max_length=16, choices=SEVERITIES, default="Warning")
+    title = models.CharField(max_length=255)
+    message = models.TextField()
+    entity_type = models.CharField(max_length=64, blank=True, default="")
+    entity_id = models.CharField(max_length=64, blank=True, default="")
+    entity_number = models.CharField(max_length=128, blank=True, default="")
+    status = models.CharField(max_length=32, choices=STATUSES, default="Active", db_index=True)
+    acknowledged_by = models.ForeignKey(
+        django_settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="acknowledged_alerts",
+    )
+    acknowledged_at = models.DateTimeField(null=True, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = "alert_incidents"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["client", "status", "-created_at"], name="ix_alert_inc_status"),
+        ]
+
+    def __str__(self):
+        return f"[{self.severity}] {self.title} - {self.status}"
+

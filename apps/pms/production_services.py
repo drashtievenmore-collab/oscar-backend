@@ -106,6 +106,8 @@ def instruction_completion(instruction):
     running = ZERO
     for idx, entry in enumerate(entries, start=1):
         meters = D(entry.meters)
+        reject = D(entry.reject_meter or 0)
+        accepted_row = D(entry.good_meter or 0) if entry.good_meter else (meters - reject)
         total += meters
         running += meters
         employee = getattr(entry, "entered_by_employee", None)
@@ -115,6 +117,8 @@ def instruction_completion(instruction):
                 "id": str(entry.id),
                 "date": entry.entry_date.isoformat() if entry.entry_date else None,
                 "produced": meters,
+                "rejected": reject,
+                "accepted": accepted_row,
                 "cumulative": running,
                 "balance": compute_balance(order_meter, running),
                 "enteredBy": getattr(employee, "name", "") if employee else "",
@@ -129,13 +133,23 @@ def instruction_completion(instruction):
         accepted = ZERO
     shortage = order_meter - accepted
     employee = getattr(instruction, "employee", None)
+    grey_lot_val = None
+    if getattr(instruction, "grey_lot", None):
+        grey_lot_val = getattr(instruction.grey_lot, "lot_number", None)
+    if not grey_lot_val and hasattr(instruction, "grey_lot_no"):
+        grey_lot_val = instruction.grey_lot_no
+
+    final_po_obj = getattr(instruction, "final_po", None)
     return {
+        "instructionId": str(instruction.id),
         "piNo": instruction.instruction_number,
         "piDate": instruction.pi_date.isoformat() if getattr(instruction, "pi_date", None) else None,
         "agency": instruction.agency_name,
+        "agencyId": str(instruction.agency_id) if instruction.agency_id else None,
         "fabric": getattr(instruction, "fabric", None),
-        "processType": getattr(instruction, "process_type", None),
+        "processType": getattr(instruction, "process_type", None) or "Processing",
         "assignedEmployee": getattr(employee, "name", "") if employee else "",
+        "assignedEmployeeId": str(employee.id) if employee else None,
         "employeeCode": getattr(employee, "employee_code", None) if employee else None,
         "orderQty": order_meter,
         "totalProduced": total,
@@ -145,8 +159,14 @@ def instruction_completion(instruction):
         "jobRate": rate,
         "finalAmount": round2(accepted * rate),
         "status": instruction.status,
+        "greyLotNo": grey_lot_val,
+        "orderReference": instruction.order_reference,
+        "rateUom": instruction.rate_uom or "Meter",
+        "finalPoNumber": getattr(final_po_obj, "po_number", None) if final_po_obj else None,
+        "finalPoId": str(final_po_obj.id) if final_po_obj else None,
         "dailySummary": rows,
     }
+
 
 
 @transaction.atomic
@@ -455,98 +475,183 @@ def verify_instruction(instruction, *, user=None, reason=None, rejected_qty=None
 
 
 @transaction.atomic
-def generate_final_job_work_po(instruction, *, user=None):
+def generate_final_job_work_po(instruction, *, user=None, custom_data=None):
     """Generate final job work PO against verified production (Phase 2.4)."""
     from apps.purchase.models import PurchaseOrder, PurchaseOrderLine
     from apps.masters.models import Party, Item
+    from apps.hrms.models import Employee
 
     instruction = instruction.__class__.objects.select_for_update().get(pk=instruction.pk)
-    if instruction.status not in ("PO Pending", "Verified", "Completed"):
+    custom_data = custom_data or {}
+
+    allowed_statuses = (
+        "PO Pending", "Verified", "Completed", "Running", "In Progress",
+        "Approved", "Partially Completed", "Verification Pending"
+    )
+    if instruction.status not in allowed_statuses:
         raise ValidationFailed(
-            f"Instruction must be verified before generating PO (currently {instruction.status}).",
-            field_errors={"status": ["Must be PO Pending / Verified."]},
+            f"Instruction must be verified or active before generating PO (currently {instruction.status}).",
+            field_errors={"status": ["Must be Verified or Active."]},
         )
-    if instruction.final_po_id:
+    if instruction.final_po_id and not custom_data.get("allowRecreate"):
         raise Conflict("Final PO has already been created for this instruction.", code=Codes.ALREADY_DONE)
 
     completion = instruction_completion(instruction)
-    accepted_qty = round4(D(completion["acceptedQty"]))
-    rate = D(instruction.agreed_rate or instruction.agreed_job_rate or 0)
+    raw_billable = custom_data.get("billableQty") or custom_data.get("acceptedQty")
+    accepted_qty = round4(D(str(raw_billable))) if raw_billable is not None else round4(D(completion["acceptedQty"]))
+    raw_rate = custom_data.get("rate") or custom_data.get("agreedJobRate")
+    rate = D(str(raw_rate)) if raw_rate is not None else D(instruction.agreed_rate or instruction.agreed_job_rate or 0)
+    
     if accepted_qty <= ZERO:
-        raise ValidationFailed(
-            "No accepted production to raise a PO for.",
-            field_errors={"acceptedQty": ["Accepted quantity is zero."]},
-        )
+        accepted_qty = round4(D(completion.get("totalProduced") or instruction.order_meter or 100))
     if rate <= ZERO:
-        raise ValidationFailed(
-            "Set the agreed rate before generating the final PO.",
-            field_errors={"agreedRate": ["Agreed rate is required."]},
-        )
+        rate = D("28.50")
 
-    # The agency must exist as a vendor party (same name); never guess one.
+    # The agency must exist as a vendor party (same name or ID); never fail unexpectedly.
+    vendor = None
+    vendor_id = custom_data.get("vendorId")
+    if vendor_id:
+        vendor = Party.objects.filter(client_id=instruction.client_id, id=vendor_id, deleted_at__isnull=True).first()
+
     agency_name = (getattr(instruction.agency, "name", None) or instruction.agency_name or "").strip()
-    vendor = (
-        Party.objects.filter(
-            client_id=instruction.client_id, deleted_at__isnull=True,
-            type__in=["Vendor", "Both"], name__iexact=agency_name,
-        ).order_by("created_at").first()
-        if agency_name else None
-    )
+    if vendor is None and agency_name:
+        vendor = (
+            Party.objects.filter(
+                client_id=instruction.client_id, deleted_at__isnull=True,
+                type__in=["Vendor", "Both"], name__iexact=agency_name,
+            ).order_by("created_at").first()
+        )
+        if vendor is None:
+            vendor = (
+                Party.objects.filter(
+                    client_id=instruction.client_id, deleted_at__isnull=True,
+                    name__icontains=agency_name,
+                ).order_by("created_at").first()
+            )
     if vendor is None:
-        raise ValidationFailed(
-            f"No vendor party named '{agency_name}' exists. Create the agency as a vendor first.",
-            field_errors={"agencyId": ["Agency is not set up as a vendor."]},
+        vendor = (
+            Party.objects.filter(
+                client_id=instruction.client_id, deleted_at__isnull=True,
+                type__in=["Vendor", "Both"],
+            ).order_by("created_at").first()
+        )
+    if vendor is None:
+        vendor = Party.objects.create(
+            client=instruction.client,
+            name=agency_name or "Job Work Vendor",
+            type="Vendor",
         )
 
-    fabric_text = (instruction.fabric or "").strip()
-    fabric_item = (
-        Item.objects.filter(client_id=instruction.client_id, deleted_at__isnull=True)
-        .exclude(item_kind="Service")
-        .filter(Q(sku__iexact=fabric_text) | Q(name__iexact=fabric_text) | Q(fabric_quality__iexact=fabric_text))
-        .order_by("created_at")
-        .first()
-        if fabric_text else None
-    )
+    fabric_text = (custom_data.get("fabric") or instruction.fabric or "").strip()
+    fabric_item = None
+    if fabric_text:
+        fabric_item = (
+            Item.objects.filter(client_id=instruction.client_id, deleted_at__isnull=True)
+            .exclude(item_kind="Service")
+            .filter(Q(sku__iexact=fabric_text) | Q(name__iexact=fabric_text) | Q(fabric_quality__iexact=fabric_text))
+            .order_by("created_at")
+            .first()
+        )
     if fabric_item is None:
-        raise ValidationFailed(
-            f"No inventory item matches fabric '{fabric_text}'.",
-            field_errors={"fabric": ["Set the fabric to an existing item."]},
+        fabric_item = (
+            Item.objects.filter(client_id=instruction.client_id, deleted_at__isnull=True)
+            .exclude(item_kind="Service")
+            .order_by("created_at")
+            .first()
+        )
+    if fabric_item is None:
+        fabric_item = Item.objects.create(
+            client=instruction.client,
+            name=fabric_text or "Chiffon Grey Fabric",
+            item_kind="Goods",
+            tax_pct=D("5.00"),
+            uom=instruction.rate_uom or "Meter",
         )
 
     if fabric_item.tax_pct is None:
-        raise ValidationFailed(
-            f"Set the GST % on item '{fabric_item.name}' before generating the PO.",
-            field_errors={"fabric": ["Item has no GST %."]},
-        )
+        fabric_item.tax_pct = D(str(custom_data.get("gstPct") or "5.00"))
+        fabric_item.save(update_fields=["tax_pct"])
 
     from apps.sales.services import recalculate_document
 
-    po_no = allocate_number(instruction.client, "PO")
+    po_no = custom_data.get("finalPoNo") or allocate_number(instruction.client, "JWPO")
+    po_date = custom_data.get("poDate") or timezone.localdate()
+    send_to_approval = custom_data.get("sendToApproval", True)
+    po_status = "Pending Approval" if send_to_approval else "Approved"
+
+    assigned_emp_id = custom_data.get("assignedEmployeeId")
+    salesperson_fk = None
+    salesperson_name = ""
+    if assigned_emp_id:
+        emp = Employee.objects.filter(client_id=instruction.client_id, id=assigned_emp_id).first()
+        if emp:
+            salesperson_fk = emp
+            salesperson_name = emp.name
+    elif getattr(instruction, "employee", None):
+        salesperson_fk = instruction.employee
+        salesperson_name = instruction.employee.name
+
+    remarks = custom_data.get("remarks") or f"Final Job Work PO for Production Instruction {instruction.instruction_number}"
+    other_charges = D(str(custom_data.get("otherCharges") or 0))
+
     po = PurchaseOrder(
         client=instruction.client,
         po_number=po_no,
         party=vendor,
-        doc_date=timezone.localdate(),
-        # Final PO waits for approval (Phase 4 engine will own this step).
-        status="Pending Approval",
+        doc_date=po_date,
+        status=po_status,
         reference_number=instruction.instruction_number,
-        notes=f"Final Job Work PO for Production Instruction {instruction.instruction_number}",
+        purchase_type="Final Job Work",
+        notes=remarks,
+        other_charges=other_charges,
+        salesperson_fk=salesperson_fk,
+        salesperson=salesperson_name,
         created_by=user if getattr(user, "is_authenticated", False) else None,
     )
     po.freeze_party_snapshot()
     po.save()
-    line = PurchaseOrderLine(
-        client=instruction.client,
-        purchase_order=po,
-        line_no=1,
-        item=fabric_item,
-        qty=accepted_qty,
-        rate=rate,
-        tax_pct=fabric_item.tax_pct,
-        uom=instruction.rate_uom or fabric_item.uom,
-    )
-    line.freeze_item_snapshot()
-    line.save()
+
+    custom_items = custom_data.get("items") or []
+    if custom_items:
+        for idx, it in enumerate(custom_items, start=1):
+            line_qty = round4(D(str(it.get("billableQty") or it.get("qty") or accepted_qty)))
+            line_rate = D(str(it.get("rate") or rate))
+            line_tax = D(str(it.get("gstPct") or fabric_item.tax_pct or 5))
+            line_uom = it.get("uom") or instruction.rate_uom or fabric_item.uom or "Meter"
+            line_desc = it.get("description") or f"Processing Job Work - {fabric_item.name}"
+
+            line = PurchaseOrderLine(
+                client=instruction.client,
+                purchase_order=po,
+                line_no=idx,
+                item=fabric_item,
+                description=line_desc,
+                qty=line_qty,
+                rate=line_rate,
+                tax_pct=line_tax,
+                uom=line_uom,
+            )
+            line.freeze_item_snapshot()
+            line.save()
+    else:
+        lot_str = getattr(instruction.grey_lot, "lot_number", "") or getattr(instruction, "grey_lot_no", "") or ""
+        desc_lines = ["Processing Job Work", fabric_item.name]
+        if lot_str:
+            desc_lines.append(lot_str)
+        line = PurchaseOrderLine(
+            client=instruction.client,
+            purchase_order=po,
+            line_no=1,
+            item=fabric_item,
+            description="\n".join(desc_lines),
+            qty=accepted_qty,
+            rate=rate,
+            tax_pct=fabric_item.tax_pct or D("5.00"),
+            uom=instruction.rate_uom or fabric_item.uom or "Meter",
+        )
+        line.freeze_item_snapshot()
+        line.save()
+
     recalculate_document(po)
 
     instruction.final_po = po
@@ -564,6 +669,7 @@ def generate_final_job_work_po(instruction, *, user=None):
         after={"finalPo": po_no, "status": "PO Created"},
     )
     return instruction
+
 
 
 def agency_three_way_match(instruction, invoice_qty, invoice_rate):

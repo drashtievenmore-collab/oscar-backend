@@ -631,3 +631,66 @@ def _uuid_or_404(value):
         return uuid.UUID(str(value))
     except (TypeError, ValueError):
         raise NotFound()
+
+
+from django.http import HttpResponse
+from rest_framework.views import APIView
+from .itc04_reports import get_itc04_report_data, generate_itc04_csv
+
+
+class ITC04ReportView(APIView):
+    """Statutory GST ITC-04 Job Work quarterly return data (PDF §20)."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_jobwork"]
+
+    def get(self, request):
+        params = request.query_params
+        fy = params.get("financialYear") or params.get("financial_year")
+        quarter = params.get("quarter")
+        start_date = params.get("startDate") or params.get("start_date")
+        end_date = params.get("endDate") or params.get("end_date")
+        vendor_id = params.get("vendorId") or params.get("vendor_id")
+
+        data = get_itc04_report_data(
+            client=request.user.client,
+            financial_year=fy,
+            quarter=quarter,
+            start_date=start_date,
+            end_date=end_date,
+            vendor_id=vendor_id,
+        )
+        return Response(data)
+
+
+class ITC04ExportView(APIView):
+    """Download GST ITC-04 statement in standard CSV format."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_jobwork"]
+
+    def get(self, request):
+        params = request.query_params
+        fy = params.get("financialYear") or params.get("financial_year")
+        quarter = params.get("quarter")
+        start_date = params.get("startDate") or params.get("start_date")
+        end_date = params.get("endDate") or params.get("end_date")
+        vendor_id = params.get("vendorId") or params.get("vendor_id")
+        table = params.get("table", "both")
+
+        data = get_itc04_report_data(
+            client=request.user.client,
+            financial_year=fy,
+            quarter=quarter,
+            start_date=start_date,
+            end_date=end_date,
+            vendor_id=vendor_id,
+        )
+        csv_content = generate_itc04_csv(data, table=table)
+        period_str = f"{data['period'].get('quarter') or 'Q'}_{data['period'].get('financialYear') or 'FY'}"
+        filename = f"ITC-04_{period_str}.csv"
+
+        response = HttpResponse(csv_content, content_type="text/csv")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
+

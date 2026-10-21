@@ -114,7 +114,6 @@ class PartyViewSet(TenantModelViewSet):
         if not serializer.validated_data.get("code"):
             series = {
                 "Vendor": "VEND",
-                "Transporter": "TRNS",
                 "Processor": "PROC",
             }.get(serializer.validated_data.get("type"), "CUST")
             serializer.validated_data["code"] = allocate_number(
@@ -333,7 +332,7 @@ class ItemViewSet(TenantModelViewSet):
     serializer_class = ItemSerializer
     audit_entity_type = "Item"
     audit_label_field = "sku"
-    search_fields = ["name", "sku", "description", "hsn_code"]
+    search_fields = ["name", "sku", "description", "hsn_code", "fabric_quality", "fabric_design", "fabric_color"]
     ordering_fields = ["name", "sku", "cost_price", "selling_price", "created_at"]
     ordering = ["name"]
     status_field = "lifecycle_status"
@@ -346,6 +345,12 @@ class ItemViewSet(TenantModelViewSet):
         "lifecycleStatus": "lifecycle_status",
         "trackingMode": "tracking_mode",
         "vendorId": "vendor_id",
+        "fabricQuality": "fabric_quality",
+        "fabric_quality": "fabric_quality",
+        "fabricDesign": "fabric_design",
+        "fabric_design": "fabric_design",
+        "fabricColor": "fabric_color",
+        "fabric_color": "fabric_color",
     }
     permission_map = {"write": ["view_inventory"]}
 

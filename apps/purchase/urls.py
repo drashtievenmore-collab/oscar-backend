@@ -8,6 +8,7 @@ from . import views
 
 router = DefaultRouter(trailing_slash=True)
 router.register("orders", views.PurchaseOrderViewSet, basename="purchase-orders")
+router.register("deliveries", views.SupplierDeliveryViewSet, basename="purchase-deliveries")
 router.register("bills", views.PurchaseBillViewSet, basename="purchase-bills")
 router.register("receipts", views.GoodsReceiptViewSet, basename="purchase-receipts")
 router.register("payments", views.PaymentOutViewSet, basename="purchase-payments")

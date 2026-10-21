@@ -29,37 +29,86 @@ from .models import AUTOMATION_SOURCE, Lead, Stage, StageTask, Task
 #: explicit mark-lost) moves it to Lost. Won/Lost are terminal — neither
 #: overwrites the other, and every move is idempotent.
 QUOTATION_DEAL_TRANSITIONS = {
-    "Sent": ("Draft",),
-    "Open": ("Draft", "Sent"),
+    "Sent": ("Draft", "Open"),
+    "Open": ("Draft", "Sent", "Revised", "Declined", "Lost"),
     "Won": ("Draft", "Sent", "Open", "Revised", "Declined"),
     "Lost": ("Draft", "Sent", "Open", "Revised", "Declined"),
 }
 
 
 def advance_deal_for_quotation(quotation, stage, *, actor=None, description=None):
-    """Move the deal linked to ``quotation`` to ``stage`` (or no-op).
+    """Move the deal linked to ``quotation`` (or quotation's lead) to ``stage``.
 
-    Resolves the deal through ``quotation.crm_deal`` — quotations created
-    from a deal carry the link (``POST /crm/deals/{id}/create-quotation/``
-    or ``crmDeal`` on quotation create). Returns the deal, or ``None`` when
-    there is no linked deal or no move was needed.
+    Resolves the deal through ``quotation.crm_deal``, or falls back to
+    any deal associated with ``quotation.crm_lead``. If no deal exists for
+    the lead, automatically creates one in ``stage``. Returns the deal,
+    or ``None`` when there is no linked deal/lead or stage transition is invalid.
     """
     from .models import Deal, DealActivity
 
-    deal_id = getattr(quotation, "crm_deal_id", None)
-    if not deal_id or stage not in QUOTATION_DEAL_TRANSITIONS:
+    if stage not in QUOTATION_DEAL_TRANSITIONS:
         return None
+
     with transaction.atomic():
-        try:
-            deal = Deal.objects.select_for_update().get(pk=deal_id)
-        except Deal.DoesNotExist:
+        deal = None
+        deal_id = getattr(quotation, "crm_deal_id", None)
+        if deal_id:
+            try:
+                deal = Deal.objects.select_for_update().get(pk=deal_id)
+            except Deal.DoesNotExist:
+                deal = None
+
+        if deal is None and getattr(quotation, "crm_lead_id", None):
+            deal = Deal.objects.select_for_update().filter(
+                lead_id=quotation.crm_lead_id,
+                client_id=quotation.client_id,
+                deleted_at__isnull=True,
+            ).order_by("-created_at").first()
+
+        # If still no deal exists for this lead, create one automatically
+        if deal is None and getattr(quotation, "crm_lead_id", None):
+            lead = quotation.crm_lead
+            deal = Deal.objects.create(
+                client=quotation.client,
+                deal_number=allocate_number(quotation.client, "DEAL"),
+                title=lead.name if lead else (quotation.quotation_number or "Deal"),
+                lead=lead,
+                party=quotation.party or (lead.party if lead else None),
+                owner=lead.owner if lead else None,
+                value=quotation.total or (lead.amount if lead else 0) or 0,
+                stage=stage,
+                created_by=actor if getattr(actor, "is_authenticated", False) else None,
+            )
+            quotation.crm_deal = deal
+            quotation.save(update_fields=["crm_deal", "updated_at"])
+            if lead and not lead.converted_deal_id:
+                lead.converted_deal = deal
+                lead.save(update_fields=["converted_deal", "updated_at"])
+            DealActivity.objects.create(
+                deal=deal,
+                type="stage_change",
+                description=(
+                    description
+                    or f"Deal automatically created in stage {stage} for quotation {getattr(quotation, 'quotation_number', '')}."
+                ),
+                actor=actor if getattr(actor, "is_authenticated", False) else None,
+            )
+            return deal
+
+        if not deal:
             return None
+
+        if quotation.crm_deal_id != deal.id:
+            quotation.crm_deal = deal
+            quotation.save(update_fields=["crm_deal", "updated_at"])
+
         if deal.stage == stage:
             return deal
-        if deal.stage in ("Won", "Lost"):
+        if deal.stage in ("Won",) and stage != "Won":
             return deal
         if deal.stage not in QUOTATION_DEAL_TRANSITIONS[stage]:
             return deal
+
         previous = deal.stage
         deal.stage = stage
         if stage in ("Won", "Lost") and deal.closed_at is None:

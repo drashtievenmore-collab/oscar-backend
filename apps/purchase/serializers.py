@@ -1,6 +1,7 @@
 """Purchase serializers (api.md §6)."""
 from decimal import Decimal
 
+from django.db.models import Sum
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -14,6 +15,7 @@ from apps.core.money import ZERO, D, round2
 from apps.core.serializers import (
     BaseModelSerializer,
     BaseSerializer,
+    ISODateTimeField,
     MoneyField,
     PercentField,
     QuantityField,
@@ -22,6 +24,8 @@ from apps.core.serializers import (
 from apps.sales.serializers import line_serializer_for
 
 from .models import (
+    PURCHASE_TYPE_FINAL_JOB_WORK,
+    PURCHASE_TYPES,
     Expense,
     GoodsReceipt,
     GoodsReceiptLine,
@@ -32,6 +36,7 @@ from .models import (
     PurchaseOrderLine,
     PurchaseReturn,
     PurchaseReturnLine,
+    SupplierDelivery,
     VendorBill,
     VendorBillLine,
 )
@@ -101,14 +106,51 @@ class PurchaseOrderSerializer(DocumentSerializer):
     #: The UI shows the derived billed status, not the stored one (api.md §6.2).
     billedStatus = serializers.SerializerMethodField()
 
+    purchaseType = serializers.ChoiceField(
+        source="purchase_type", choices=PURCHASE_TYPES, required=False
+    )
+    #: Optional -- a general grey stock purchase has no project.
+    projectId = TenantPrimaryKeyRelatedField(
+        source="project", model="pms.Project", required=False, allow_null=True
+    )
+    projectCode = serializers.CharField(source="project.code", read_only=True, default=None)
+    projectName = serializers.CharField(source="project.customer_name", read_only=True, default=None)
+
     class Meta:
         model = PurchaseOrder
         fields = HEADER_FIELDS + [
             "po_number", "status", "expected_date", "location",
             "reference_number", "auto_generated", "vendorId", "vendorName",
-            "billedStatus",
+            "billedStatus", "purchaseType", "projectId", "projectCode", "projectName",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["po_number", "auto_generated"]
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        instance = self.instance
+        purchase_type = attrs.get("purchase_type")
+        if instance is None:
+            # Final job work POs are only generated from a verified production
+            # instruction, never typed into the Create PO form.
+            if purchase_type == PURCHASE_TYPE_FINAL_JOB_WORK:
+                raise serializers.ValidationError(
+                    {"purchaseType": "Final job work POs are generated from a verified production instruction."}
+                )
+        else:
+            locked = instance.status not in ("Draft",)
+            if locked and purchase_type and purchase_type != instance.purchase_type:
+                raise serializers.ValidationError(
+                    {"purchaseType": "The purchase type cannot change once the PO has left Draft."}
+                )
+            if locked and "project" in attrs and attrs["project"] != instance.project:
+                raise serializers.ValidationError(
+                    {"projectId": "The project cannot change once the PO has left Draft."}
+                )
+        project = attrs.get("project")
+        if project is not None and not attrs.get("reference_number") and not getattr(instance, "reference_number", None):
+            # Older project screens find their POs by reference_number.
+            attrs["reference_number"] = project.code
+        return attrs
 
 
     def get_billedStatus(self, order):
@@ -525,3 +567,117 @@ class VendorBillSerializer(BaseModelSerializer):
         bill.save(
             update_fields=["subtotal", "gst_amount", "total", "updated_at"]
         )
+
+
+class SupplierDeliverySerializer(BaseModelSerializer):
+    purchaseOrder = TenantPrimaryKeyRelatedField(
+        source="purchase_order", queryset=PurchaseOrder.objects.all(), required=False, allow_null=True
+    )
+    purchaseOrderId = TenantPrimaryKeyRelatedField(
+        source="purchase_order", queryset=PurchaseOrder.objects.all(), required=False, allow_null=True
+    )
+    deliveryNumber = serializers.CharField(source="delivery_number", read_only=True)
+    supplierChallanNo = serializers.CharField(source="supplier_challan_no", required=False, allow_null=True, allow_blank=True)
+    supplierChallanDate = serializers.DateField(source="supplier_challan_date", required=False, allow_null=True)
+    dispatchDate = serializers.DateField(source="dispatch_date")
+    expectedDeliveryDate = serializers.DateField(source="expected_delivery_date", required=False, allow_null=True)
+    actualDeliveryDate = serializers.DateField(source="actual_delivery_date", required=False, allow_null=True)
+    transporterName = serializers.CharField(source="transporter_name", required=False, allow_null=True, allow_blank=True)
+    vehicleNumber = serializers.CharField(source="vehicle_number", required=False, allow_null=True, allow_blank=True)
+    lrBiltyNumber = serializers.CharField(source="lr_bilty_number", required=False, allow_null=True, allow_blank=True)
+    dispatchedQty = QuantityField(source="dispatched_qty", required=False)
+    status = serializers.CharField(required=False)
+    remarks = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    createdAt = ISODateTimeField(source="created_at", read_only=True)
+    updatedAt = ISODateTimeField(source="updated_at", read_only=True)
+
+    poNumber = serializers.SerializerMethodField()
+    supplierName = serializers.SerializerMethodField()
+    fabricName = serializers.SerializerMethodField()
+    orderedQty = serializers.SerializerMethodField()
+    receivedQty = serializers.SerializerMethodField()
+    remainingQty = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SupplierDelivery
+        fields = [
+            "id",
+            "deliveryNumber",
+            "purchaseOrder",
+            "purchaseOrderId",
+            "supplierChallanNo",
+            "supplierChallanDate",
+            "dispatchDate",
+            "expectedDeliveryDate",
+            "actualDeliveryDate",
+            "transporterName",
+            "vehicleNumber",
+            "lrBiltyNumber",
+            "dispatchedQty",
+            "status",
+            "remarks",
+            "poNumber",
+            "supplierName",
+            "fabricName",
+            "orderedQty",
+            "receivedQty",
+            "remainingQty",
+            "createdAt",
+            "updatedAt",
+        ]
+        read_only_fields = ["id", "deliveryNumber", "createdAt", "updatedAt"]
+
+    def get_poNumber(self, obj):
+        return obj.purchase_order.po_number if obj.purchase_order else None
+
+    def get_supplierName(self, obj):
+        po = obj.purchase_order
+        if po and po.party:
+            return po.party.name
+        return po.party_name if po else None
+
+    def get_fabricName(self, obj):
+        po = obj.purchase_order
+        if po:
+            fl = po.line_items.first()
+            if fl:
+                return fl.item_name or (fl.item.name if fl.item else "Grey Fabric")
+        return None
+
+    def get_orderedQty(self, obj):
+        po = obj.purchase_order
+        if po:
+            return float(po.line_items.aggregate(s=Sum("qty"))["s"] or 0)
+        return 0.0
+
+    def get_receivedQty(self, obj):
+        po = obj.purchase_order
+        if po:
+            return float(po.line_items.aggregate(s=Sum("received_qty"))["s"] or 0)
+        return 0.0
+
+    def get_remainingQty(self, obj):
+        ordered = self.get_orderedQty(obj)
+        received = self.get_receivedQty(obj)
+        return max(0.0, ordered - received)
+
+    def validate(self, attrs):
+        po = attrs.get("purchase_order") or getattr(self.instance, "purchase_order", None)
+        qty = attrs.get("dispatched_qty")
+        if qty is not None and D(qty) <= ZERO:
+            raise serializers.ValidationError({"dispatchedQty": "Dispatch quantity must be greater than zero."})
+        if po and qty is not None:
+            ordered = D(po.line_items.aggregate(s=Sum("qty"))["s"] or ZERO)
+            qs = po.deliveries.all()
+            if self.instance and self.instance.pk:
+                qs = qs.exclude(pk=self.instance.pk)
+            already_dispatched = D(qs.aggregate(s=Sum("dispatched_qty"))["s"] or ZERO)
+            remaining = max(ZERO, ordered - already_dispatched)
+            if ordered > ZERO and remaining <= ZERO:
+                raise serializers.ValidationError({"dispatchedQty": f"All {ordered} ordered meters have already been dispatched."})
+            if ordered > ZERO and D(qty) > remaining:
+                raise serializers.ValidationError({
+                    "dispatchedQty": f"Dispatch quantity ({qty}) exceeds remaining order quantity ({remaining})."
+                })
+        return attrs
+

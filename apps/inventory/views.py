@@ -205,6 +205,127 @@ class StockSummaryView(APIView):
         )
 
 
+class CombinedGreyStockView(APIView):
+    """
+    GET /inventory/combined-grey-stock/
+    Authoritative calculation of combined grey fabric stock across all fabric qualities,
+    configured minimum threshold, shortage status, and external WIP.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request):
+        client_id = request.client_id
+        location_id = request.query_params.get("locationId") or request.query_params.get("location_id")
+        grey_calc = stock.calculate_combined_grey_stock(client_id, location_id=location_id)
+        grey_setting = stock.get_combined_grey_stock_setting(client_id)
+        threshold = grey_setting["threshold"]
+        avail_grey = grey_calc["available_grey_stock"]
+
+        shortage = ZERO
+        if not grey_setting["is_configured"]:
+            status_val = "Unconfigured"
+        elif not grey_setting["is_enabled"]:
+            status_val = "Disabled"
+        elif avail_grey < threshold:
+            shortage = round4(threshold - avail_grey)
+            status_val = "Critical" if avail_grey <= ZERO else "Low Stock"
+        else:
+            status_val = "Sufficient"
+
+        return Response({
+            "physicalGrey": float(grey_calc["physical_grey_stock"]),
+            "reservedGrey": float(grey_calc["reserved_grey_stock"]),
+            "availableGrey": float(grey_calc["available_grey_stock"]),
+            "externalWip": float(grey_calc["external_wip"]),
+            "wipByParty": grey_calc["wip_by_party"],
+            "uom": grey_calc["uom"],
+            "qualitiesCount": grey_calc["qualities_count"],
+            "takasCount": grey_calc["takas_count"],
+            "threshold": float(threshold),
+            "shortage": float(shortage),
+            "status": status_val,
+            "isConfigured": grey_setting["is_configured"],
+            "isEnabled": grey_setting["is_enabled"],
+            "channels": grey_setting["channels"],
+            "incompatibleItems": grey_calc["incompatible_items"],
+        })
+
+
+class CombinedGreyStockSettingView(APIView):
+    """
+    GET /inventory/combined-grey-stock/setting/
+    POST /inventory/combined-grey-stock/setting/
+    View and update the minimum total grey stock threshold in AlertSetting.
+    """
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_inventory"]
+
+    def get(self, request):
+        setting = stock.get_combined_grey_stock_setting(request.client_id)
+        return Response({
+            "threshold": float(setting["threshold"]),
+            "isEnabled": setting["is_enabled"],
+            "isConfigured": setting["is_configured"],
+            "uom": setting["uom"],
+            "channels": setting["channels"],
+            "settingId": setting["setting_id"],
+        })
+
+    def post(self, request):
+        client_id = request.client_id
+        data = request.data or {}
+
+        raw_threshold = data.get("threshold")
+        if raw_threshold is None or str(raw_threshold).strip() == "":
+            raise ValidationFailed(
+                "Threshold amount is required.",
+                field_errors={"threshold": ["Please specify a minimum grey stock threshold in meters."]},
+            )
+        try:
+            threshold = round4(D(raw_threshold))
+            if threshold < ZERO:
+                raise ValueError()
+        except (ValueError, TypeError, ArithmeticError):
+            raise ValidationFailed(
+                "Invalid threshold amount.",
+                field_errors={"threshold": ["Threshold must be a non-negative number."]},
+            )
+
+        uom_str = data.get("uom", "Mtr")
+        if uom_str and uom_str.strip().lower() not in ("mtr", "meter", "m", "meters"):
+            raise ValidationFailed(
+                "Combined grey stock threshold must be configured in linear meters.",
+                field_errors={"uom": ["Only meter units are supported for combined grey stock aggregation."]},
+            )
+
+        is_enabled = data.get("isEnabled", True)
+        if isinstance(is_enabled, str):
+            is_enabled = is_enabled.lower() in ("true", "1", "yes")
+
+        channels = data.get("channels") or ["in_app", "email"]
+        if not isinstance(channels, list):
+            channels = [channels]
+
+        updated_setting = stock.set_combined_grey_stock_setting(
+            client_id=client_id,
+            threshold=threshold,
+            is_enabled=is_enabled,
+            channels=channels,
+            user=request.user if getattr(request, "user", None) and request.user.is_authenticated else None,
+        )
+
+        return Response({
+            "threshold": float(updated_setting["threshold"]),
+            "isEnabled": updated_setting["is_enabled"],
+            "isConfigured": updated_setting["is_configured"],
+            "uom": updated_setting["uom"],
+            "channels": updated_setting["channels"],
+            "settingId": updated_setting["setting_id"],
+            "message": "Combined grey stock threshold updated successfully.",
+        })
+
+
 class StockMovementViewSet(ReadOnlyTenantViewSet):
     """``GET /inventory/movements/`` -- the movement ledger.
 
@@ -1960,6 +2081,41 @@ class InventoryDashboardView(APIView):
                     "lotNo": None,
                 })
 
+        # Combined Grey Fabric Stock metrics & alert status
+        grey_calc = stock.calculate_combined_grey_stock(client_id, location_id=godown_id)
+        grey_setting = stock.get_combined_grey_stock_setting(client_id)
+        threshold = grey_setting["threshold"]
+        avail_grey = grey_calc["available_grey_stock"]
+
+        shortage = ZERO
+        if not grey_setting["is_configured"]:
+            status_val = "Unconfigured"
+        elif not grey_setting["is_enabled"]:
+            status_val = "Disabled"
+        elif avail_grey < threshold:
+            shortage = round4(threshold - avail_grey)
+            status_val = "Critical" if avail_grey <= ZERO else "Low Stock"
+        else:
+            status_val = "Sufficient"
+
+        combined_grey_stock = {
+            "physicalGrey": float(grey_calc["physical_grey_stock"]),
+            "reservedGrey": float(grey_calc["reserved_grey_stock"]),
+            "availableGrey": float(grey_calc["available_grey_stock"]),
+            "externalWip": float(grey_calc["external_wip"]),
+            "wipByParty": grey_calc["wip_by_party"],
+            "uom": grey_calc["uom"],
+            "qualitiesCount": grey_calc["qualities_count"],
+            "takasCount": grey_calc["takas_count"],
+            "threshold": float(threshold),
+            "shortage": float(shortage),
+            "status": status_val,
+            "isConfigured": grey_setting["is_configured"],
+            "isEnabled": grey_setting["is_enabled"],
+            "channels": grey_setting["channels"],
+            "incompatibleItems": grey_calc["incompatible_items"],
+        }
+
         return Response({
             "units": {"inScope": units_in_scope, "mixed": mixed_units},
             "filters": {
@@ -1987,6 +2143,7 @@ class InventoryDashboardView(APIView):
             "goodRecords": good_records,
             "reprocessRecords": reprocess_records,
             "returnRecords": return_records,
+            "combinedGreyStock": combined_grey_stock,
         })
 
     @transaction.atomic
@@ -2828,14 +2985,13 @@ class QCCompleteInspectionView(APIView):
         from . import qc as qc_service
 
         client_id = request.client_id
-        receipt_id = request.data.get("receiptId")
+        receipt_id = request.data.get("receiptId") or request.data.get("grnId")
         bill_id = request.data.get("billId")
+        taka_items = request.data.get("takas")
         quantities = qc_service.parse_quantities(request.data)
 
         with transaction.atomic():
             if not receipt_id and bill_id:
-                # Goods not yet received on the bill: receive them (into QC
-                # Hold) first, then apply this result to the new GRN.
                 from apps.purchase import services as purchase_services
 
                 bill = PurchaseBill.objects.filter(
@@ -2873,6 +3029,7 @@ class QCCompleteInspectionView(APIView):
                 receipt,
                 quantities=quantities,
                 line_quantities=request.data.get("lines") or None,
+                taka_dispositions=taka_items,
                 user=request.user,
                 remarks=request.data.get("remarks") or None,
                 job_work_order=jwo,
@@ -2886,6 +3043,12 @@ class QCCompleteInspectionView(APIView):
                 f"QC recorded for {receipt.grn_number}: {result['verdict']}."
                 + ("" if result["stockPosted"] else " This receipt has no stock posted, so no stock moved.")
             ),
+            "goodQty": float(result["quantities"].get("good", 0)),
+            "secondQty": float(result["quantities"].get("second", 0)),
+            "reprocessQty": float(result["quantities"].get("reprocess", 0)),
+            "rejectQty": float(result["quantities"].get("reject", 0)),
+            "holdQty": float(result["quantities"].get("hold", 0)),
+            "postedStock": float(result["quantities"].get("good", 0)),
             **{f"{k}Qty": float(v) for k, v in result["quantities"].items()},
         })
 
@@ -4390,7 +4553,7 @@ class LotTakaRegisterView(APIView):
 
         # Base queryset
         qs = LotTaka.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related(
-            "item", "supplier", "location"
+            "item", "supplier", "location", "created_by", "updated_by"
         )
 
         # Filters
@@ -4438,6 +4601,47 @@ class LotTakaRegisterView(APIView):
         item_filter = request.query_params.get("itemId")
         if item_filter:
             qs = qs.filter(item_id=item_filter)
+
+        grn_filter = (
+            request.query_params.get("grn")
+            or request.query_params.get("grn_no")
+            or request.query_params.get("grn_number")
+            or request.query_params.get("grnNumber")
+        )
+        if grn_filter and grn_filter != "All":
+            grn_q = Q(source_document_number__iexact=grn_filter) | Q(source_document_number__icontains=grn_filter)
+            try:
+                import uuid
+                grn_uuid = uuid.UUID(str(grn_filter))
+                grn_q |= Q(source_document_id=grn_uuid)
+            except Exception:
+                pass
+            qs = qs.filter(grn_q)
+
+        po_filter = (
+            request.query_params.get("po")
+            or request.query_params.get("po_id")
+            or request.query_params.get("po_number")
+            or request.query_params.get("poNumber")
+            or request.query_params.get("purchaseOrderId")
+        )
+        if po_filter and po_filter != "All":
+            from apps.purchase.models import GoodsReceipt
+            po_q = Q(purchase_order_id=po_filter) | Q(purchase_order__po_number__iexact=po_filter)
+            try:
+                import uuid
+                po_uuid = uuid.UUID(str(po_filter))
+                po_q |= Q(purchase_order_id=po_uuid)
+            except Exception:
+                pass
+            linked_grns = list(GoodsReceipt.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(po_q).values_list("id", "grn_number"))
+            grn_ids = [g[0] for g in linked_grns]
+            grn_nums = [g[1] for g in linked_grns if g[1]]
+            qs = qs.filter(
+                Q(source_document_id__in=grn_ids)
+                | Q(source_document_number__in=grn_nums)
+                | Q(source_document_number__iexact=str(po_filter))
+            )
 
         if search_query:
             qs = qs.filter(
@@ -4554,7 +4758,14 @@ class LotTakaRegisterView(APIView):
                 "imageUrl": lt.image_url or "",
                 "sourceDoc": lt.source_document_type,
                 "grnNo": lt.source_document_number or "-",
+                "sourceDocumentId": str(lt.source_document_id) if lt.source_document_id else None,
                 "stockMovements": mov_list,
+                "createdBy": (lt.created_by.name or lt.created_by.email) if lt.created_by else None,
+                "createdById": str(lt.created_by_id) if lt.created_by_id else None,
+                "updatedBy": (lt.updated_by.name or lt.updated_by.email) if lt.updated_by else None,
+                "updatedById": str(lt.updated_by_id) if lt.updated_by_id else None,
+                "createdAt": lt.created_at.isoformat() if lt.created_at else None,
+                "updatedAt": lt.updated_at.isoformat() if lt.updated_at else None,
             })
 
         # Summary Cards -- quantities are only summed in one unit.
@@ -4654,8 +4865,196 @@ class LotTakaRegisterView(APIView):
         field_errors = {}
 
         item = Item.objects.filter(client_id=client_id, id=data.get("itemId"), deleted_at__isnull=True).first() if data.get("itemId") else None
-        if item is None:
-            field_errors["itemId"] = ["Choose the fabric item."]
+
+        takas_list = data.get("takas")
+        if takas_list and isinstance(takas_list, list) and len(takas_list) > 0:
+            if item is None:
+                field_errors["itemId"] = ["Choose the fabric item."]
+            qc_status = data.get("qcStatus") or "Pending"
+            if qc_status not in ("Passed", "Pending"):
+                qc_status = "Pending"
+            try:
+                rec_date = date.fromisoformat(str(data.get("receivedDate") or ""))
+            except ValueError:
+                rec_date = date.today()
+
+            grn_id = data.get("grnId") or data.get("sourceDocumentId")
+            grn = None
+            if grn_id:
+                from apps.purchase.models import GoodsReceipt
+                grn = GoodsReceipt.objects.select_for_update().filter(client_id=client_id, id=grn_id, deleted_at__isnull=True).first()
+            if not grn and data.get("grnNo"):
+                from apps.purchase.models import GoodsReceipt
+                grn = GoodsReceipt.objects.select_for_update().filter(client_id=client_id, grn_number__iexact=data.get("grnNo"), deleted_at__isnull=True).first()
+
+            submitted_rolls = set()
+            total_taka_meters = ZERO
+            for idx, t in enumerate(takas_list):
+                r_num = str(t.get("takaRoll") or t.get("takaNumber") or (idx + 1)).strip()
+                if r_num in submitted_rolls:
+                    field_errors[f"takas_{idx}"] = [f"Duplicate roll number '{r_num}' in submission."]
+                submitted_rolls.add(r_num)
+                t_code = t.get("takaId") or t.get("barcode")
+                if t_code and LotTaka.objects.filter(Q(taka_id=t_code) | Q(barcode=t_code), client_id=client_id, deleted_at__isnull=True).exists():
+                    field_errors[f"takas_{idx}"] = [f"Taka identifier or barcode '{t_code}' already exists."]
+                t_qty = round4(D(str(t.get("receivedQty") or t.get("qty") or 0)))
+                if t_qty <= ZERO:
+                    field_errors[f"takas_{idx}"] = [f"Taka #{t.get('takaRoll') or idx+1} quantity must be greater than 0."]
+                total_taka_meters += t_qty
+
+            if grn:
+                grn_total_qty = sum(D(str(l.received_qty or 0)) for l in grn.lines.all())
+                existing_grn_takas = list(LotTaka.objects.filter(client_id=client_id, source_document_id=grn.id, deleted_at__isnull=True))
+                is_single_placeholder = False
+                if len(existing_grn_takas) == 1:
+                    ph = existing_grn_takas[0]
+                    if abs(D(str(ph.received_quantity)) - grn_total_qty) < Decimal("0.001"):
+                        is_single_placeholder = True
+
+                already_allocated = ZERO if is_single_placeholder else sum(D(str(t.received_quantity or 0)) for t in existing_grn_takas)
+                available_for_split = max(ZERO, grn_total_qty - already_allocated)
+
+                if total_taka_meters > available_for_split:
+                    field_errors["takas"] = [
+                        f"Total taka quantity ({total_taka_meters} m) cannot exceed the received quantity available from GRN ({available_for_split} m)."
+                    ]
+
+            if field_errors:
+                raise ValidationFailed("Validation failed for lot/taka creation.", field_errors=field_errors)
+
+            client = request.user.client
+            lot_no = (data.get("lotNo") or "").strip() or allocate_number(client, "LOT", rec_date)
+
+            existing_taka_rolls = set(
+                LotTaka.objects.filter(client_id=client_id, lot_number=lot_no, deleted_at__isnull=True).values_list("taka_number", flat=True)
+            )
+
+            if grn:
+                placeholder_takas = LotTaka.objects.filter(client_id=client_id, source_document_id=grn.id, deleted_at__isnull=True)
+                if placeholder_takas.count() == 1:
+                    ph = placeholder_takas.first()
+                    if abs(D(str(ph.received_quantity)) - grn_total_qty) < Decimal("0.001"):
+                        if ph.stock_movement:
+                            bal = StockBalance.objects.filter(
+                                client_id=client_id,
+                                item_id=ph.stock_movement.item_id,
+                                location_id=ph.stock_movement.location_id,
+                            ).first()
+                            if bal:
+                                bal.on_hand = max(ZERO, (bal.on_hand or ZERO) - ph.stock_movement.effective_quantity)
+                                bal.save(update_fields=["on_hand", "updated_at"])
+                            ph.stock_movement.delete()
+                        ph.delete()
+                        existing_taka_rolls.discard(ph.taka_number)
+
+            supplier = None
+            if data.get("supplierId"):
+                supplier = Party.objects.filter(client_id=client_id, id=data.get("supplierId")).first()
+            elif data.get("supplier"):
+                supplier = Party.objects.filter(client_id=client_id, name=data.get("supplier")).first()
+            elif grn and grn.party:
+                supplier = grn.party
+
+            def dec_or_none_val(value):
+                return D(str(value)) if value not in (None, "") else None
+
+            rate = dec_or_none_val(data.get("rate")) or (grn.lines.first().unit_cost if grn and grn.lines.exists() else ZERO)
+            target_location = stock.system_location(client_id, "QC_HOLD") if qc_status == "Pending" else (Location.objects.filter(client_id=client_id, id=data.get("locationId"), deleted_at__isnull=True).first() or Location.objects.filter(client_id=client_id, is_active=True).first())
+
+            created_takas = []
+            for t_idx, t in enumerate(takas_list):
+                t_roll = str(t.get("takaRoll") or t.get("takaNumber") or (t_idx + 1)).strip()
+                if t_roll in existing_taka_rolls:
+                    raise ValidationFailed(
+                        f"Taka roll '{t_roll}' already exists for Lot '{lot_no}'. Duplicate roll numbers are not permitted.",
+                        field_errors={"takaRoll": [f"Roll #{t_roll} already exists."]}
+                    )
+                existing_taka_rolls.add(t_roll)
+
+                taka_qty = round4(D(str(t.get("receivedQty") or t.get("qty") or 0)))
+                taka_code = allocate_number(client, "TAK")
+                roll_weight = dec_or_none_val(t.get("rollWeight") or t.get("weight"))
+                t_width = dec_or_none_val(t.get("width") or data.get("width"))
+                t_gsm = dec_or_none_val(t.get("gsm") or data.get("gsm"))
+                t_remarks = t.get("remarks") or data.get("remarks") or None
+
+                lot_taka = LotTaka.objects.create(
+                    client_id=client_id,
+                    taka_id=taka_code,
+                    lot_number=lot_no,
+                    taka_number=t_roll,
+                    item=item,
+                    supplier=supplier,
+                    source_document_type="GRN" if grn else (data.get("sourceDoc") or "Manual"),
+                    source_document_number=grn.grn_number if grn else (data.get("grnNo") or None),
+                    source_document_id=grn.id if grn else None,
+                    source_line_id=grn.lines.first().id if (grn and grn.lines.exists()) else None,
+                    location=target_location,
+                    received_date=rec_date,
+                    received_quantity=taka_qty,
+                    available_quantity=ZERO,
+                    uom=item.uom,
+                    qc_status=qc_status,
+                    status="QC Hold" if qc_status == "Pending" else "Active",
+                    barcode=taka_code,
+                    tag_status="Pending",
+                    print_count=0,
+                    roll_weight=roll_weight,
+                    width=t_width,
+                    pieces=1,
+                    gsm=t_gsm,
+                    rate=rate,
+                    remarks=t_remarks,
+                    tags=data.get("tags") or [],
+                    image_url=data.get("imageUrl") or None,
+                    created_by=request.user,
+                    updated_by=request.user,
+                )
+
+                mov = stock.post_movement(
+                    client_id=client_id,
+                    item=item,
+                    location=target_location,
+                    type="PURCHASE",
+                    quantity=taka_qty,
+                    unit_cost=rate,
+                    batch_number=lot_no,
+                    lot_taka=lot_taka,
+                    reference_type="GoodsReceipt" if grn else "LotRegister",
+                    reference_id=grn.id if grn else lot_taka.id,
+                    reference_number=grn.grn_number if grn else f"{lot_no}/{t_roll}",
+                    source_document_type="GoodsReceipt" if grn else "LotRegister",
+                    source_document_id=grn.id if grn else lot_taka.id,
+                    movement_date=rec_date,
+                    notes=f"GRN intake {lot_no} / {t_roll} ({taka_code})",
+                    user=request.user,
+                )
+                lot_taka.stock_movement = mov
+                lot_taka.save(update_fields=["stock_movement", "updated_at"])
+                created_takas.append({
+                    "id": str(lot_taka.id),
+                    "takaId": lot_taka.taka_id,
+                    "lotNo": lot_taka.lot_number,
+                    "takaRoll": lot_taka.taka_number,
+                    "barcode": lot_taka.barcode,
+                    "receivedQty": float(taka_qty),
+                })
+
+            from apps.core.audit import record_audit
+            user_label = getattr(request.user, "name", None) or getattr(request.user, "email", "Authorized Manager")
+            record_audit(
+                client=client_id, actor=request.user, action="create", entity_type="LotTaka",
+                entity_id=created_takas[0]["id"] if created_takas else None,
+                entity_label=lot_no,
+                description=f"Created {len(created_takas)} takas ({total_taka_meters} m) for Lot {lot_no} by {user_label} from GRN {grn.grn_number if grn else 'manual'}",
+            )
+            return Response({
+                "success": True,
+                "message": f"Successfully created {len(created_takas)} Taka rolls for Lot {lot_no} ({total_taka_meters} m) assigned to QC Hold.",
+                "lotNo": lot_no,
+                "takas": created_takas,
+            }, status=status.HTTP_201_CREATED)
+
         try:
             received_qty = round4(D(data.get("receivedQty")))
         except Exception:  # noqa: BLE001
@@ -4799,11 +5198,18 @@ class LotTakaRegisterView(APIView):
             raise ValidationFailed("Lot record not found.", field_errors={"id": ["Not found."]})
 
         data = request.data
+        is_manager = bool(
+            getattr(request.user, "is_staff", False)
+            or getattr(request.user, "is_superuser", False)
+            or request.user.has_perm("inventory.adjust_stock")
+            or (getattr(request.user, "role", None) and any(m in request.user.role.name.lower() for m in ("manager", "admin", "lead")))
+        )
         disallowed = [
-            f for f in ("locationId", "location", "rate", "status", "qcStatus", "qc_status",
-                        "availableQty", "receivedQty")
+            f for f in ("locationId", "location", "rate", "status", "qcStatus", "qc_status", "availableQty")
             if f in data
         ]
+        if not is_manager and ("receivedQty" in data or "qty" in data):
+            disallowed.append("receivedQty")
         if disallowed:
             raise ValidationFailed(
                 f"Direct edits to {', '.join(disallowed)} are not allowed. "
@@ -4813,7 +5219,15 @@ class LotTakaRegisterView(APIView):
             )
 
         before = {"remarks": lot_taka.remarks, "rollWeight": str(lot_taka.roll_weight),
-                  "width": str(lot_taka.width), "gsm": str(lot_taka.gsm)}
+                  "width": str(lot_taka.width), "gsm": str(lot_taka.gsm), "receivedQty": str(lot_taka.received_quantity)}
+        if is_manager and ("receivedQty" in data or "qty" in data):
+            new_qty = round4(D(str(data.get("receivedQty") or data.get("qty"))))
+            if new_qty <= ZERO:
+                raise ValidationFailed("Taka quantity must be greater than zero.", field_errors={"receivedQty": ["Must be > 0."]})
+            lot_taka.received_quantity = new_qty
+            if lot_taka.stock_movement:
+                lot_taka.stock_movement.quantity = new_qty
+                lot_taka.stock_movement.save(update_fields=["quantity", "updated_at"])
         if "remarks" in data:
             lot_taka.remarks = data["remarks"]
         if "tags" in data:

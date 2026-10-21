@@ -11,9 +11,13 @@ from .views import (
     ProcessMasterViewSet,
     ReturnReasonMasterViewSet,
     TransporterViewSet,
+    PartyViewSet,
+    ItemViewSet,
 )
 
 router = DefaultRouter(trailing_slash=True)
+router.register("parties", PartyViewSet, basename="masters-parties")
+router.register("items", ItemViewSet, basename="masters-items")
 router.register("agencies", AgencyViewSet, basename="masters-agencies")
 router.register("brokers", BrokerViewSet, basename="masters-brokers")
 router.register("transporters", TransporterViewSet, basename="masters-transporters")

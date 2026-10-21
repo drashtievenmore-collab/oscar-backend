@@ -2,8 +2,8 @@
 Broker commission services (PDF §12).
 
 Tracks broker commissions linked to sales invoices:
-- Status lifecycle: Accrued -> Approved -> Payable -> Paid / Hold / Cancelled.
-- Support commission types: percent (of taxable invoice value), per_meter (on dispatched meters), fixed.
+- Status lifecycle: Accrued -> Approved -> Payable -> Partially Paid -> Paid / Hold / Cancelled.
+- Support commission types: percent (of taxable invoice value), per_meter (on dispatched meters), per_taka (on dispatched takas), fixed.
 - Broker payment posting: Dr Brokerage Payable / Cr Bank.
 - Automatic reversal on Sales Return / Claim.
 """
@@ -26,13 +26,35 @@ def calculate_broker_commission(invoice, *, user=None, rate_override=None, commi
     """Calculate and accrue broker commission on a finalized sales invoice."""
     broker = invoice.broker_fk
     if broker is None and invoice.broker:
-        broker = Broker.objects.filter(client_id=invoice.client_id, name__iexact=invoice.broker, deleted_at__isnull=True).first()
+        broker = Broker.objects.filter(
+            client_id=invoice.client_id, name__iexact=invoice.broker, deleted_at__isnull=True
+        ).first()
+
+    # If still not found, check linked sales order / quotation / lead
+    so = invoice.sales_order
+    if broker is None and so and so.broker_fk:
+        broker = so.broker_fk
+    if broker is None and so and so.quotation and so.quotation.broker_fk:
+        broker = so.quotation.broker_fk
 
     if broker is None:
         return None
 
-    comm_type = commission_type_override or broker.commission_type or "percent"
-    rate = D(rate_override if rate_override is not None else broker.default_value or 0)
+    # Determine agreed terms from deal / lead if available
+    agreed_type = None
+    agreed_rate = None
+    if so and so.quotation and so.quotation.crm_lead:
+        lead = so.quotation.crm_lead
+        cvals = lead.custom_values or {}
+        agreed_type = cvals.get("commission_basis") or cvals.get("commission_type")
+        if cvals.get("commission_rate") is not None:
+            try:
+                agreed_rate = D(str(cvals.get("commission_rate")))
+            except Exception:
+                pass
+
+    comm_type = commission_type_override or agreed_type or broker.commission_type or "percent"
+    rate = D(rate_override if rate_override is not None else (agreed_rate if agreed_rate is not None else broker.default_value or 0))
 
     # Basis: exclude GST (use taxable_value)
     taxable_val = D(invoice.taxable_value or invoice.total or 0)
@@ -43,6 +65,17 @@ def calculate_broker_commission(invoice, *, user=None, rate_override=None, commi
         amount = round2(taxable_val * rate / D(100))
     elif comm_type == "per_meter":
         amount = round2(total_meters * rate)
+    elif comm_type == "per_taka":
+        # Calculate eligible takas from invoice lines
+        takas_count = 0
+        for line in invoice.line_items.all():
+            if getattr(line, "taka_count", None):
+                takas_count += int(line.taka_count)
+            elif line.line_taka_allocations.exists():
+                takas_count += line.line_taka_allocations.count()
+            else:
+                takas_count += 1
+        amount = round2(D(max(1, takas_count)) * rate)
     else:  # fixed
         amount = round2(rate)
 
@@ -57,7 +90,7 @@ def calculate_broker_commission(invoice, *, user=None, rate_override=None, commi
             "salesperson": invoice.salesperson_fk,
             "invoice_date": invoice.doc_date,
             "invoice_amount": taxable_val,
-            "commission_basis": "INVOICE",
+            "commission_basis": "QUANTITY" if comm_type in ("per_meter", "per_taka") else "INVOICE",
             "commission_type": comm_type,
             "rate": rate,
             "commission_amount": amount,
@@ -94,13 +127,18 @@ def make_broker_payable(commission, *, user=None):
 
 
 @transaction.atomic
-def pay_broker_commission(commission, amount=None, *, payment_ref=None, user=None):
+def pay_broker_commission(commission, amount=None, *, payment_ref=None, payment_method=None, bank_account=None, user=None, remarks=None):
     """Record broker payment and post Dr Brokerage Payable / Cr Bank."""
     commission = BrokerCommission.objects.select_for_update().get(pk=commission.pk)
-    pay_amount = round2(D(amount)) if amount is not None else D(commission.commission_amount)
+    outstanding = round2(D(commission.commission_amount) - D(commission.paid_amount))
 
+    pay_amount = round2(D(amount)) if amount is not None else outstanding
     if pay_amount <= ZERO:
         raise ValidationFailed("Payment amount must be greater than zero.")
+    if pay_amount > outstanding:
+        raise ValidationFailed(
+            f"Payment amount (₹ {pay_amount:,.2f}) cannot exceed outstanding balance (₹ {outstanding:,.2f})."
+        )
 
     # Post accounting entry
     try:
@@ -110,7 +148,7 @@ def pay_broker_commission(commission, amount=None, *, payment_ref=None, user=Non
                 ledger.debit(
                     ledger.system_account(commission.client_id, "brokerage_payable"),
                     pay_amount,
-                    description=f"Brokerage payment to {commission.broker.name}",
+                    description=f"Brokerage payout to {commission.broker.name} ({payment_method or 'Bank Transfer'})",
                 ),
                 ledger.credit(
                     ledger.system_account(commission.client_id, "bank"),
@@ -118,7 +156,7 @@ def pay_broker_commission(commission, amount=None, *, payment_ref=None, user=Non
                     description=f"Brokerage payout for invoice {commission.invoice.invoice_number}",
                 ),
             ],
-            narration=f"Broker payment {commission.commission_number or commission.id}",
+            narration=f"Broker payment {commission.commission_number or commission.id}: {remarks or ''}",
             source_document_type="BrokerCommission",
             source_document_id=commission.id,
             user=user,
@@ -127,27 +165,40 @@ def pay_broker_commission(commission, amount=None, *, payment_ref=None, user=Non
     except Exception:
         pass
 
-    commission.paid_amount = round2(commission.paid_amount + pay_amount)
-    commission.status = "Paid"
+    new_total_paid = round2(D(commission.paid_amount) + pay_amount)
+    commission.paid_amount = new_total_paid
+    if new_total_paid >= D(commission.commission_amount):
+        commission.status = "Paid"
+    else:
+        commission.status = "Partially Paid"
     commission.paid_at = timezone.now()
-    commission.payment_reference = payment_ref
-    commission.save(update_fields=["paid_amount", "status", "paid_at", "payment_reference", "journal_entry", "updated_at"])
+    if payment_ref:
+        commission.payment_reference = payment_ref
+    if remarks:
+        commission.notes = (commission.notes or "") + f" [Paid ₹{pay_amount:,.2f}: {remarks}]"
+    commission.save(update_fields=["paid_amount", "status", "paid_at", "payment_reference", "notes", "journal_entry", "updated_at"])
     return commission
 
 
 @transaction.atomic
-def reverse_broker_commission_for_invoice(invoice, *, user=None, reason=None):
+def reverse_broker_commission_for_invoice(invoice, *, user=None, return_val=None, reason=None):
     """Adjust or cancel broker commission when a sales return or credit note occurs."""
     commissions = BrokerCommission.objects.filter(
         client_id=invoice.client_id, invoice=invoice, deleted_at__isnull=True
     )
     for comm in commissions:
-        if comm.status in ("Accrued", "Approved", "Payable"):
-            comm.status = "Cancelled"
-            comm.notes = (comm.notes or "") + f" [Auto-cancelled on return: {reason or 'Sales Return'}]"
-            comm.save(update_fields=["status", "notes", "updated_at"])
+        if comm.status in ("Accrued", "Approved", "Payable", "Partially Paid"):
+            if return_val and D(return_val) < D(comm.invoice_amount) and D(comm.invoice_amount) > ZERO:
+                # Proportional reduction
+                reduction = round2(D(comm.commission_amount) * (D(return_val) / D(comm.invoice_amount)))
+                comm.commission_amount = max(ZERO, round2(D(comm.commission_amount) - reduction))
+                comm.notes = (comm.notes or "") + f" [Adjusted -₹{reduction} on return: {reason or 'Return'}]"
+                comm.save(update_fields=["commission_amount", "notes", "updated_at"])
+            else:
+                comm.status = "Cancelled"
+                comm.notes = (comm.notes or "") + f" [Auto-cancelled on return: {reason or 'Sales Return'}]"
+                comm.save(update_fields=["status", "notes", "updated_at"])
         elif comm.status == "Paid":
-            # Reverse posted journal entry if any
             if comm.journal_entry_id:
                 try:
                     ledger.reverse_document_entries(

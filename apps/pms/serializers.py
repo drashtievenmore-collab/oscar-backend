@@ -255,6 +255,11 @@ class ProjectStageSerializer(BaseModelSerializer):
     delayDetails = serializers.SerializerMethodField()
     isOverdue = serializers.SerializerMethodField()
     isAtRisk = serializers.SerializerMethodField()
+    branch = serializers.SerializerMethodField()
+    quantities = serializers.SerializerMethodField()
+    document = serializers.SerializerMethodField()
+    isRequired = serializers.SerializerMethodField()
+    remarks = serializers.SerializerMethodField()
 
     class Meta:
         model = ProjectStage
@@ -265,7 +270,8 @@ class ProjectStageSerializer(BaseModelSerializer):
             "actualCompletionDateTime", "completionPct", "percentage", "weightPct",
             "weight", "requiredApproval",
             "requiredDocument", "status", "tasks", "documents", "approvals",
-            "delayDetails", "isOverdue", "isAtRisk", "created_at", "updated_at",
+            "delayDetails", "isOverdue", "isAtRisk", "branch", "quantities", "document", "isRequired",
+            "remarks", "created_at", "updated_at",
         ]
 
     def validate(self, attrs):
@@ -319,6 +325,29 @@ class ProjectStageSerializer(BaseModelSerializer):
             threshold = services.get_settings(stage.client_id).at_risk_threshold_pct
         return services.is_stage_at_risk(stage, threshold)
 
+    def get_branch(self, stage):
+        meta_dict = (self.context.get("pipeline_stages_map") or {}).get(stage.sequence, {})
+        if "branch" in meta_dict:
+            return meta_dict["branch"]
+        if stage.sequence == 2 or "procurement" in (stage.name or "").lower():
+            return "branch_b"
+        return "common"
+
+    def get_isRequired(self, stage):
+        return stage.status != "Not Required"
+
+    def get_quantities(self, stage):
+        meta_dict = (self.context.get("pipeline_stages_map") or {}).get(stage.sequence, {})
+        return meta_dict.get("quantities", {})
+
+    def get_document(self, stage):
+        meta_dict = (self.context.get("pipeline_stages_map") or {}).get(stage.sequence, {})
+        return meta_dict.get("document", None)
+
+    def get_remarks(self, stage):
+        meta_dict = (self.context.get("pipeline_stages_map") or {}).get(stage.sequence, {})
+        return meta_dict.get("remarks", "")
+
 
 class ProjectListSerializer(BaseModelSerializer):
     """The list row -- no nested children, so the list stays one query."""
@@ -345,6 +374,16 @@ class ProjectListSerializer(BaseModelSerializer):
     isOverdue = serializers.SerializerMethodField()
     createdBy = serializers.SerializerMethodField()
     createdById = serializers.CharField(source="created_by_id", read_only=True)
+    paymentStatus = serializers.CharField(source="payment_status", required=False)
+    requirementMeters = serializers.DecimalField(source="requirement_meters", max_digits=18, decimal_places=2, coerce_to_string=False, required=False, allow_null=True)
+    dyeingSentMeters = serializers.DecimalField(source="dyeing_sent_meters", max_digits=18, decimal_places=2, coerce_to_string=False, required=False, allow_null=True)
+    customerProjectReceivedMeters = serializers.DecimalField(source="customer_project_received_meters", max_digits=18, decimal_places=2, coerce_to_string=False, required=False, allow_null=True)
+    customerProjectTotalMeters = serializers.DecimalField(source="customer_project_total_meters", max_digits=18, decimal_places=2, coerce_to_string=False, required=False, allow_null=True)
+    customerProjectStatus = serializers.CharField(source="customer_project_status", required=False, allow_null=True)
+    ownProjectReceivedMeters = serializers.DecimalField(source="own_project_received_meters", max_digits=18, decimal_places=2, coerce_to_string=False, required=False, allow_null=True)
+    ownProjectTotalMeters = serializers.DecimalField(source="own_project_total_meters", max_digits=18, decimal_places=2, coerce_to_string=False, required=False, allow_null=True)
+    ownProjectStatus = serializers.CharField(source="own_project_status", required=False, allow_null=True)
+    projectTypes = serializers.ListField(source="project_types", child=serializers.CharField(), required=False)
 
     class Meta:
         model = Project
@@ -354,6 +393,10 @@ class ProjectListSerializer(BaseModelSerializer):
             "currentDepartment", "priority", "overallCompletionPct",
             "startDate", "expectedCompletionDate", "actualCompletionDate",
             "status", "isOverdue", "createdBy", "createdById",
+            "paymentStatus", "requirementMeters", "dyeingSentMeters",
+            "customerProjectReceivedMeters", "customerProjectTotalMeters", "customerProjectStatus",
+            "ownProjectReceivedMeters", "ownProjectTotalMeters", "ownProjectStatus",
+            "projectTypes",
             "created_at", "updated_at",
         ]
 
@@ -406,12 +449,113 @@ class ProjectDetailSerializer(ProjectListSerializer):
 
     stages = serializers.SerializerMethodField()
     activityLog = serializers.SerializerMethodField()
+    pipelineSummary = serializers.SerializerMethodField()
+    customerReturns = serializers.SerializerMethodField()
+    custom_field_values = serializers.SerializerMethodField()
+    shortageAction = serializers.SerializerMethodField()
 
     class Meta(ProjectListSerializer.Meta):
-        fields = ProjectListSerializer.Meta.fields + ["stages", "activityLog"]
+        fields = ProjectListSerializer.Meta.fields + [
+            "stages", "activityLog", "pipelineSummary", "customerReturns", "custom_field_values", "shortageAction"
+        ]
+
+    def get_custom_field_values(self, project):
+        from .pipeline_services import get_project_cfv
+        return get_project_cfv(project)
+
+    def get_shortageAction(self, project):
+        from .pipeline_services import get_project_cfv
+        return get_project_cfv(project).get("shortage_action")
+
+    def get_customerReturns(self, project):
+        try:
+            from django.db.models import Q
+            from apps.sales.models import SalesReturn, SalesOrder, SalesInvoice
+
+            order = getattr(project, "sales_order", None)
+            if not order and project.crm_order_id:
+                order = SalesOrder.objects.filter(
+                    client_id=project.client_id,
+                    order_number=project.crm_order_id,
+                ).first()
+
+            invoices = []
+            if order:
+                invoices = list(SalesInvoice.objects.filter(client_id=project.client_id, sales_order=order))
+
+            q = Q()
+            if invoices:
+                q |= Q(sales_invoice__in=invoices)
+            if order:
+                q |= Q(sales_invoice__sales_order=order)
+            if project.code:
+                q |= Q(reason__icontains=project.code)
+
+            if not q:
+                if project.party_id:
+                    returns_qs = SalesReturn.objects.filter(
+                        client_id=project.client_id,
+                        party_id=project.party_id,
+                        deleted_at__isnull=True,
+                    ).select_related("party", "sales_invoice", "location").prefetch_related("line_items", "line_items__lot_taka")
+                else:
+                    return []
+            else:
+                returns_qs = (
+                    SalesReturn.objects.filter(client_id=project.client_id)
+                    .filter(q)
+                    .filter(deleted_at__isnull=True)
+                    .select_related("party", "sales_invoice", "location")
+                    .prefetch_related("line_items", "line_items__lot_taka")
+                    .distinct()
+                )
+
+            result = []
+            for ret in returns_qs:
+                lines = []
+                for line in ret.line_items.all():
+                    lines.append({
+                        "id": str(line.id),
+                        "lineNo": line.line_no,
+                        "returnedQty": float(line.returned_qty or 0),
+                        "condition": line.condition,
+                        "lotTaka": line.lot_taka.taka_number if line.lot_taka else None,
+                        "lotNo": line.lot_taka.lot_number if line.lot_taka else None,
+                        "unitPrice": float(getattr(line, "unit_price", 0) or 0),
+                        "lineTotal": float(getattr(line, "line_total", 0) or 0),
+                    })
+                result.append({
+                    "id": str(ret.id),
+                    "returnNumber": ret.return_number or f"RET-{ret.id}",
+                    "creditNoteNumber": ret.credit_note_number or "—",
+                    "docDate": ret.doc_date.isoformat() if ret.doc_date else None,
+                    "status": ret.status,
+                    "reason": ret.reason or "—",
+                    "totalAmount": float(ret.total_amount or 0),
+                    "invoiceNumber": ret.sales_invoice.invoice_number if ret.sales_invoice else "—",
+                    "invoiceId": str(ret.sales_invoice_id) if ret.sales_invoice_id else None,
+                    "customerName": ret.party.name if ret.party else project.customer_name,
+                    "locationName": ret.location.name if ret.location else "—",
+                    "totalReturnedQty": sum(l["returnedQty"] for l in lines),
+                    "lines": lines,
+                })
+            return result
+        except Exception:
+            return []
+
+    def get_pipelineSummary(self, project):
+        if self.context.get("pipeline_summary"):
+            return self.context.get("pipeline_summary")
+        try:
+            from .pipeline_services import evaluate_stock_and_route
+            return evaluate_stock_and_route(project)
+        except Exception:
+            return {}
 
     def get_stages(self, project):
-        stages = self.context.get("stages") or []
+        stages = self.context.get("stages")
+        if stages is None:
+            stages = list(project.stages.filter(deleted_at__isnull=True).order_by("sequence"))
         return ProjectStageSerializer(stages, many=True, context=self.context).data
 
     def get_activityLog(self, project):

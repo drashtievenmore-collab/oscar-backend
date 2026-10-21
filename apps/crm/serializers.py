@@ -133,6 +133,7 @@ class LeadSerializer(BaseModelSerializer):
     conversionReference = serializers.CharField(source="conversion_reference", read_only=True)
     customerId = serializers.CharField(source="party.id", read_only=True)
     customerName = serializers.CharField(source="party.name", read_only=True)
+    customValues = serializers.JSONField(source="custom_values", required=False)
 
     class Meta:
         model = Lead
@@ -144,7 +145,7 @@ class LeadSerializer(BaseModelSerializer):
             "customerId", "customerName",
             "convertedAt", "convertedByName", "conversionSource",
             "conversionReference",
-            "lost_reason", "custom_values",
+            "lost_reason", "custom_values", "customValues",
             "productsCount", "sourcesCount", "filesCount", "openTasksCount",
             "deliveryChallansCount",
             "salesInvoicesCount",
@@ -239,12 +240,17 @@ class LeadThreadSerializer(BaseModelSerializer):
 
 class LeadEmailSerializer(BaseModelSerializer):
     createdByName = serializers.CharField(source="created_by.name", read_only=True)
+    toAddresses = serializers.ListField(
+        child=serializers.CharField(), source="to_addresses", required=False
+    )
+    status = serializers.CharField(required=False)
+    errorMessage = serializers.CharField(source="error_message", read_only=True)
 
     class Meta:
         model = LeadEmail
         fields = [
-            "id", "subject", "body", "to_addresses", "sent_at",
-            "provider_message_id", "created_at", "createdByName",
+            "id", "subject", "body", "to_addresses", "toAddresses", "sent_at",
+            "provider_message_id", "status", "errorMessage", "created_at", "createdByName",
         ]
 
 

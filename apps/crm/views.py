@@ -170,6 +170,26 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             serializer.validated_data["stage"] = first
 
         lead = super().perform_create(serializer)
+        if not Deal.objects.filter(lead=lead, client_id=lead.client_id, deleted_at__isnull=True).exists():
+            deal = Deal.objects.create(
+                client=lead.client,
+                deal_number=allocate_number(lead.client, "DEAL"),
+                title=lead.name,
+                lead=lead,
+                party=lead.party,
+                owner=lead.owner,
+                value=lead.amount or 0,
+                stage="Draft",
+                created_by=self.request.user if getattr(self.request.user, "is_authenticated", False) else None,
+            )
+            lead.converted_deal = deal
+            lead.save(update_fields=["converted_deal", "updated_at"])
+            DealActivity.objects.create(
+                deal=deal,
+                type="created",
+                description=f"Deal automatically created in Draft stage for new lead {lead.lead_number}.",
+                actor=self.request.user if getattr(self.request.user, "is_authenticated", False) else None,
+            )
         services.run_stage_automation(lead, lead.stage, user=self.request.user)
         return lead
 
@@ -487,9 +507,17 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
                          "title": "Note added", "body": note.body,
                          "actor": note.author.name if note.author_id else None})
         for email in lead.emails.filter(deleted_at__isnull=True):
-            rows.append({"type": "email", "id": str(email.id),
-                         "at": email.sent_at or email.created_at,
-                         "title": email.subject, "body": email.body, "actor": None})
+            email_status = getattr(email, "status", "Sent") or "Sent"
+            rows.append({
+                "type": "email",
+                "id": str(email.id),
+                "at": email.sent_at or email.created_at,
+                "title": email.subject,
+                "body": email.body,
+                "status": email_status,
+                "actor": email.created_by.name if email.created_by_id else None,
+                "dotColor": "#10b981" if email_status == "Sent" else ("#ef4444" if email_status == "Failed" else "#3b82f6"),
+            })
         for task in lead.tasks.filter(deleted_at__isnull=True):
             rows.append({"type": "task", "id": str(task.id), "at": task.created_at,
                          "title": task.title, "body": task.description,
@@ -640,22 +668,26 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
     @action(detail=True, methods=["get", "post"], url_path="emails")
     def emails(self, request, pk=None):
         if request.method == "POST":
+            lead = self.get_object()
             raw = request.data.dict() if hasattr(request.data, "dict") else dict(request.data)
             data = dict(raw)
-            # A drawer "Send Email" is sent, not a draft.
-            if not data.get("sent_at") and not data.get("sentAt"):
-                data["sent_at"] = timezone.now().isoformat()
-            lead = self.get_object()
-            serializer = LeadEmailSerializer(
-                data=data, context=self.get_serializer_context()
-            )
-            serializer.is_valid(raise_exception=True)
-            row = serializer.save(
-                client_id=request.client_id, lead=lead,
-                created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+            to_addresses = data.get("to_addresses") or data.get("toAddresses") or data.get("mailTo") or []
+            if isinstance(to_addresses, str):
+                to_addresses = [a.strip() for a in to_addresses.split(",") if a.strip()]
+            subject = data.get("subject")
+            body = data.get("body") or data.get("message")
+
+            from .email_services import send_lead_email
+            email_record = send_lead_email(
+                lead,
+                to_addresses=to_addresses,
+                subject=subject,
+                body=body,
+                actor=request.user,
+                client_id=request.client_id,
             )
             return Response(
-                LeadEmailSerializer(row, context=self.get_serializer_context()).data,
+                LeadEmailSerializer(email_record, context=self.get_serializer_context()).data,
                 status=status.HTTP_201_CREATED,
             )
         return self._sub_resource(request, "emails", LeadEmailSerializer)
@@ -1609,18 +1641,37 @@ class CrmDashboardView(APIView):
         return Response(
             {
                 "kpis": {
-                    "totalLeads": leads.count(),
-                    "openDeals": deals.exclude(stage__in=["Won", "Lost"]).count(),
-                    "wonDeals": deals.filter(stage="Won").count(),
-                    "pipelineValue": round2(
-                        deals.exclude(stage__in=["Won", "Lost"]).aggregate(
-                            value=money_sum("value")
-                        )["value"]
-                    ),
-                    "openTasks": Task.objects.filter(
-                        client_id=client_id, deleted_at__isnull=True
-                    ).exclude(status="Completed").count(),
-                },
+            "totalLeads": leads.count(),
+            "convertedLeads": leads.filter(converted_at__isnull=False).count(),
+            "openLeads": leads.filter(converted_at__isnull=True).count(),
+            "openDeals": deals.exclude(stage__in=["Won", "Lost"]).count(),
+            "wonDeals": deals.filter(stage="Won").count(),
+            "lostDeals": deals.filter(stage="Lost").count(),
+            "totalDeals": deals.count(),
+            "pipelineValue": round2(
+                deals.exclude(stage__in=["Won", "Lost"]).aggregate(
+                    value=money_sum("value")
+                )["value"]
+            ),
+            "wonValue": round2(
+                deals.filter(stage="Won").aggregate(value=money_sum("value"))["value"]
+            ),
+            "leadConversionRatePct": round(
+                (leads.filter(converted_at__isnull=False).count() / max(leads.count(), 1)) * 100, 1
+            ),
+            "winRatePct": round(
+                (deals.filter(stage="Won").count()
+                / max(deals.filter(stage__in=["Won", "Lost"]).count(), 1))
+                * 100,
+                1,
+            ),
+            "openTasks": Task.objects.filter(
+                client_id=client_id, deleted_at__isnull=True
+            ).exclude(status="Completed").count(),
+            "overdueTasks": Task.objects.filter(
+                client_id=client_id, deleted_at__isnull=True, due_date__lt=timezone.now().date()
+            ).exclude(status="Completed").count(),
+        },
                 "funnel": [
                     {
                         "stage": row["stage__name"],

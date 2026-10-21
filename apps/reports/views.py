@@ -54,6 +54,10 @@ REPORT_CATALOGUE = [
     ("hrms-attendance", "Attendance Report", "HRMS", ["month", "departmentId"]),
     ("hrms-payroll-summary", "Payroll Summary", "HRMS", ["month"]),
     ("hrms-attrition", "Attrition", "HRMS", ["date_from", "date_to"]),
+    ("annual-commercial-leakage", "Annual Commercial Leakage", "Accounts", ["date_from", "date_to"]),
+    ("party-profitability", "Party Profitability", "Sales", ["date_from", "date_to"]),
+    ("design-colour-analysis", "Design & Colour Fabric Analysis", "Inventory", ["date_from", "date_to"]),
+    ("stock-ageing-mis", "Stock Ageing MIS", "Inventory", ["asOf"]),
 ]
 
 
@@ -61,7 +65,7 @@ REPORT_CATALOGUE = [
 #: path that serves them (here, ``/accounts/reports/`` and exports).
 FINANCIAL_REPORTS = {
     "ar-ap-ageing", "ageing", "profit-and-loss", "balance-sheet", "gst-summary",
-    "cash-flow", "trial-balance",
+    "cash-flow", "trial-balance", "annual-commercial-leakage",
 }
 
 #: Per-report permission: each operational report needs its own module's view
@@ -70,9 +74,12 @@ REPORT_PERMISSIONS = {
     "inventory-valuation": ["view_inventory"],
     "stock-summary": ["view_inventory"],
     "stock-movement": ["view_inventory"],
+    "design-colour-analysis": ["view_inventory"],
+    "stock-ageing-mis": ["view_inventory"],
     "customer-revenue": ["view_sales"],
     "sales-register": ["view_sales"],
     "sales-dashboard": ["view_sales"],
+    "party-profitability": ["view_sales"],
     "vendor-allocation": ["view_purchase"],
     "purchase-register": ["view_purchase"],
     "crm-pipeline": ["view_lead"],
@@ -208,6 +215,22 @@ class ReportView(APIView):
             raise ValidationFailed(
                 "Date must be YYYY-MM-DD.", field_errors={"date": ["Expected YYYY-MM-DD."]}
             )
+
+    def _report_annual_commercial_leakage(self, request, client_id, date_from, date_to, as_of):
+        from .mis_reports import annual_commercial_leakage
+        return Response(annual_commercial_leakage(client_id, date_from=date_from, date_to=date_to))
+
+    def _report_party_profitability(self, request, client_id, date_from, date_to, as_of):
+        from .mis_reports import party_profitability_report
+        return Response(party_profitability_report(client_id, date_from=date_from, date_to=date_to))
+
+    def _report_design_colour_analysis(self, request, client_id, date_from, date_to, as_of):
+        from .mis_reports import design_colour_analysis
+        return Response(design_colour_analysis(client_id, date_from=date_from, date_to=date_to))
+
+    def _report_stock_ageing_mis(self, request, client_id, date_from, date_to, as_of):
+        from .mis_reports import stock_ageing_mis
+        return Response(stock_ageing_mis(client_id, as_of=as_of))
 
     # -- the five the frontend computes today -------------------------------
     def _report_inventory_valuation(self, request, client_id, *args):
