@@ -162,6 +162,79 @@ class EmployeeViewSet(TenantModelViewSet):
         "employmentType": "employment_type",
     }
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"], "create": ["create_staff"]}
+    def get_queryset(self):
+        self._ensure_employee_users_linked()
+        return super().get_queryset()
+
+    def _ensure_employee_users_linked(self):
+        try:
+            from apps.accounts.models import User
+            from django.db.models import Q
+            client_id = self.get_client_id()
+            unlinked_employee_users = User.objects.filter(
+                client_id=client_id,
+                deleted_at__isnull=True,
+                employee__isnull=True,
+            ).filter(
+                Q(role__name__iexact="Employee") |
+                Q(role__code__iexact="EM") |
+                Q(role__code__iexact="EMPLOYEE")
+            )
+            for u in unlinked_employee_users:
+                self._link_user_to_employee(u)
+        except Exception as e:
+            pass
+
+    @staticmethod
+    def _link_user_to_employee(user):
+        from apps.hrms.models import Employee, Department, Designation, Location
+        from apps.core.numbering import allocate_number
+
+        dept = None
+        if user.department and user.department.strip():
+            dept = Department.objects.filter(
+                client_id=user.client_id, name__iexact=user.department.strip(), deleted_at__isnull=True
+            ).first()
+            if not dept:
+                dept = Department.objects.create(client_id=user.client_id, name=user.department.strip())
+
+        desig = Designation.objects.filter(
+            client_id=user.client_id, name__iexact="Employee", deleted_at__isnull=True
+        ).first()
+        if not desig:
+            desig = Designation.objects.create(client_id=user.client_id, name="Employee")
+
+        loc = None
+        if user.location and user.location.strip():
+            loc = Location.objects.filter(
+                client_id=user.client_id, name__iexact=user.location.strip(), deleted_at__isnull=True
+            ).first()
+            if not loc:
+                loc = Location.objects.create(client_id=user.client_id, name=user.location.strip())
+
+        emp = Employee.objects.filter(
+            client_id=user.client_id, email__iexact=user.email, deleted_at__isnull=True
+        ).first()
+
+        if not emp:
+            try:
+                code = allocate_number(user.client, "EMP")
+            except Exception:
+                code = f"EMP-{(Employee.objects.filter(client_id=user.client_id).count() + 1):03d}"
+            emp = Employee.objects.create(
+                client_id=user.client_id,
+                employee_code=code,
+                name=user.name or user.email,
+                email=user.email,
+                phone=user.phone or "",
+                department=dept,
+                designation=desig,
+                location=loc,
+                joining_date=user.joined_date or timezone.localdate(),
+                status="Active" if user.status in ("Active", "Invited") else "Inactive",
+            )
+        user.employee = emp
+        user.save(update_fields=["employee"])
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -529,7 +602,13 @@ class AttendanceViewSet(TenantModelViewSet):
         "department": "employee__department__name",
         "date": "work_date",
     }
-    permission_map = {"read": ["view_team_attendance"], "write": ["mark_attendance"]}
+    permission_map = {
+        "read": ["view_team_attendance"],
+        "write": ["mark_attendance"],
+        "today": [],
+        "punch": [],
+        "punch_timeline": [],
+    }
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -667,6 +746,141 @@ class AttendanceViewSet(TenantModelViewSet):
         )[:200]
         return Response(envelope(AuditLogSerializer(rows, many=True).data))
 
+    def _resolve_employee(self, request, employee_id=None):
+        client_id = getattr(request, "client_id", None) or getattr(request.user, "client_id", None)
+        if employee_id:
+            try:
+                emp = Employee.objects.filter(
+                    pk=employee_id, client_id=client_id, deleted_at__isnull=True
+                ).first()
+                if emp:
+                    return emp
+            except (ValueError, TypeError, Exception):
+                pass
+            return Employee.objects.filter(
+                employee_code=employee_id, client_id=client_id, deleted_at__isnull=True
+            ).first()
+
+        if getattr(request.user, "employee", None):
+            return request.user.employee
+
+        if getattr(request.user, "email", None):
+            emp = Employee.objects.filter(
+                client_id=client_id, email__iexact=request.user.email, deleted_at__isnull=True
+            ).first()
+            if emp:
+                if not getattr(request.user, "employee_id", None) and hasattr(request.user, "save"):
+                    request.user.employee = emp
+                    request.user.save(update_fields=["employee"])
+                return emp
+
+        from apps.hrms.models import Designation
+        desig = Designation.objects.filter(client_id=client_id, name__iexact="Employee").first()
+        if not desig:
+            desig = Designation.objects.create(client_id=client_id, name="Employee")
+        code = f"EMP-{(Employee.objects.filter(client_id=client_id).count() + 1):03d}"
+        emp = Employee.objects.create(
+            client_id=client_id,
+            employee_code=code,
+            name=getattr(request.user, "name", "") or request.user.email,
+            email=request.user.email,
+            phone=getattr(request.user, "phone", "") or "",
+            designation=desig,
+            joining_date=timezone.localdate(),
+            status="Active",
+        )
+        request.user.employee = emp
+        request.user.save(update_fields=["employee"])
+        return emp
+
+    @action(detail=False, methods=["get"])
+    def today(self, request):
+        """GET /hrms/attendance/today/ -- punch state for current employee today."""
+        employee_id = request.query_params.get("employeeId")
+        employee = self._resolve_employee(request, employee_id)
+        if not employee:
+            return Response({
+                "has_employee": False,
+                "status": "Not Punched In",
+                "is_punched_in": False,
+                "punches": [],
+                "formatted_working_time": "00h 00m",
+                "working_seconds": 0,
+                "working_hours": 0.0,
+                "late_minutes": 0,
+                "first_punch": None,
+                "last_punch": None,
+                "date": timezone.localdate().isoformat(),
+            })
+        status_data = services.get_today_punch_status(self.get_client_id(), employee)
+        return Response(status_data)
+
+    @action(detail=False, methods=["post"])
+    def punch(self, request):
+        """POST /hrms/attendance/punch/ -- record Punch In or Punch Out."""
+        punch_type = (
+            request.data.get("punch_type")
+            or request.data.get("punchType")
+            or request.data.get("type")
+        )
+        if not punch_type:
+            raise ValidationFailed(
+                "Punch type ('IN' or 'OUT') is required.",
+                field_errors={"punch_type": ["Required."]},
+            )
+
+        employee = self._resolve_employee(
+            request, request.data.get("employeeId") or request.data.get("employee_id")
+        )
+        if not employee:
+            raise ValidationFailed(
+                "No employee profile linked to current user account.",
+                code="NO_EMPLOYEE",
+            )
+
+        remark = request.data.get("remark") or request.data.get("notes")
+        source = request.data.get("source") or "web"
+        early_reason = (
+            request.data.get("earlyReason")
+            or request.data.get("early_reason")
+            or request.data.get("reason")
+        )
+        request_regularization = bool(
+            request.data.get("requestRegularization")
+            or request.data.get("request_regularization")
+        )
+
+        punch_obj, status_data = services.record_punch(
+            client=self.get_client_id(),
+            employee=employee,
+            punch_type=punch_type,
+            source=source,
+            remark=remark,
+            early_reason=early_reason,
+            request_regularization=request_regularization,
+            user=request.user,
+        )
+        return Response(
+            status_data,
+            status=status.HTTP_201_CREATED if punch_obj else status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["get"], url_path="punch-timeline")
+    def punch_timeline(self, request):
+        employee_id = request.query_params.get("employeeId")
+        date_str = request.query_params.get("date")
+        employee = self._resolve_employee(request, employee_id)
+        if not employee:
+            return Response([])
+        work_date = timezone.localdate()
+        if date_str:
+            try:
+                work_date = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        status_data = services.get_today_punch_status(self.get_client_id(), employee, work_date=work_date)
+        return Response(status_data.get("punches", []))
+
 
 class RegularizationViewSet(TenantModelViewSet):
     queryset = AttendanceRegularization.objects.select_related("employee")
@@ -755,7 +969,13 @@ class FlexibilityPolicyView(APIView):
     """``GET/PUT /hrms/attendance/flexibility/``."""
 
     permission_classes = [HasModulePermission]
-    permission_map = {"read": ["view_team_attendance"], "write": ["mark_attendance"]}
+    permission_map = {
+        "read": ["view_team_attendance"],
+        "write": ["mark_attendance"],
+        "today": [],
+        "punch": [],
+        "punch_timeline": [],
+    }
 
     def get(self, request):
         return Response(services.flexibility_policy(request.client_id))

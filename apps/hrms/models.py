@@ -1636,16 +1636,42 @@ class BrokerCommissionRecord(TenantModel, LegacyIdMixin):
 # COMMENTED OUT PER OSCAR LETTER PAD SCOPE (Kept for reference, do not delete):
 # =============================================================================
 
-# --- Live GPS / IP Attendance Punch Clock ---
-# class AttendancePunch(TenantModel, LegacyIdMixin):
-#     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="punches")
-#     punch_type = models.TextField(choices=[("IN", "Punch In"), ("OUT", "Punch Out")])
-#     punch_time = models.DateTimeField(default=timezone.now)
-#     ip_address = models.GenericIPAddressField(null=True, blank=True)
-#     latitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
-#     longitude = models.DecimalField(max_digits=10, decimal_places=7, null=True, blank=True)
-#     early_departure_reason = models.TextField(blank=True, default="")
-#     is_regularized = models.BooleanField(default=False)
+# --- Live Attendance Punch Clock ---
+class AttendancePunch(TenantModel, LegacyIdMixin):
+    PUNCH_TYPES = [
+        ("IN", "Punch In"),
+        ("OUT", "Punch Out"),
+    ]
+    SOURCES = [
+        ("web", "Web / Topbar"),
+        ("mobile", "Mobile App"),
+        ("biometric", "Biometric Device"),
+        ("manual", "Manual / Correction"),
+    ]
+
+    employee = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, related_name="punches"
+    )
+    attendance = models.ForeignKey(
+        Attendance, on_delete=models.CASCADE, related_name="punches", null=True, blank=True
+    )
+    work_date = models.DateField(db_index=True)
+    punch_type = models.CharField(max_length=10, choices=PUNCH_TYPES)
+    punch_time = models.DateTimeField(db_index=True)
+    source = models.CharField(max_length=20, choices=SOURCES, default="web")
+    remark = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "hrms_attendance_punches"
+        ordering = ["punch_time"]
+        indexes = [
+            models.Index(fields=["client", "employee", "work_date"], name="ix_hrms_punch_emp_date"),
+            models.Index(fields=["client", "punch_time"], name="ix_hrms_punch_time"),
+        ]
+
+    def __str__(self):
+        return f"{self.employee} - {self.punch_type} @ {self.punch_time}"
+
 
 # --- Company Meetings & Conference Room Booking ---
 # class MeetingRoom(TenantModel, LegacyIdMixin):

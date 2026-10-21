@@ -872,3 +872,336 @@ def process_employee_separation(employee, *, separation_type="Resigned", last_wo
         ).update(is_active=False, status="Inactive", updated_at=timezone.now())
 
     return employee
+
+
+# ── Attendance Punch Services ───────────────────────────────────────────────
+from decimal import Decimal
+from datetime import datetime, time, timedelta
+from django.utils import timezone
+from django.db import transaction
+from apps.core.exceptions import ValidationFailed
+from apps.hrms.models import Attendance, AttendancePunch, AttendanceRegularization, Employee, Department, Designation
+
+
+def format_time_ampm(dt):
+    if not dt:
+        return None
+    local_dt = timezone.localtime(dt) if timezone.is_aware(dt) else dt
+    return local_dt.strftime("%I:%M %p")
+
+
+def format_duration_hm(seconds):
+    if not seconds or seconds < 0:
+        return "00h 00m"
+    h = int(seconds) // 3600
+    m = (int(seconds) % 3600) // 60
+    return f"{h:02d}h {m:02d}m"
+
+
+def calculate_punch_metrics(client_id, employee, work_date, punches=None, now=None):
+    if punches is None:
+        punches = list(
+            AttendancePunch.objects.filter(
+                client_id=client_id,
+                employee=employee,
+                work_date=work_date,
+                deleted_at__isnull=True,
+            ).order_by("punch_time")
+        )
+
+    if now is None:
+        now = timezone.now()
+    elif not timezone.is_aware(now):
+        now = timezone.make_aware(now)
+
+    total_completed_seconds = 0
+    current_in = None
+    pairs_display = []
+
+    for p in punches:
+        if p.punch_type == "IN":
+            current_in = p
+        elif p.punch_type == "OUT" and current_in:
+            delta = (p.punch_time - current_in.punch_time).total_seconds()
+            if delta > 0:
+                total_completed_seconds += delta
+                pairs_display.append({
+                    "inTime": format_time_ampm(current_in.punch_time),
+                    "outTime": format_time_ampm(p.punch_time),
+                    "duration": format_duration_hm(delta),
+                    "durationSeconds": int(delta),
+                })
+            current_in = None
+
+    is_punched_in = bool(punches and punches[-1].punch_type == "IN")
+    active_seconds = 0
+    if is_punched_in and punches:
+        active_seconds = max(0, int((now - punches[-1].punch_time).total_seconds()))
+
+    total_working_seconds = int(total_completed_seconds + active_seconds)
+    working_hours = round(Decimal(total_working_seconds) / Decimal(3600), 2)
+
+    first_punch = punches[0] if punches else None
+    last_punch = punches[-1] if punches else None
+    first_in = next((p for p in punches if p.punch_type == "IN"), None)
+    last_out = next((p for p in reversed(punches) if p.punch_type == "OUT"), None)
+
+    shift_start_time = time(9, 30)
+    shift_end_time = time(18, 30)
+    full_day_hours = Decimal("8.00")
+    half_day_threshold = Decimal("4.00")
+
+    late_minutes = 0
+    if first_in:
+        local_first_in = timezone.localtime(first_in.punch_time) if timezone.is_aware(first_in.punch_time) else first_in.punch_time
+        shift_start_dt = datetime.combine(local_first_in.date(), shift_start_time)
+        first_in_naive = local_first_in.replace(tzinfo=None) if local_first_in.tzinfo else local_first_in
+        if first_in_naive > shift_start_dt:
+            diff = (first_in_naive - shift_start_dt).total_seconds()
+            late_minutes = max(0, int(diff // 60))
+
+    early_leaving_minutes = 0
+    if last_out:
+        local_last_out = timezone.localtime(last_out.punch_time) if timezone.is_aware(last_out.punch_time) else last_out.punch_time
+        shift_end_dt = datetime.combine(local_last_out.date(), shift_end_time)
+        last_out_naive = local_last_out.replace(tzinfo=None) if local_last_out.tzinfo else local_last_out
+        if last_out_naive < shift_end_dt:
+            diff = (shift_end_dt - last_out_naive).total_seconds()
+            early_leaving_minutes = max(0, int(diff // 60))
+
+    is_early_out = bool(last_out and (early_leaving_minutes > 0 or working_hours < full_day_hours))
+
+    if not punches:
+        status = "Absent"
+    elif is_punched_in:
+        status = "Late" if late_minutes > 0 else "Present"
+    elif working_hours < half_day_threshold:
+        status = "Half Day"
+    elif late_minutes > 0:
+        status = "Late"
+    else:
+        status = "Present"
+
+    return {
+        "punches": punches,
+        "is_punched_in": is_punched_in,
+        "total_working_seconds": total_working_seconds,
+        "formatted_working_time": format_duration_hm(total_working_seconds),
+        "working_hours": working_hours,
+        "first_punch": first_punch,
+        "last_punch": last_punch,
+        "first_in": first_in,
+        "last_out": last_out,
+        "late_minutes": late_minutes,
+        "early_leaving_minutes": early_leaving_minutes,
+        "is_early_out": is_early_out,
+        "shift_start": "09:30",
+        "shift_end": "18:30",
+        "full_day_hours": float(full_day_hours),
+        "half_day_threshold_hours": float(half_day_threshold),
+        "status": status,
+        "pairs_display": pairs_display,
+    }
+
+
+def get_today_punch_status(client, employee=None, work_date=None):
+    if employee is None and hasattr(client, 'client'):
+        employee = client
+        client = employee.client
+    client_id = getattr(client, "id", client)
+    if work_date is None:
+        work_date = timezone.localdate()
+
+    punches = list(
+        AttendancePunch.objects.filter(
+            client_id=client_id,
+            employee=employee,
+            work_date=work_date,
+            deleted_at__isnull=True,
+        ).order_by("punch_time")
+    )
+    metrics = calculate_punch_metrics(client_id, employee, work_date, punches=punches)
+
+    if metrics["is_punched_in"]:
+        status_label = "Punched In"
+    elif punches:
+        status_label = "Punched Out"
+    else:
+        status_label = "Not Punched In"
+
+    first_punch_time = format_time_ampm(metrics["first_punch"].punch_time) if metrics["first_punch"] else None
+    last_punch_time = format_time_ampm(metrics["last_punch"].punch_time) if metrics["last_punch"] else None
+
+    att_row = Attendance.objects.filter(
+        client_id=client_id, employee=employee, work_date=work_date
+    ).first()
+
+    has_out_punch = any(p.punch_type == "OUT" for p in punches)
+    day_completed = bool(has_out_punch and not metrics["is_punched_in"])
+    can_punch_in = bool(not metrics["is_punched_in"] and not day_completed)
+    can_punch_out = bool(metrics["is_punched_in"])
+
+    has_pending_regularization = AttendanceRegularization.objects.filter(
+        client_id=client_id, employee=employee, work_date=work_date, status="Pending"
+    ).exists()
+
+    return {
+        "has_employee": True,
+        "employee": {
+            "id": str(employee.id),
+            "name": employee.name,
+            "employeeCode": employee.employee_code,
+            "department": getattr(employee.department, "name", "") if employee.department else "",
+            "shift": employee.shift or "General",
+        },
+        "date": work_date.isoformat(),
+        "status": status_label,
+        "is_punched_in": metrics["is_punched_in"],
+        "day_completed": day_completed,
+        "can_punch_in": can_punch_in,
+        "can_punch_out": can_punch_out,
+        "is_early_out": metrics["is_early_out"],
+        "early_leaving_minutes": metrics["early_leaving_minutes"],
+        "shift_start": metrics["shift_start"],
+        "shift_end": metrics["shift_end"],
+        "full_day_hours": metrics["full_day_hours"],
+        "half_day_threshold_hours": metrics["half_day_threshold_hours"],
+        "has_pending_regularization": has_pending_regularization,
+        "attendance_status": att_row.status if att_row else metrics["status"],
+        "first_punch": first_punch_time,
+        "last_punch": last_punch_time,
+        "first_punch_iso": metrics["first_punch"].punch_time.isoformat() if metrics["first_punch"] else None,
+        "last_punch_iso": metrics["last_punch"].punch_time.isoformat() if metrics["last_punch"] else None,
+        "working_seconds": metrics["total_working_seconds"],
+        "formatted_working_time": metrics["formatted_working_time"],
+        "working_hours": float(metrics["working_hours"]),
+        "late_minutes": metrics["late_minutes"],
+        "punches": [
+            {
+                "id": str(p.id),
+                "punchType": p.punch_type,
+                "punchTime": p.punch_time.isoformat(),
+                "timeDisplay": format_time_ampm(p.punch_time),
+                "source": p.source,
+                "remark": p.remark,
+            }
+            for p in punches
+        ],
+        "pairs": metrics["pairs_display"],
+    }
+
+
+@transaction.atomic
+def record_punch(
+    *, client, employee, punch_type, punch_time=None, source="web", remark=None, user=None,
+    early_reason=None, request_regularization=False
+):
+    client_id = getattr(client, "id", client)
+    punch_type = str(punch_type).upper().strip()
+    if punch_type not in ("IN", "OUT"):
+        raise ValidationFailed(
+            f"Invalid punch type: {punch_type}. Must be 'IN' or 'OUT'.",
+            field_errors={"punch_type": ["Must be IN or OUT."]},
+        )
+
+    if punch_time is None:
+        punch_time = timezone.now()
+    elif not timezone.is_aware(punch_time):
+        punch_time = timezone.make_aware(punch_time)
+
+    work_date = timezone.localdate(punch_time)
+
+    existing_punches = list(
+        AttendancePunch.objects.select_for_update()
+        .filter(client_id=client_id, employee=employee, work_date=work_date)
+        .order_by("punch_time")
+    )
+    last_punch = existing_punches[-1] if existing_punches else None
+
+    # Single punch in/out per day rule
+    has_out_punch = any(p.punch_type == "OUT" for p in existing_punches)
+    if punch_type == "IN" and has_out_punch:
+        raise ValidationFailed(
+            "You have already completed your punch in and punch out for today.",
+            code="DAY_PUNCH_LIMIT_REACHED",
+        )
+
+    if last_punch:
+        time_diff = abs((punch_time - last_punch.punch_time).total_seconds())
+        if last_punch.punch_type == punch_type:
+            if time_diff < 5:
+                return last_punch, get_today_punch_status(client_id, employee, work_date=work_date)
+            if punch_type == "IN":
+                raise ValidationFailed("You are already punched in. Please punch out first.", code="ALREADY_PUNCHED_IN")
+            else:
+                raise ValidationFailed("You are already punched out. Please punch in first.", code="ALREADY_PUNCHED_OUT")
+    elif punch_type == "OUT":
+        raise ValidationFailed("Cannot punch out without punching in first.", code="CANNOT_PUNCH_OUT")
+
+    punch_remark = remark
+    if early_reason:
+        punch_remark = f"{remark} | Early: {early_reason}" if remark else f"Early Punch Out: {early_reason}"
+
+    punch = AttendancePunch.objects.create(
+        client_id=client_id,
+        employee=employee,
+        work_date=work_date,
+        punch_type=punch_type,
+        punch_time=punch_time,
+        source=source,
+        remark=punch_remark,
+        created_by=user if getattr(user, "is_authenticated", False) else None,
+    )
+
+    all_punches = existing_punches + [punch]
+    metrics = calculate_punch_metrics(client_id, employee, work_date, punches=all_punches, now=punch_time)
+
+    first_in = metrics["first_in"].punch_time if metrics["first_in"] else None
+    last_out = metrics["last_out"].punch_time if metrics["last_out"] else None
+    check_in_time = first_in or metrics["first_punch"].punch_time
+    check_out_time = None if metrics["is_punched_in"] else last_out
+
+    att_row = Attendance.objects.select_for_update().filter(
+        client_id=client_id, employee=employee, work_date=work_date
+    ).first()
+
+    status_to_use = metrics["status"]
+    if att_row and att_row.status in ("On Leave", "Holiday", "Week Off"):
+        status_to_use = att_row.status
+
+    if att_row is not None:
+        att_row.check_in = check_in_time
+        att_row.check_out = check_out_time
+        att_row.hours = metrics["working_hours"]
+        att_row.status = status_to_use
+        att_row.source = "punch"
+        if early_reason:
+            att_row.remark = f"{att_row.remark or ''} | Early: {early_reason}".strip(" |")
+        att_row.save(update_fields=["check_in", "check_out", "hours", "status", "source", "remark", "updated_at"])
+    else:
+        att_row = Attendance.objects.create(
+            client_id=client_id,
+            employee=employee,
+            work_date=work_date,
+            check_in=check_in_time,
+            check_out=check_out_time,
+            hours=metrics["working_hours"],
+            status=status_to_use,
+            source="punch",
+            remark=punch_remark,
+        )
+
+    # Optional regularization request creation
+    if request_regularization and early_reason:
+        AttendanceRegularization.objects.create(
+            client_id=client_id,
+            employee=employee,
+            work_date=work_date,
+            requested_check_in=check_in_time,
+            requested_check_out=timezone.now(),
+            reason=f"Early departure regularisation: {early_reason}",
+            status="Pending",
+            created_by=user if getattr(user, "is_authenticated", False) else None,
+        )
+
+    return punch, get_today_punch_status(client_id, employee, work_date=work_date)
