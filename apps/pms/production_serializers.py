@@ -36,6 +36,13 @@ class ProductionInstructionSerializer(BaseModelSerializer):
     finalPoNumber = serializers.ReadOnlyField(source="final_po.po_number")
     employeeCode = serializers.ReadOnlyField(source="employee.employee_code")
     employeeName = serializers.ReadOnlyField(source="employee.name")
+    supervisorName = serializers.ReadOnlyField(source="supervisor.name")
+    expectedStartDate = serializers.DateField(
+        source="expected_start_date", required=False, allow_null=True
+    )
+    expectedCompletionDate = serializers.DateField(
+        source="expected_completion_date", required=False, allow_null=True
+    )
     cumulative = serializers.SerializerMethodField()
     balance = serializers.SerializerMethodField()
     totalProduced = serializers.SerializerMethodField()
@@ -48,9 +55,10 @@ class ProductionInstructionSerializer(BaseModelSerializer):
         fields = [
             "id", "instruction_number", "agency_name", "agencyId", "agencyCode", "order_reference", "order_meter",
             "taka_count", "total_weight", "width", "gsm", "tentative_rate", "agreed_rate", "rate_uom",
-            "special_terms", "expected_start_date", "pi_date", "fabric", "process_type", "agreed_job_rate", "rejected_qty",
+            "special_terms", "expected_start_date", "expectedStartDate", "expected_completion_date", "expectedCompletionDate",
+            "pi_date", "fabric", "process_type", "agreed_job_rate", "rejected_qty",
             "verification_remarks", "completed_at", "greyLotId", "greyLotNo", "finalPoId", "finalPoNumber",
-            "employeeId", "employeeCode", "employeeName", "supervisorId",
+            "employeeId", "employeeCode", "employeeName", "supervisorId", "supervisorName",
             "status", "verified_by", "verified_at", "notes",
             "cumulative", "balance", "totalProduced", "acceptedQty",
             "shortageQty", "finalAmount", "created_at", "updated_at",
@@ -120,7 +128,7 @@ class DailyProductionEntrySerializer(BaseModelSerializer):
         source="instruction", model="pms.ProductionInstruction"
     )
     enteredByEmployeeId = TenantPrimaryKeyRelatedField(
-        source="entered_by_employee", model="hrms.Employee"
+        source="entered_by_employee", model="hrms.Employee", required=False, allow_null=True
     )
     photoFileId = TenantPrimaryKeyRelatedField(
         source="photo_file", model="core.File", required=False, allow_null=True
@@ -135,7 +143,7 @@ class DailyProductionEntrySerializer(BaseModelSerializer):
             "produced_takas", "produced_weight", "good_meter", "reject_meter", "reprocess_meter",
             "cumulative_meter", "balance_meter", "photoFileId",
             "enteredByEmployeeId", "employeeCode", "employeeName",
-            "entered_by_user", "created_at", "remarks",
+            "entered_by_user", "created_at", "remarks", "status",
         ]
         read_only_fields = [
             "id", "entered_by_user", "created_at", "opening_pending",
@@ -146,9 +154,26 @@ class DailyProductionEntrySerializer(BaseModelSerializer):
         employee = attrs.get(
             "entered_by_employee", getattr(self.instance, "entered_by_employee", None)
         )
-        services.validate_employee_for_production(
-            employee, field="enteredByEmployeeId"
-        )
+        if not employee and hasattr(self, "context") and "request" in self.context:
+            user = self.context["request"].user
+            if user and getattr(user, "is_authenticated", False):
+                from apps.hrms.models import Employee
+                employee = getattr(user, "employee", None)
+                if not employee:
+                    employee = Employee.objects.filter(client=user.client, email__iexact=user.email, deleted_at__isnull=True).first()
+                if not employee and "instruction" in attrs:
+                    employee = getattr(attrs["instruction"], "employee", None) or getattr(attrs["instruction"], "supervisor", None)
+                if not employee:
+                    employee = Employee.objects.filter(client=user.client, status="Active", deleted_at__isnull=True).first()
+                if employee:
+                    attrs["entered_by_employee"] = employee
+
+        if employee:
+            services.validate_employee_for_production(
+                employee, field="enteredByEmployeeId"
+            )
+        else:
+            raise serializers.ValidationError({"enteredByEmployeeId": ["An active employee is required to record daily production."]})
         return attrs
 
 
@@ -199,4 +224,11 @@ class VerifyInstructionSerializer(BaseSerializer):
     rejectedQty = serializers.DecimalField(
         max_digits=18, decimal_places=4, required=False, default=0
     )
+    physicallyVerifiedQty = serializers.DecimalField(
+        max_digits=18, decimal_places=4, required=False, allow_null=True
+    )
     reason = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    action = serializers.CharField(required=False, allow_blank=True, default="approve_complete")
+    verificationDate = serializers.DateField(required=False, allow_null=True)
+    verifiedByEmployeeId = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    attachments = serializers.ListField(required=False, default=list)

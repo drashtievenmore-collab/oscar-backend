@@ -390,12 +390,24 @@ class QCInspectionSerializer(BaseModelSerializer):
     inspectorId = TenantPrimaryKeyRelatedField(source="inspector", model="accounts.User", required=False, allow_null=True)
     inspectorName = serializers.SerializerMethodField()
     inspectorEmployeeId = TenantPrimaryKeyRelatedField(source="inspector_employee", model="hrms.Employee", required=False, allow_null=True)
+    purchaseOrderId = TenantPrimaryKeyRelatedField(source="purchase_order", model="purchase.PurchaseOrder", required=False, allow_null=True)
+    productionInstructionId = TenantPrimaryKeyRelatedField(source="production_instruction", model="pms.ProductionInstruction", required=False, allow_null=True)
+    fabricItemId = TenantPrimaryKeyRelatedField(source="fabric_item", model="masters.Item", required=False, allow_null=True)
+    inspectionType = serializers.CharField(source="inspection_type", required=False)
+    inspectionMethod = serializers.CharField(source="inspection_method", required=False)
+    gsm = serializers.DecimalField(source="gsm", max_digits=9, decimal_places=2, required=False, allow_null=True)
+    width = serializers.DecimalField(source="width", max_digits=9, decimal_places=2, required=False, allow_null=True)
+    defectsFound = serializers.CharField(source="defects_found", required=False, allow_blank=True, allow_null=True)
+    qualityGrade = serializers.CharField(source="quality_grade", required=False, allow_blank=True, allow_null=True)
+    photos = serializers.ListField(child=serializers.CharField(), required=False)
     lines = QCInspectionLineSerializer(many=True, required=False)
 
     class Meta:
         model = QCInspection
         fields = [
             "id", "inspectionNumber", "sourceDocumentType", "sourceDocumentId", "sourceDocumentNumber",
+            "purchaseOrderId", "productionInstructionId", "fabricItemId",
+            "inspectionType", "inspectionMethod", "gsm", "width", "defectsFound", "qualityGrade", "photos",
             "inspectionDate", "inspectorId", "inspectorName", "inspectorEmployeeId", "shift", "status",
             "total_received_qty", "total_inspected_qty", "passed_qty", "second_quality_qty",
             "reprocess_qty", "rejected_qty", "hold_qty", "notes", "lines", "created_at", "updated_at",
