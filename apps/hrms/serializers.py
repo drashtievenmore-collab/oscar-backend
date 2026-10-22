@@ -103,9 +103,14 @@ class DesignationSerializer(BaseModelSerializer):
 
 
 class LocationSerializer(BaseModelSerializer):
+    employeeCount = serializers.SerializerMethodField()
+
     class Meta:
         model = Location
-        fields = ["id", "name", "address", "timezone", "created_at"]
+        fields = ["id", "name", "address", "timezone", "employeeCount", "created_at"]
+
+    def get_employeeCount(self, location):
+        return location.employees.filter(deleted_at__isnull=True).count()
 
 
 class EmployeeSerializer(BaseModelSerializer):
