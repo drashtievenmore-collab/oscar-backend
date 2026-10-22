@@ -38,6 +38,8 @@ router.register(
     "payroll/advances", views.SalaryAdvanceViewSet, basename="hrms-salary-advances"
 )
 router.register("payroll", views.PayslipViewSet, basename="hrms-payroll")
+router.register("incentive-schemes", views.SalespersonIncentiveSchemeViewSet, basename="hrms-incentive-schemes")
+router.register("incentives", views.SalespersonIncentiveViewSet, basename="hrms-incentives")
 router.register("broker-commissions", views.BrokerCommissionViewSet, basename="hrms-broker-commissions")
 router.register("transfers", views.StubLifecycleViewSet, basename="hrms-transfers")
 router.register("promotions", views.StubLifecycleViewSet, basename="hrms-promotions")

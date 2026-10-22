@@ -84,7 +84,7 @@ def system_account(client_id, system_key):
     if account is None:
         spec = next((item for item in SYSTEM_ACCOUNTS if item[0] == system_key), None)
         if spec:
-            from apps.core.models import Client
+            from apps.accounts.models import Client
             client = Client.objects.filter(id=client_id).first()
             if client:
                 account, _ = Account.objects.get_or_create(
@@ -762,6 +762,56 @@ def post_salary_advance(advance, *, bank_account=None, user=None):
         narration=f"Salary Advance Disbursed - {advance.employee.name} (Ref: {advance.advance_code or advance.id})",
         source_document_type="SalaryAdvance",
         source_document_id=advance.id,
+        user=user,
+    )
+
+
+def post_incentive_accrual(accrual, *, user=None):
+    """Dr Sales Incentive Expense | Cr Incentive Payable"""
+    client_id = accrual.client_id
+    amount = round2(accrual.calculated_incentive)
+    if amount <= Decimal("0.00"):
+        return None
+    entry = post_entry(
+        client=accrual.client,
+        postings=[
+            debit(system_account(client_id, "incentive_expense"), amount),
+            credit(system_account(client_id, "incentive_payable"), amount),
+        ],
+        entry_date=accrual.end_date or timezone.localdate(),
+        narration=f"Sales Incentive Accrual {accrual.period_name} - {accrual.employee.name}",
+        source_document_type="SalespersonIncentiveAccrual",
+        source_document_id=accrual.id,
+        user=user,
+    )
+    accrual.journal_entry = entry
+    accrual.save(update_fields=["journal_entry", "updated_at"])
+    return entry
+
+def post_incentive_payout(accrual, *, bank_account=None, user=None):
+    """Dr Incentive Payable | Cr Bank/Cash -- clears what approval accrued.
+
+    Incentive is paid on its own, not through the payslip (letter pad §12).
+    """
+    client_id = accrual.client_id
+    amount = round2(accrual.calculated_incentive)
+    if amount <= Decimal("0.00") or accrual.journal_entry_id is None:
+        return None
+    account = (
+        bank_account.account
+        if bank_account and getattr(bank_account, "account", None)
+        else system_account(client_id, "cash")
+    )
+    return post_entry(
+        client=accrual.client,
+        postings=[
+            debit(system_account(client_id, "incentive_payable"), amount),
+            credit(account, amount),
+        ],
+        entry_date=timezone.localdate(),
+        narration=f"Sales Incentive Payout {accrual.period_name} - {accrual.employee.name}",
+        source_document_type="SalespersonIncentivePayout",
+        source_document_id=accrual.id,
         user=user,
     )
 
