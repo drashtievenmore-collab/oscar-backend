@@ -873,6 +873,290 @@ def process_employee_separation(employee, *, separation_type="Resigned", last_wo
 
     return employee
 
+def sync_employee_from_user(user, raw_data=None):
+    """Ensure an Employee record in HRMS exists and is linked for this user."""
+    if not user or not user.client_id:
+        return None
+    from apps.hrms.models import Employee, Department, Designation, Location
+    from apps.core.numbering import allocate_number
+
+    raw = raw_data or {}
+    client = user.client
+    client_id = user.client_id
+
+    # 1. Resolve Department
+    dept_name = user.department or raw.get("department") or raw.get("dept")
+    dept = None
+    if dept_name and str(dept_name).strip():
+        dept = Department.objects.filter(
+            client_id=client_id, name__iexact=str(dept_name).strip(), deleted_at__isnull=True
+        ).first()
+        if not dept:
+            dept = Department.objects.create(
+                client_id=client_id, name=str(dept_name).strip()
+            )
+
+    # 2. Resolve Designation from role or designation name
+    role = user.role
+    if not role and user.role_id:
+        from apps.accounts.models import Role
+        role = Role.objects.filter(pk=user.role_id).first()
+
+    desig_name = ""
+    if role and role.name:
+        desig_name = str(role.name).strip()
+    elif raw.get("designation"):
+        desig_name = str(raw.get("designation")).strip()
+    elif raw.get("role"):
+        desig_name = str(raw.get("role")).strip()
+    else:
+        desig_name = "Employee"
+
+    desig = None
+    if desig_name:
+        desig = Designation.objects.filter(
+            client_id=client_id, name__iexact=desig_name, deleted_at__isnull=True
+        ).first()
+        if not desig:
+            desig = Designation.objects.create(
+                client_id=client_id, name=desig_name
+            )
+
+    # 3. Resolve Location
+    loc_name = user.location or raw.get("location")
+    loc = None
+    if loc_name and str(loc_name).strip():
+        loc = Location.objects.filter(
+            client_id=client_id, name__iexact=str(loc_name).strip(), deleted_at__isnull=True
+        ).first()
+        if not loc:
+            loc = Location.objects.create(
+                client_id=client_id, name=str(loc_name).strip()
+            )
+
+    # Determine desired status
+    emp_status = "Active" if user.status in ("Active", "Invited") and user.is_active else "Inactive"
+
+    # 4. Check if user already has an employee record
+    if user.employee_id:
+        emp = user.employee
+        if emp and not emp.deleted_at:
+            updates = []
+            if user.name and emp.name != user.name:
+                emp.name = user.name
+                updates.append("name")
+            if user.phone and emp.phone != user.phone:
+                emp.phone = user.phone
+                updates.append("phone")
+            if user.email and emp.email != user.email:
+                emp.email = user.email
+                updates.append("email")
+            if dept and emp.department_id != dept.id:
+                emp.department = dept
+                updates.append("department")
+            if desig and emp.designation_id != desig.id:
+                emp.designation = desig
+                updates.append("designation")
+            if loc and emp.location_id != loc.id:
+                emp.location = loc
+                updates.append("location")
+            if emp.status != emp_status:
+                emp.status = emp_status
+                updates.append("status")
+            if updates:
+                emp.save(update_fields=list(dict.fromkeys(updates)))
+            return emp
+
+    # 5. Check if an Employee with matching email exists
+    emp = Employee.objects.filter(
+        client_id=client_id, email__iexact=user.email, deleted_at__isnull=True
+    ).first()
+
+    if not emp:
+        desired_code = raw.get("employeeId") or raw.get("employeeCode") or raw.get("empId")
+        code = None
+        if desired_code:
+            desired_code = str(desired_code).strip()
+            if not Employee.objects.filter(client_id=client_id, employee_code=desired_code).exists():
+                code = desired_code
+
+        if not code:
+            try:
+                code = allocate_number(client, "EMP")
+            except Exception:
+                code = f"EMP-{(Employee.objects.filter(client_id=client_id).count() + 1):03d}"
+
+        emp = Employee.objects.create(
+            client_id=client_id,
+            employee_code=code,
+            name=user.name or user.email,
+            email=user.email,
+            phone=user.phone or "",
+            avatar_url=user.avatar_url or "",
+            department=dept,
+            designation=desig,
+            location=loc,
+            joining_date=user.joined_date or timezone.localdate(),
+            status=emp_status,
+        )
+    else:
+        updates = []
+        if dept and emp.department_id != dept.id:
+            emp.department = dept
+            updates.append("department")
+        if desig and emp.designation_id != desig.id:
+            emp.designation = desig
+            updates.append("designation")
+        if loc and emp.location_id != loc.id:
+            emp.location = loc
+            updates.append("location")
+        if user.name and emp.name != user.name:
+            emp.name = user.name
+            updates.append("name")
+        if emp.status != emp_status:
+            emp.status = emp_status
+            updates.append("status")
+        if updates:
+            emp.save(update_fields=list(dict.fromkeys(updates)))
+
+    user.employee = emp
+    user.save(update_fields=["employee"])
+    return emp
+
+
+def sync_user_from_employee(employee, client_id=None, actor=None):
+    """Ensure a User login account in Administration exists and is linked for this Employee."""
+    if not employee:
+        return None
+    from apps.accounts.models import User, Role
+
+    cid = client_id or employee.client_id
+    client = getattr(employee, "client", None)
+    if not client:
+        from apps.accounts.models import Client
+        client = Client.objects.filter(id=cid).first()
+
+    email = str(employee.email or "").strip().lower()
+    if not email:
+        code_part = str(employee.employee_code or employee.id).lower().replace("-", "")
+        email = f"emp.{code_part}@oscar.local"
+        if not employee.email:
+            employee.email = email
+            employee.save(update_fields=["email"])
+
+    department = employee.department.name if employee.department_id else ""
+    location = employee.location.name if employee.location_id else ""
+    desig_name = employee.designation.name if employee.designation_id else ""
+
+    # Find matching role
+    role = None
+    if desig_name:
+        role = Role.objects.filter(
+            client_id=cid, name__iexact=desig_name
+        ).first()
+    if not role:
+        role = Role.objects.filter(
+            client_id=cid, code__in=["EMP", "EM"]
+        ).first() or Role.objects.filter(
+            client_id=cid, name__icontains="Employee"
+        ).first()
+    if not role:
+        role = Role.objects.filter(client_id=cid).first()
+
+    existing = User.objects.filter(
+        client_id=cid, email__iexact=email, deleted_at__isnull=True
+    ).first()
+    if existing is None and employee.id:
+        existing = User.objects.filter(
+            client_id=cid, employee_id=employee.id, deleted_at__isnull=True
+        ).first()
+
+    is_active = employee.status in ("Active", "Probation", "On Leave")
+
+    if existing is not None:
+        updates = []
+        if existing.employee_id != employee.id:
+            existing.employee = employee
+            updates.append("employee")
+        if not existing.role_id and role:
+            existing.role = role
+            updates.append("role")
+        for field, value in (
+            ("name", employee.name),
+            ("phone", employee.phone),
+            ("department", department),
+            ("location", location),
+            ("avatar_url", employee.avatar_url),
+            ("joined_date", employee.joining_date),
+        ):
+            if value and getattr(existing, field) != value:
+                setattr(existing, field, value)
+                updates.append(field)
+        if not is_active:
+            if existing.is_active or existing.status != "Inactive":
+                existing.is_active = False
+                existing.status = "Inactive"
+                updates.extend(["status", "is_active"])
+        else:
+            if existing.status != "Active" or not existing.is_active:
+                existing.status = "Active"
+                existing.is_active = True
+                updates.extend(["status", "is_active"])
+        if updates:
+            updates.append("updated_at")
+            existing.save(update_fields=list(dict.fromkeys(updates)))
+        return existing
+
+    user = User.objects.create_user(
+        email=email,
+        client=client,
+        name=employee.name or email.split("@")[0],
+        phone=employee.phone or "",
+        employee=employee,
+        role=role,
+        department=department,
+        location=location,
+        avatar_url=employee.avatar_url or "",
+        joined_date=employee.joining_date or timezone.localdate(),
+        status="Active" if is_active else "Inactive",
+    )
+    if not is_active:
+        user.is_active = False
+        user.save(update_fields=["is_active"])
+    return user
+
+
+def sync_all_users_and_employees(client_id):
+    """Bidirectional backfill pass ensuring all users have employees and vice versa."""
+    if not client_id:
+        return
+    from apps.accounts.models import User
+    from apps.hrms.models import Employee
+
+    # 1. Any User missing employee or where employee FK is null
+    unlinked_users = User.objects.filter(
+        client_id=client_id, deleted_at__isnull=True, employee__isnull=True
+    )
+    for u in unlinked_users:
+        try:
+            sync_employee_from_user(u)
+        except Exception:
+            pass
+
+    # 2. Any Employee not linked to any User
+    linked_emp_ids = User.objects.filter(
+        client_id=client_id, deleted_at__isnull=True, employee_id__isnull=False
+    ).values_list("employee_id", flat=True)
+    unlinked_employees = Employee.objects.filter(
+        client_id=client_id, deleted_at__isnull=True
+    ).exclude(id__in=linked_emp_ids)
+    for emp in unlinked_employees:
+        try:
+            sync_user_from_employee(emp, client_id=client_id)
+        except Exception:
+            pass
+
+
 
 # ── Attendance Punch Services ───────────────────────────────────────────────
 from decimal import Decimal

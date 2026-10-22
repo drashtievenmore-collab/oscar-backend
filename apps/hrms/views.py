@@ -163,78 +163,24 @@ class EmployeeViewSet(TenantModelViewSet):
     }
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"], "create": ["create_staff"]}
     def get_queryset(self):
-        self._ensure_employee_users_linked()
+        try:
+            from apps.hrms.services import sync_all_users_and_employees
+            sync_all_users_and_employees(self.get_client_id())
+        except Exception:
+            pass
         return super().get_queryset()
 
     def _ensure_employee_users_linked(self):
         try:
-            from apps.accounts.models import User
-            from django.db.models import Q
-            client_id = self.get_client_id()
-            unlinked_employee_users = User.objects.filter(
-                client_id=client_id,
-                deleted_at__isnull=True,
-                employee__isnull=True,
-            ).filter(
-                Q(role__name__iexact="Employee") |
-                Q(role__code__iexact="EM") |
-                Q(role__code__iexact="EMPLOYEE")
-            )
-            for u in unlinked_employee_users:
-                self._link_user_to_employee(u)
-        except Exception as e:
+            from apps.hrms.services import sync_all_users_and_employees
+            sync_all_users_and_employees(self.get_client_id())
+        except Exception:
             pass
 
     @staticmethod
     def _link_user_to_employee(user):
-        from apps.hrms.models import Employee, Department, Designation, Location
-        from apps.core.numbering import allocate_number
-
-        dept = None
-        if user.department and user.department.strip():
-            dept = Department.objects.filter(
-                client_id=user.client_id, name__iexact=user.department.strip(), deleted_at__isnull=True
-            ).first()
-            if not dept:
-                dept = Department.objects.create(client_id=user.client_id, name=user.department.strip())
-
-        desig = Designation.objects.filter(
-            client_id=user.client_id, name__iexact="Employee", deleted_at__isnull=True
-        ).first()
-        if not desig:
-            desig = Designation.objects.create(client_id=user.client_id, name="Employee")
-
-        loc = None
-        if user.location and user.location.strip():
-            loc = Location.objects.filter(
-                client_id=user.client_id, name__iexact=user.location.strip(), deleted_at__isnull=True
-            ).first()
-            if not loc:
-                loc = Location.objects.create(client_id=user.client_id, name=user.location.strip())
-
-        emp = Employee.objects.filter(
-            client_id=user.client_id, email__iexact=user.email, deleted_at__isnull=True
-        ).first()
-
-        if not emp:
-            try:
-                code = allocate_number(user.client, "EMP")
-            except Exception:
-                code = f"EMP-{(Employee.objects.filter(client_id=user.client_id).count() + 1):03d}"
-            emp = Employee.objects.create(
-                client_id=user.client_id,
-                employee_code=code,
-                name=user.name or user.email,
-                email=user.email,
-                phone=user.phone or "",
-                department=dept,
-                designation=desig,
-                location=loc,
-                joining_date=user.joined_date or timezone.localdate(),
-                status="Active" if user.status in ("Active", "Invited") else "Inactive",
-            )
-        user.employee = emp
-        user.save(update_fields=["employee"])
+        from apps.hrms.services import sync_employee_from_user
+        return sync_employee_from_user(user)
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -319,7 +265,8 @@ class EmployeeViewSet(TenantModelViewSet):
         serializer.validated_data["employee_code"] = allocate_number(
             self.request.user.client, "EMP"
         )
-        employee = super().perform_create(serializer)
+        super().perform_create(serializer)
+        employee = serializer.instance
         self._ensure_user_for_employee(
             employee, self.get_client_id(), actor=self.request.user
         )
@@ -327,108 +274,43 @@ class EmployeeViewSet(TenantModelViewSet):
 
     @staticmethod
     def _ensure_user_for_employee(employee, client_id, actor=None):
-        """Keep the Administration -> Users row in step with the employee row.
-
-        The employee record is the source of truth for who someone is and what
-        they do; the user row is the login that goes with it. So a create
-        *and* an edit both land here: existing accounts are re-pointed at the
-        employee and have their identity fields refreshed, and an employee with
-        no account yet gets one. Matching is by email, which is what makes the
-        create path idempotent -- re-saving an employee never makes a second
-        login.
-        """
-        if not employee or not employee.email:
-            return None
-        from apps.accounts.models import User
-
-        email = str(employee.email).lower().strip()
-        if not email:
-            return None
-        department = employee.department.name if employee.department_id else None
-        existing = User.objects.filter(
-            client_id=client_id, email=email, deleted_at__isnull=True
-        ).first()
-        if existing is not None:
-            updates = []
-            if existing.employee_id is None:
-                existing.employee = employee
-                updates.append("employee")
-            # An admin editing the login row must not freeze the person's name
-            # in place of the HR record -- the next employee edit carries the
-            # truth back. A blank user field always yields to the employee.
-            for field, value in (
-                ("name", employee.name),
-                ("phone", employee.phone),
-                ("department", department),
-                ("avatar_url", employee.avatar_url),
-                ("joined_date", employee.joining_date),
-            ):
-                if value and getattr(existing, field) != value:
-                    setattr(existing, field, value)
-                    updates.append(field)
-            if employee.status in ["Resigned", "Terminated", "Exited", "Suspended"]:
-                if existing.is_active or existing.status != "Inactive":
-                    existing.is_active = False
-                    existing.status = "Inactive"
-                    updates.extend(["status", "is_active"])
-            else:
-                if existing.status != "Active" or not existing.is_active:
-                    existing.status = "Active"
-                    existing.is_active = True
-                    updates.extend(["status", "is_active"])
-            if updates:
-                updates.append("updated_at")
-                existing.save(update_fields=list(dict.fromkeys(updates)))
-            return existing
-        user = User.objects.create_user(
-            email=email,
-            client_id=client_id,
-            name=employee.name,
-            phone=employee.phone,
-            employee=employee,
-            department=department,
-            avatar_url=employee.avatar_url,
-            joined_date=employee.joining_date,
-            status="Active",
-        )
-        return user
+        """Keep the Administration -> Users row in step with the employee row."""
+        from apps.hrms.services import sync_user_from_employee
+        return sync_user_from_employee(employee, client_id=client_id, actor=actor)
 
     def perform_update(self, serializer):
-        employee = super().perform_update(serializer)
+        super().perform_update(serializer)
+        employee = serializer.instance
         self._ensure_user_for_employee(
             employee, self.get_client_id(), actor=self.request.user
         )
         return employee
 
+    def perform_destroy(self, instance):
+        super().perform_destroy(instance)
+        try:
+            from apps.accounts.models import User, UserSession
+            user = User.objects.filter(
+                client_id=instance.client_id, employee_id=instance.id, deleted_at__isnull=True
+            ).first()
+            if user:
+                user.status = "Inactive"
+                user.is_active = False
+                user.save(update_fields=["status", "is_active", "updated_at"])
+                UserSession.objects.filter(user=user, revoked_at__isnull=True).update(
+                    revoked_at=timezone.now(), revoked_reason="employee_deleted"
+                )
+        except Exception:
+            pass
+
     @action(detail=False, methods=["post"], url_path="backfill-users")
     @transaction.atomic
     def backfill_users(self, request):
-        rows = Employee.objects.filter(
-            client_id=request.client_id, deleted_at__isnull=True
-        ).select_related("department")
-        created = linked = skipped = 0
-        for employee in rows:
-            if not employee.email:
-                skipped += 1
-                continue
-            from apps.accounts.models import User
-
-            email = str(employee.email).lower().strip()
-            existing = User.objects.filter(
-                client_id=request.client_id, email=email, deleted_at__isnull=True
-            ).first()
-            if existing is None:
-                self._ensure_user_for_employee(
-                    employee, request.client_id, actor=request.user
-                )
-                created += 1
-            else:
-                before = (existing.employee_id, existing.status)
-                self._ensure_user_for_employee(
-                    employee, request.client_id, actor=request.user
-                )
-                linked += 1 if before[0] is None or before[1] != "Active" else 0
-        return Response({"created": created, "linked": linked, "skipped": skipped})
+        from apps.hrms.services import sync_all_users_and_employees
+        sync_all_users_and_employees(request.client_id)
+        from apps.accounts.models import User
+        count = User.objects.filter(client_id=request.client_id, employee__isnull=False, deleted_at__isnull=True).count()
+        return Response({"linked": count})
 
     @action(detail=True, methods=["post"])
     @transaction.atomic

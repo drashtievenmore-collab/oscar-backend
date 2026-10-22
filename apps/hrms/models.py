@@ -278,6 +278,12 @@ class Employee(TenantModel, LegacyIdMixin):
     def __str__(self):
         return f"{self.employee_code} {self.name}"
 
+    @property
+    def user(self):
+        from apps.accounts.models import User
+        return User.objects.filter(employee=self, deleted_at__isnull=True).first()
+
+
 
 # ---------------------------------------------------------------------------
 # db.md §11.2 -- Attendance
