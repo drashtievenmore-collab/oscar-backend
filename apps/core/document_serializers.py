@@ -105,6 +105,29 @@ class DocumentLineSerializer(BaseModelSerializer):
         fields = LINE_FIELDS
         read_only_fields = ["amount", "discount_amount", "tax_amount", "line_total", "uom_factor"]
 
+    def validate_itemId(self, item):
+        if item is not None and self.instance is None:
+            if getattr(item, "lifecycle_status", None) == "Inactive":
+                raise serializers.ValidationError(f"Item '{item.name}' is inactive and cannot be selected.")
+        return item
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        item = attrs.get("item")
+        if item and not attrs.get("fabric_quality"):
+            fq_str = getattr(item, "fabric_quality", None)
+            if fq_str:
+                from apps.masters.models import FabricQuality
+                client_id = self.context.get("client_id")
+                fq = FabricQuality.objects.filter(
+                    client_id=client_id, name=fq_str, deleted_at__isnull=True
+                ).first() or FabricQuality.objects.filter(
+                    client_id=client_id, code=fq_str, deleted_at__isnull=True
+                ).first()
+                if fq:
+                    attrs["fabric_quality"] = fq
+        return attrs
+
     def get_isBomPart(self, line):
         """db.md §3.2 -- derived as ``parent_line_id is not null``."""
         return line.parent_line_id is not None
@@ -145,6 +168,12 @@ class DocumentSerializer(BaseModelSerializer):
     line_serializer = None
     line_fk_name = None
     line_table_name = None
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict) and "items" in data and "lineItems" not in data:
+            data = dict(data)
+            data["lineItems"] = data.get("items")
+        return super().to_internal_value(data)
 
     def get_balance_due(self, document):
         return document.balance_due

@@ -49,6 +49,11 @@ SYSTEM_ACCOUNTS = [
     ("employee_advances", "1150", "Employee Advances", "Asset", "Receivable"),
     ("incentive_expense", "5510", "Sales Incentives & Commissions", "Expense", None),
     ("incentive_payable", "2350", "Incentive Payable", "Liability", "Payable"),
+    # Used by broker payouts and sample consumption, which posted to keys that
+    # did not exist and silently skipped their journal entries.
+    ("brokerage_payable", "2360", "Brokerage Payable", "Liability", "Payable"),
+    ("brokerage_expense", "5520", "Brokerage & Commission Expense", "Expense", None),
+    ("sample_expense", "5410", "Sample Expense", "Expense", None),
 ]
 
 
@@ -230,6 +235,11 @@ def reverse_entry(entry, *, user=None, narration=None):
         reversal_of=entry,
     )
     JournalEntry.objects.filter(pk=entry.pk).update(status="Reversed")
+    # Ledgers leave out both the reversed original and its mirror, so the pair
+    # nets to zero. The mirror's own post ran before the status flip above;
+    # refresh the party balances now that the original is excluded.
+    for party_id in {line.party_id for line in entry.lines.all() if line.party_id}:
+        recalculate_party_balance(entry.client_id, party_id)
     return reversal
 
 
@@ -240,6 +250,8 @@ def reverse_document_entries(*, client_id, source_document_type, source_document
         source_document_type=source_document_type,
         source_document_id=source_document_id,
         deleted_at__isnull=True,
+        # A reversal entry carries the same source document; never reverse it.
+        reversal_of__isnull=True,
     ).exclude(status="Reversed")
     return [reverse_entry(entry, user=user) for entry in entries]
 
@@ -800,7 +812,7 @@ def recalculate_party_balance(client_id, party):
     party_id = getattr(party, "id", party)
     rows = JournalLine.objects.filter(
         client_id=client_id, party_id=party_id, deleted_at__isnull=True
-    ).exclude(journal_entry__status="Reversed").aggregate(
+    ).exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False).aggregate(
         debit=Coalesce(Sum("debit"), Value(Decimal("0.00")),
                        output_field=DecimalField(max_digits=18, decimal_places=2)),
         credit=Coalesce(Sum("credit"), Value(Decimal("0.00")),
@@ -831,7 +843,7 @@ def party_ledger(client_id, party_id, *, date_from=None, date_to=None):
         JournalLine.objects.filter(
             client_id=client_id, party_id=party_id, deleted_at__isnull=True
         )
-        .exclude(journal_entry__status="Reversed")
+        .exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False)
         .select_related("journal_entry")
         .order_by("journal_entry__entry_date", "journal_entry__created_at", "line_no")
     )
@@ -872,7 +884,7 @@ def account_balances(client_id, *, as_of=None):
 
     queryset = JournalLine.objects.filter(
         client_id=client_id, deleted_at__isnull=True
-    ).exclude(journal_entry__status="Reversed")
+    ).exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False)
     if as_of:
         queryset = queryset.filter(journal_entry__entry_date__lte=as_of)
 
@@ -911,7 +923,7 @@ def account_balances(client_id, *, as_of=None):
 def trial_balance(client_id, *, as_of=None):
     queryset = JournalLine.objects.filter(
         client_id=client_id, deleted_at__isnull=True
-    ).exclude(journal_entry__status="Reversed")
+    ).exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False)
     if as_of:
         queryset = queryset.filter(journal_entry__entry_date__lte=as_of)
 
@@ -954,7 +966,7 @@ def account_ledger(client_id, account_id, *, date_from=None, date_to=None):
         JournalLine.objects.filter(
             client_id=client_id, account_id=account_id, deleted_at__isnull=True
         )
-        .exclude(journal_entry__status="Reversed")
+        .exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False)
         .select_related("journal_entry", "party")
         .order_by("journal_entry__entry_date", "journal_entry__created_at", "line_no")
     )

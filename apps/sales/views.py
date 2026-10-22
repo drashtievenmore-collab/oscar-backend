@@ -1307,6 +1307,9 @@ class PaymentInViewSet(TenantModelViewSet):
     ordering = ["-payment_date", "-created_at"]
     filter_map = {"customerId": "party_id", "mode": "mode"}
     permission_map = {"read": ["view_sales"], "write": ["record_payment_in"]}
+    # A receipt is posted on create; it is changed only by /cancel/ or
+    # /allocate/, never edited or deleted (its ledger entry would not follow).
+    http_method_names = ["get", "post", "head", "options"]
 
     def get_aggregates(self, queryset):
         rows = queryset.aggregate(
@@ -1383,7 +1386,37 @@ class PaymentInViewSet(TenantModelViewSet):
 # ---------------------------------------------------------------------------
 # Sales returns (api.md §5.9)
 # ---------------------------------------------------------------------------
-class SalesReturnViewSet(SalesDocumentViewSet):
+class PostedReturnGuardMixin:
+    """A return posts its stock and ledger entry the moment it is created, so
+    afterwards only bookkeeping fields may change. Quantities, values and
+    cancellation go through ``/cancel/``, which reverses those effects."""
+
+    POSTED_EDITABLE_FIELDS = {"status", "notes", "terms", "reason"}
+    POSTED_STATUS_CHANGES = ("Settled",)
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        changed = {
+            key for key, value in serializer.validated_data.items()
+            if getattr(instance, key, object()) != value
+        }
+        blocked = changed - self.POSTED_EDITABLE_FIELDS
+        new_status = serializer.validated_data.get("status", instance.status)
+        if blocked or (new_status != instance.status and new_status not in self.POSTED_STATUS_CHANGES):
+            raise Conflict(
+                "A posted return can't be edited. Cancel it (which reverses its stock "
+                "and ledger entry) and record a new one.",
+                code=Codes.DRAFT_ONLY,
+            )
+        super().perform_update(serializer)
+
+    def check_delete_allowed(self, instance):
+        raise Conflict(
+            "A posted return can't be deleted. Cancel it instead.", code=Codes.DRAFT_ONLY
+        )
+
+
+class SalesReturnViewSet(PostedReturnGuardMixin, SalesDocumentViewSet):
     queryset = SalesReturn.objects.select_related("sales_invoice")
     serializer_class = SalesReturnSerializer
     audit_entity_type = "SalesReturn"
@@ -1463,6 +1496,20 @@ class SalesReturnViewSet(SalesDocumentViewSet):
             )
             invoice_line.save(update_fields=["returned_qty", "updated_at"])
 
+            # The credit is the returned quantity at the invoice's own terms --
+            # never a client-sent qty/rate/tax, which could credit far more
+            # than the stock that came back.
+            line.qty = round4(D(line.returned_qty))
+            line.rate = invoice_line.rate
+            line.discount_pct = invoice_line.discount_pct
+            line.tax_pct = invoice_line.tax_pct
+            line.item_id = invoice_line.item_id
+            line.uom = invoice_line.uom
+            line.uom_factor = invoice_line.uom_factor
+            line.save(update_fields=[
+                "qty", "rate", "discount_pct", "tax_pct", "item", "uom", "uom_factor", "updated_at",
+            ])
+
             if line.item_id and line.item.holds_stock and location_id:
                 # Phase 1.4: route by condition (Good -> return location,
                 # Hold -> QC Hold, Reprocess / Second Quality / Reject -> their
@@ -1500,6 +1547,10 @@ class SalesReturnViewSet(SalesDocumentViewSet):
                     )
                     stock.set_serial_status(resolved, "returned", movement=movement)
 
+        # Re-total from the invoice-priced lines before anything is posted.
+        services.recalculate_document(sales_return)
+        sales_return.refresh_from_db()
+
         entry = ledger.post_sales_return(sales_return, user=self.request.user)
         if entry is not None:
             sales_return.journal_entry = entry
@@ -1513,8 +1564,11 @@ class SalesReturnViewSet(SalesDocumentViewSet):
         reverse_incentives_for_invoice(
             invoice, user=self.request.user, reason=f"Sales Return {sales_return.return_number}"
         )
+        # Pass the returned value so a partial return reduces the commission
+        # pro rata (the service's own rule) instead of cancelling all of it.
         reverse_broker_commission_for_invoice(
-            invoice, user=self.request.user, reason=f"Sales Return {sales_return.return_number}"
+            invoice, user=self.request.user, reason=f"Sales Return {sales_return.return_number}",
+            return_val=sales_return.taxable_value,
         )
 
     @action(detail=True, methods=["post"])

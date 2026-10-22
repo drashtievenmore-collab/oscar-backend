@@ -41,6 +41,7 @@ from .models import (
     Transporter,
     Unit,
 )
+from .serializers import slug_code
 from .serializers import (
     AgencySerializer,
     BrokerSerializer,
@@ -1179,20 +1180,26 @@ class FabricVariantViewSet(TextileMasterViewSet):
     """Fabric item / variant master -- ``/inventory/fabric-variants/``."""
 
     queryset = FabricVariant.objects.select_related(
-        "quality", "quality__uom", "design", "shade", "uom", "image_file"
+        "quality", "quality__uom", "design", "shade", "uom", "image_file",
+        "category", "fabric_type_ref", "item"
     )
     serializer_class = FabricVariantSerializer
     search_fields = TextileMasterViewSet.search_fields + [
         "hsn_code", "quality__name", "quality__code", "design__name", "design__code",
         "shade__name", "shade__code", "fabric_type", "construction",
+        "category__name", "category__code", "fabric_type_ref__name", "fabric_type_ref__code",
     ]
     filter_map = {
         **TextileMasterViewSet.filter_map,
         "qualityId": "quality_id",
         "designId": "design_id",
         "shadeId": "shade_id",
+        "categoryId": "category_id",
+        "fabricTypeId": "fabric_type_ref_id",
         "fabricType": "fabric_type",
         "construction": "construction",
+        "isActive": "is_active",
+        "is_active": "is_active",
     }
 
 

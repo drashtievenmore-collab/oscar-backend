@@ -112,7 +112,7 @@ def _journal_by_day(client_id, days, *, system_keys=None, exclude_keys=None, acc
         client_id=client_id,
         deleted_at__isnull=True,
         journal_entry__entry_date__in=days,
-    ).exclude(journal_entry__status="Reversed")
+    ).exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False)
     if system_keys is not None:
         queryset = queryset.filter(account__system_key__in=system_keys)
     if exclude_keys:
@@ -307,7 +307,7 @@ def _working_capital(client_id, funds, stock_value):
 
     rows = (
         JournalLine.objects.filter(client_id=client_id, deleted_at__isnull=True)
-        .exclude(journal_entry__status="Reversed")
+        .exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False)
         .filter(
             Q(account__type="Asset", account__subtype__in=["Receivable", "Tax"])
             | Q(account__type="Liability", account__subtype__in=["Payable", "Tax"])

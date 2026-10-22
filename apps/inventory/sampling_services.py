@@ -200,29 +200,28 @@ def consume_sample(sample, consume_qty=None, *, user=None, remarks=None):
     expense_amount = round2(consume_qty * unit_cost)
 
     if expense_amount > ZERO:
-        try:
-            entry = ledger.post_entry(
-                client=sample.client_id,
-                postings=[
-                    ledger.debit(
-                        ledger.system_account(sample.client_id, "sample_expense"),
-                        expense_amount,
-                        description=f"Sample {sample.sample_number} consumed",
-                    ),
-                    ledger.credit(
-                        ledger.system_account(sample.client_id, "stock"),
-                        expense_amount,
-                        description=f"Stock deduction for sample {sample.sample_number}",
-                    ),
-                ],
-                narration=f"Sample consumption: {sample.sample_number}",
-                source_document_type="Sample",
-                source_document_id=sample.id,
-                user=user,
-            )
-            sample.journal_entry = entry
-        except Exception:
-            pass  # Fallback if specific sample_expense account code not configured yet
+        # A posting failure rolls back the consumption instead of leaving the
+        # sample consumed with nothing in the books.
+        entry = ledger.post_entry(
+            client=sample.client_id,
+            postings=[
+                ledger.debit(
+                    ledger.system_account(sample.client_id, "sample_expense"),
+                    expense_amount,
+                    description=f"Sample {sample.sample_number} consumed",
+                ),
+                ledger.credit(
+                    ledger.system_account(sample.client_id, "stock"),
+                    expense_amount,
+                    description=f"Stock deduction for sample {sample.sample_number}",
+                ),
+            ],
+            narration=f"Sample consumption: {sample.sample_number}",
+            source_document_type="Sample",
+            source_document_id=sample.id,
+            user=user,
+        )
+        sample.journal_entry = entry
 
     sample.save(update_fields=["consumed_quantity", "status", "journal_entry", "updated_at"])
     return sample

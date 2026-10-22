@@ -17,14 +17,14 @@ from apps.core.exceptions import (
     ValidationFailed,
 )
 from apps.core import idempotency
-from apps.core.money import ZERO, D, round2, round4
+from apps.core.money import ZERO, D, ROUNDING_TOLERANCE, round2, round4
 from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
 from apps.core.printing import PdfNotAvailable, print_payload, send_payload
 from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
 from apps.inventory import services as stock
 from apps.masters import uom
-from apps.sales.views import SalesDocumentViewSet, _clone_document
+from apps.sales.views import PostedReturnGuardMixin, SalesDocumentViewSet, _clone_document
 
 from . import services
 from .models import (
@@ -75,6 +75,9 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
     print_title = "Purchase Order"
     filter_map = {
         "vendorId": "party_id",
+        "purchaseOrderId": "purchase_order_id",
+        "poId": "purchase_order_id",
+        "po": "purchase_order_id",
         "vendor_id": "party_id",
         "purchaseType": "purchase_type",
         "projectId": "project_id",
@@ -1154,12 +1157,23 @@ class PurchaseBillViewSet(SalesDocumentViewSet):
         """``{ amount }`` from vendor advances (api.md §6.4)."""
         from apps.sales.models import PaymentAllocation
 
-        bill = self.get_object()
+        bill = PurchaseBill.objects.select_for_update().get(pk=self.get_object().pk)
         amount = round2(request.data.get("amount"))
         if amount <= ZERO:
             raise ValidationFailed(
                 "Enter an amount to apply.",
                 field_errors={"amount": ["Must be greater than zero."]},
+            )
+        if bill.status in ("Draft", "Cancelled") or bill.posted_at is None:
+            raise BusinessRuleViolation(
+                "An advance can only be applied to a posted, open bill.",
+                code=Codes.PAYMENT_ON_DRAFT if bill.status != "Cancelled" else Codes.PAYMENT_ON_CANCELLED,
+            )
+        outstanding = services.bill_outstanding(bill)["outstanding"]
+        if amount > outstanding + ROUNDING_TOLERANCE:
+            raise BusinessRuleViolation(
+                f"Only {outstanding} is outstanding on this bill.",
+                code=Codes.PAYMENT_EXCEEDS_BALANCE,
             )
 
         advance = services.vendor_advance_balance(request.client_id, bill.party_id)
@@ -1387,6 +1401,9 @@ class PaymentOutViewSet(TenantModelViewSet):
     ordering = ["-payment_date", "-created_at"]
     filter_map = {"vendorId": "party_id", "mode": "mode"}
     permission_map = {"read": ["view_purchase"], "write": ["record_payment_out"]}
+    # A payment is posted on create; it is changed only by /cancel/, never
+    # edited or deleted (its ledger entry and allocations would not follow).
+    http_method_names = ["get", "post", "head", "options"]
 
     def get_aggregates(self, queryset):
         rows = queryset.aggregate(
@@ -1437,7 +1454,7 @@ class PaymentOutViewSet(TenantModelViewSet):
         return Response(self.get_serializer(payment).data)
 
 
-class PurchaseReturnViewSet(SalesDocumentViewSet):
+class PurchaseReturnViewSet(PostedReturnGuardMixin, SalesDocumentViewSet):
     queryset = PurchaseReturn.objects.select_related("purchase_bill")
     serializer_class = PurchaseReturnSerializer
     audit_entity_type = "PurchaseReturn"
@@ -1641,6 +1658,9 @@ class VendorBillViewSet(TenantModelViewSet):
     ordering = ["-bill_date", "-created_at"]
     filter_map = {
         "vendorId": "party_id",
+        "purchaseOrderId": "purchase_order_id",
+        "poId": "purchase_order_id",
+        "po": "purchase_order_id",
         "status": "status",
         "matchStatus": "match_status",
     }
@@ -1778,12 +1798,21 @@ class VendorBillViewSet(TenantModelViewSet):
     @action(detail=True, methods=["post"])
     @transaction.atomic
     def approve(self, request, pk=None):
-        bill = self.get_object()
+        # Lock the row: two simultaneous approvals must not create two payables.
+        bill = VendorBill.objects.select_for_update().get(pk=self.get_object().pk)
         if bill.status != "Pending":
             raise Conflict(
                 f"Only a pending bill can be approved. This bill is {bill.status}.",
                 code=Codes.DRAFT_ONLY,
             )
+        # Separation of duties: Creator cannot approve their own bill unless superuser
+        if getattr(bill, "created_by_id", None) and bill.created_by_id == getattr(request.user, "id", None) and not getattr(request.user, "is_superuser", False):
+            from apps.core.permissions import PermissionDenied
+            raise PermissionDenied(
+                "Separation of duties: You cannot approve a vendor bill you created.",
+                code="SELF_APPROVAL_NOT_PERMITTED",
+            )
+
         remarks = request.data.get("remarks")
         # Approving releases the payable even though PO / GRN / bill disagree,
         # so the variance and the reason are put on record. Nothing on the PO,
@@ -1792,7 +1821,7 @@ class VendorBillViewSet(TenantModelViewSet):
         is_mismatch = matching.get("overallStatus") == "Mismatch"
         if is_mismatch and not (remarks or "").strip():
             raise ValidationFailed(
-                "This bill does not match the PO / GRN. Enter approval remarks explaining the variance.",
+                "This bill does not match the commercial records. Enter approval remarks explaining the variance.",
                 field_errors={"remarks": ["Required to approve a mismatched bill."]},
                 payload={"matching": matching},
             )
@@ -1815,12 +1844,67 @@ class VendorBillViewSet(TenantModelViewSet):
             }
         )
         bill.approval_history = history
-        bill.save(
-            update_fields=[
-                "status", "approval_remarks", "approved_by", "approved_at",
-                "approval_history", "match_result", "updated_at",
-            ]
-        )
+
+        auto_create_pb = request.data.get("createPayable", False)
+        if auto_create_pb and bill.purchase_bill_id is None:
+            final_po_data = matching.get("finalJobWorkPo")
+            final_po_id = final_po_data.get("id") if final_po_data else None
+            effective_po = PurchaseOrder.objects.filter(pk=final_po_id, client_id=bill.client_id).first() if final_po_id else bill.purchase_order
+            lines = bill.line_items.filter(deleted_at__isnull=True).order_by("line_no")
+            purchase_bill = PurchaseBill.objects.create(
+                client=bill.client,
+                party=bill.party,
+                purchase_order=effective_po,
+                doc_date=bill.bill_date,
+                status="Unpaid",
+                bill_number=allocate_number(bill.client, "BILL", bill.bill_date),
+                vendor_bill_number=bill.vendor_bill_number,
+                location_id=getattr(effective_po, "location_id", None),
+                notes=remarks or bill.remarks or f"Recorded from Vendor Bill {bill.vendor_bill_number}",
+            )
+            for line in lines:
+                PurchaseBillLine.objects.create(
+                    client=bill.client,
+                    purchase_bill=purchase_bill,
+                    line_no=line.line_no,
+                    item=line.item,
+                    description=line.item_name or (line.item.name if line.item else "Fabric"),
+                    qty=line.qty,
+                    rate=line.rate,
+                    tax_pct=bill.gst_pct,
+                    uom=line.uom or "Meter",
+                )
+            from apps.sales.services import recalculate_document
+            from apps.accounting import services as ledger
+            from .models import PURCHASE_TYPE_FINAL_JOB_WORK
+
+            purchase_bill.freeze_party_snapshot()
+            recalculate_document(purchase_bill)
+            # The payable is real from here on, so it is posted like any other
+            # bill: Dr Inventory/Purchases + GST Input | Cr Creditors.
+            purchase_bill.posted_at = now
+            purchase_bill.posted_by = request.user if getattr(request.user, "is_authenticated", False) else None
+            # Job-work fabric is stocked at production verification and GRN-linked
+            # goods are already in stock; "Receive goods" on this bill would
+            # post them a second time.
+            if bill.goods_receipt_id or getattr(effective_po, "purchase_type", None) == PURCHASE_TYPE_FINAL_JOB_WORK:
+                purchase_bill.goods_received = True
+                purchase_bill.received_date = timezone.localdate()
+            purchase_bill.save()
+            entry = ledger.post_purchase_bill(purchase_bill, user=request.user)
+            if entry is not None:
+                purchase_bill.journal_entry = entry
+                purchase_bill.save(update_fields=["journal_entry", "updated_at"])
+            bill.purchase_bill = purchase_bill
+            bill.match_status = "Matched"
+
+        save_fields = [
+            "status", "approval_remarks", "approved_by", "approved_at",
+            "approval_history", "match_result", "updated_at",
+        ]
+        if bill.purchase_bill_id is not None:
+            save_fields.extend(["purchase_bill", "match_status"])
+        bill.save(update_fields=save_fields)
         description = remarks
         if is_mismatch:
             description = f"Approved with variance: {remarks}. " + "; ".join(matching.get("reasons") or [])
@@ -1884,6 +1968,192 @@ class VendorBillViewSet(TenantModelViewSet):
     def approval_history(self, request, pk=None):
         bill = self.get_object()
         return Response({"history": bill.approval_history or []})
+
+    @action(detail=False, methods=["post"], url_path="agency-match")
+    @transaction.atomic
+    def agency_match(self, request):
+        """Unified Agency Bill Match action: Original PO + Final Job Work PO + Vendor Invoice.
+        
+        Handles preview, save_draft, validate, submit_approval, approve, and reject.
+        Enforces duplicate invoice prevention, 3-document reconciliation, and payable generation.
+        """
+        po_id = request.data.get("purchaseOrderId") or request.data.get("poId")
+        if not po_id:
+            raise ValidationFailed("purchaseOrderId is required.", field_errors={"purchaseOrderId": ["Required."]})
+
+        po = PurchaseOrder.objects.filter(client_id=request.client_id, pk=po_id, deleted_at__isnull=True).first()
+        if not po:
+            raise ValidationFailed("Purchase Order not found.", field_errors={"purchaseOrderId": ["Not found."]})
+
+        req_action = request.data.get("action", "preview")
+        bill_id = request.data.get("billId") or request.data.get("vendorBillId")
+        inv_number = (request.data.get("vendorBillNumber") or "").strip()
+        inv_date = request.data.get("billDate") or timezone.now().date().isoformat()
+        qty = round4(D(str(request.data.get("qty") or 0)))
+        rate = round2(D(str(request.data.get("rate") or 0)))
+        gst_pct = round2(D(str(request.data.get("gstPct") or 5)))
+        remarks = request.data.get("remarks", "")
+        reason = request.data.get("reason", remarks)
+
+        # Find or initialize bill
+        bill = None
+        if bill_id:
+            bill = VendorBill.objects.filter(client_id=request.client_id, pk=bill_id, deleted_at__isnull=True).first()
+
+        if req_action in ["save_draft", "validate", "submit_approval", "approve"]:
+            if not inv_number:
+                raise ValidationFailed("Vendor Invoice Number is required.", field_errors={"vendorBillNumber": ["Required."]})
+
+            # Enforce duplicate invoice submission prevention
+            dup_qs = VendorBill.objects.filter(
+                client_id=request.client_id,
+                party_id=po.party_id,
+                vendor_bill_number=inv_number,
+                deleted_at__isnull=True,
+            )
+            if bill:
+                dup_qs = dup_qs.exclude(pk=bill.pk)
+            if dup_qs.exists():
+                raise ValidationFailed(
+                    f"A vendor bill with invoice number '{inv_number}' already exists for this agency.",
+                    field_errors={"vendorBillNumber": ["Duplicate invoice number."]},
+                )
+
+            taxable = round2(qty * rate)
+            gst_amount = round2(taxable * gst_pct / Decimal("100"))
+            total = round2(taxable + gst_amount)
+
+            item = po.line_items.filter(deleted_at__isnull=True).first()
+            item_obj = item.item if item else None
+
+            if bill is None:
+                bill = VendorBill.objects.create(
+                    client=po.client,
+                    vendor_bill_number=inv_number,
+                    bill_date=inv_date,
+                    party=po.party,
+                    party_name=po.party_name or (po.party.name if po.party else ""),
+                    purchase_order=po,
+                    gst_pct=gst_pct,
+                    subtotal=taxable,
+                    gst_amount=gst_amount,
+                    total=total,
+                    remarks=remarks,
+                    status="Draft" if req_action == "save_draft" else "Pending",
+                    created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+                )
+                VendorBillLine.objects.create(
+                    client=po.client,
+                    vendor_bill=bill,
+                    line_no=1,
+                    item=item_obj,
+                    item_name=item.description if item else (item_obj.name if item_obj else "Grey Fabric"),
+                    sku=item_obj.sku if item_obj else None,
+                    uom=item.uom if item else "Meter",
+                    qty=qty,
+                    rate=rate,
+                    amount=taxable,
+                    line_total=total,
+                )
+            else:
+                bill.vendor_bill_number = inv_number
+                bill.bill_date = inv_date
+                bill.gst_pct = gst_pct
+                bill.subtotal = taxable
+                bill.gst_amount = gst_amount
+                bill.total = total
+                if remarks:
+                    bill.remarks = remarks
+                if req_action == "save_draft":
+                    bill.status = "Draft"
+                bill.save()
+
+                line = bill.line_items.filter(deleted_at__isnull=True).first()
+                if line:
+                    line.qty = qty
+                    line.rate = rate
+                    line.amount = taxable
+                    line.line_total = total
+                    line.save()
+                else:
+                    VendorBillLine.objects.create(
+                        client=po.client,
+                        vendor_bill=bill,
+                        line_no=1,
+                        item=item_obj,
+                        item_name=item.description if item else "Grey Fabric",
+                        qty=qty,
+                        rate=rate,
+                        amount=taxable,
+                        line_total=total,
+                    )
+
+        if bill:
+            matching = services.compute_vendor_bill_matching(request.client_id, bill)
+            bill.match_result = matching
+            bill.match_status = "Matched" if matching.get("overallStatus") == "Match" else "Mismatch"
+            bill.save(update_fields=["match_result", "match_status", "updated_at"])
+
+            if req_action == "submit_approval":
+                bill.status = "Pending Approval"
+                history = list(bill.approval_history or [])
+                history.append({
+                    "at": timezone.now().isoformat(),
+                    "by": getattr(request.user, "name", None) or str(request.user),
+                    "action": "Submitted for Approval",
+                    "remarks": remarks,
+                })
+                bill.approval_history = history
+                bill.save(update_fields=["status", "approval_history", "updated_at"])
+
+            elif req_action == "approve":
+                request.data["createPayable"] = True
+                appr_res = self.approve(request, pk=bill.pk)
+                if bill.purchase_bill_id is None:
+                    try:
+                        self.send_for_matching(request, pk=bill.pk)
+                        bill.refresh_from_db()
+                    except Exception as e:
+                        pass
+                data = self.get_serializer(bill).data
+                data["matching"] = services.compute_vendor_bill_matching(request.client_id, bill)
+                return Response(data)
+
+            elif req_action == "reject":
+                return self.reject(request, pk=bill.pk)
+
+            data = self.get_serializer(bill).data
+            data["matching"] = matching
+            return Response(data)
+
+        # Live preview calculation without creating a DB record
+        temp_bill = VendorBill(
+            client=po.client,
+            vendor_bill_number=inv_number or "PREVIEW",
+            bill_date=inv_date,
+            party=po.party,
+            party_name=po.party_name,
+            purchase_order=po,
+            gst_pct=gst_pct,
+            subtotal=round2(qty * rate),
+            gst_amount=round2(round2(qty * rate) * gst_pct / Decimal("100")),
+            total=round2(round2(qty * rate) + round2(round2(qty * rate) * gst_pct / Decimal("100"))),
+            remarks=remarks,
+            status="Draft",
+        )
+        temp_line = VendorBillLine(
+            vendor_bill=temp_bill,
+            line_no=1,
+            qty=qty,
+            rate=rate,
+            amount=round2(qty * rate),
+            item_name="Grey Fabric",
+        )
+        temp_bill._preloaded_lines = [temp_line]
+
+        # Use helper
+        preview_res = services.compute_vendor_bill_matching(request.client_id, temp_bill)
+        return Response({"matching": preview_res})
 
 
 class VendorLookupViewSet(ReadOnlyTenantViewSet):
