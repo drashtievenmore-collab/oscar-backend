@@ -124,6 +124,11 @@ class ProductionInstructionViewSet(TenantModelViewSet):
             user=request.user,
             reason=data.get("reason") or request.data.get("reason"),
             rejected_qty=raw_rejected,
+            physically_verified_qty=data.get("physicallyVerifiedQty") or request.data.get("physicallyVerifiedQty"),
+            action=data.get("action") or request.data.get("action"),
+            verified_by_employee_id=data.get("verifiedByEmployeeId") or request.data.get("verifiedByEmployeeId"),
+            verification_date=data.get("verificationDate") or request.data.get("verificationDate"),
+            attachments=data.get("attachments") or request.data.get("attachments"),
         )
         return Response(self.get_serializer(instruction).data)
 
@@ -181,6 +186,7 @@ class DailyProductionEntryViewSet(TenantModelViewSet):
 
     def perform_create(self, serializer):
         data = serializer.validated_data
+        status = data.get("status", "Submitted")
         entry = services.record_daily_entry(
             client=self.request.user.client,
             instruction=data["instruction"],
@@ -188,19 +194,31 @@ class DailyProductionEntryViewSet(TenantModelViewSet):
             meters=data["meters"],
             produced_takas=data.get("produced_takas") or 0,
             produced_weight=data.get("produced_weight") or 0,
-            good_meter=data.get("good_meter") or data["meters"],
+            good_meter=data.get("good_meter"),
             reject_meter=data.get("reject_meter") or 0,
             reprocess_meter=data.get("reprocess_meter") or 0,
             photo_file=data.get("photo_file"),
             entered_by_employee=data["entered_by_employee"],
             entered_by_user=self.request.user,
             remarks=data.get("remarks"),
+            status=status,
         )
         serializer.instance = entry
         self._created_instance = entry
         self._concurrency_instance = entry
-        self.write_audit("create", entry, after={"meters": str(entry.meters)})
+        self.write_audit("create", entry, after={"meters": str(entry.meters), "status": entry.status})
         return entry
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def submit(self, request, pk=None):
+        entry = self.get_object()
+        entry = services.submit_daily_entry(entry, user=request.user)
+        self.write_audit("submit", entry, after={"status": entry.status, "meters": str(entry.meters)})
+        return Response({
+            "detail": "Daily production entry submitted successfully.",
+            "entry": self.get_serializer(entry).data,
+        })
 
     @transaction.atomic
     def perform_update(self, serializer):

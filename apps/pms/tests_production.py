@@ -356,3 +356,165 @@ class ProductionPermissionTests(TestCase):
         self.assertTrue(
             {"enter_production", "verify_production"}.isdisjoint(hr_manager)
         )
+
+
+class DailyProductionEnhancedTests(ProductionTestBase):
+    def test_future_date_rejected(self):
+        from apps.core.exceptions import ValidationFailed
+        from datetime import timedelta
+        from django.utils import timezone
+        employee = self.make_employee()
+        instruction = self.make_instruction(employee=employee)
+        future_date = timezone.localdate() + timedelta(days=2)
+        with self.assertRaises(ValidationFailed):
+            services.record_daily_entry(
+                client=self.client_obj,
+                instruction=instruction,
+                entry_date=future_date,
+                meters=Decimal("10"),
+                entered_by_employee=employee,
+            )
+
+    def test_reject_meter_cannot_exceed_meters(self):
+        from apps.core.exceptions import ValidationFailed
+        employee = self.make_employee()
+        instruction = self.make_instruction(employee=employee)
+        with self.assertRaises(ValidationFailed):
+            services.record_daily_entry(
+                client=self.client_obj,
+                instruction=instruction,
+                entry_date=date(2026, 9, 25),
+                meters=Decimal("10"),
+                reject_meter=Decimal("15"),
+                entered_by_employee=employee,
+            )
+
+    def test_reprocess_meter_cannot_exceed_meters(self):
+        from apps.core.exceptions import ValidationFailed
+        employee = self.make_employee()
+        instruction = self.make_instruction(employee=employee)
+        with self.assertRaises(ValidationFailed):
+            services.record_daily_entry(
+                client=self.client_obj,
+                instruction=instruction,
+                entry_date=date(2026, 9, 25),
+                meters=Decimal("10"),
+                reprocess_meter=Decimal("12"),
+                entered_by_employee=employee,
+            )
+
+    def test_draft_entry_does_not_advance_instruction_status(self):
+        employee = self.make_employee()
+        instruction = self.make_instruction(employee=employee, order_meter=Decimal("50"))
+        initial_status = instruction.status
+        entry = services.record_daily_entry(
+            client=self.client_obj,
+            instruction=instruction,
+            entry_date=date(2026, 9, 25),
+            meters=Decimal("50"),
+            entered_by_employee=employee,
+            status="Draft",
+        )
+        instruction.refresh_from_db()
+        self.assertEqual(entry.status, "Draft")
+        self.assertEqual(instruction.status, initial_status)
+
+        # Now submit draft
+        services.submit_daily_entry(entry, user=self.user)
+        instruction.refresh_from_db()
+        entry.refresh_from_db()
+        self.assertEqual(entry.status, "Submitted")
+        self.assertEqual(instruction.status, "Completed")
+
+    def test_quantity_cannot_be_zero_or_negative(self):
+        from apps.core.exceptions import ValidationFailed
+        employee = self.make_employee()
+        instruction = self.make_instruction(employee=employee, order_meter=Decimal("100"))
+        with self.assertRaises(ValidationFailed):
+            services.record_daily_entry(
+                client=self.client_obj,
+                instruction=instruction,
+                entry_date=date(2026, 9, 25),
+                meters=Decimal("0"),
+                entered_by_employee=employee,
+            )
+        with self.assertRaises(ValidationFailed):
+            services.record_daily_entry(
+                client=self.client_obj,
+                instruction=instruction,
+                entry_date=date(2026, 9, 25),
+                meters=Decimal("-5"),
+                entered_by_employee=employee,
+            )
+
+    def test_excessive_quantity_over_tolerance_rejected(self):
+        from apps.core.exceptions import ValidationFailed
+        employee = self.make_employee()
+        instruction = self.make_instruction(employee=employee, order_meter=Decimal("100"))
+        with self.assertRaises(ValidationFailed):
+            services.record_daily_entry(
+                client=self.client_obj,
+                instruction=instruction,
+                entry_date=date(2026, 9, 25),
+                meters=Decimal("150"),
+                entered_by_employee=employee,
+            )
+
+    def test_rejected_plus_reprocess_exceeding_meters_rejected(self):
+        from apps.core.exceptions import ValidationFailed
+        employee = self.make_employee()
+        instruction = self.make_instruction(employee=employee, order_meter=Decimal("100"))
+        with self.assertRaises(ValidationFailed):
+            services.record_daily_entry(
+                client=self.client_obj,
+                instruction=instruction,
+                entry_date=date(2026, 9, 25),
+                meters=Decimal("50"),
+                reject_meter=Decimal("30"),
+                reprocess_meter=Decimal("25"),
+                entered_by_employee=employee,
+            )
+
+    def test_accounting_quantities_and_derived_good_meters(self):
+        employee = self.make_employee()
+        instruction = self.make_instruction(employee=employee, order_meter=Decimal("100"))
+        entry = services.record_daily_entry(
+            client=self.client_obj,
+            instruction=instruction,
+            entry_date=date(2026, 9, 25),
+            meters=Decimal("50"),
+            reject_meter=Decimal("10"),
+            reprocess_meter=Decimal("5"),
+            entered_by_employee=employee,
+        )
+        self.assertEqual(entry.good_meter, Decimal("35"))
+        self.assertEqual(entry.cumulative_meter, Decimal("50"))
+        self.assertEqual(entry.balance_meter, Decimal("50"))
+
+    def test_instruction_completion_metrics_calculation(self):
+        employee = self.make_employee()
+        instruction = self.make_instruction(employee=employee, order_meter=Decimal("200"))
+        services.record_daily_entry(
+            client=self.client_obj,
+            instruction=instruction,
+            entry_date=date(2026, 9, 24),
+            meters=Decimal("80"),
+            reject_meter=Decimal("10"),
+            reprocess_meter=Decimal("5"),
+            entered_by_employee=employee,
+        )
+        services.record_daily_entry(
+            client=self.client_obj,
+            instruction=instruction,
+            entry_date=date(2026, 9, 25),
+            meters=Decimal("40"),
+            entered_by_employee=employee,
+            status="Draft",
+        )
+        comp = services.instruction_completion(instruction)
+        self.assertEqual(comp["totalProduced"], Decimal("80"))
+        self.assertEqual(comp["acceptedQty"], Decimal("65"))
+        self.assertEqual(comp["rejectedQty"], Decimal("10"))
+        self.assertEqual(comp["reprocessQty"], Decimal("5"))
+        self.assertEqual(comp["balanceQty"], Decimal("120"))
+        self.assertEqual(comp["completionPercentage"], Decimal("40.00"))
