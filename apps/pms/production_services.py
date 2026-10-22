@@ -84,9 +84,9 @@ def instruction_completion(instruction):
     """Full Production Completion & Verification payload.
 
     Derived only, never stored:
-      totalProduced = SUM(entries.meters)
-      acceptedQty = totalProduced - rejected_qty
-      shortageQty = order_meter - acceptedQty
+      totalProduced = SUM(entries.meters where status != 'Draft')
+      acceptedQty = SUM(entries.good_meter) or (totalProduced - rejected - reprocess)
+      shortageQty = max(0, order_meter - totalProduced)
       finalAmount = acceptedQty * agreed_job_rate
     Daily rows carry running cumulative/balance ordered by date.
     """
@@ -100,16 +100,27 @@ def instruction_completion(instruction):
         .order_by("entry_date", "created_at")
     )
     order_meter = D(instruction.order_meter)
-    rate = D(instruction.agreed_job_rate)
+    rate = D(instruction.agreed_job_rate) or D(instruction.agreed_rate) or D(instruction.tentative_rate)
     total = ZERO
+    total_rejected = ZERO
+    total_reprocess = ZERO
+    total_accepted = ZERO
     rows = []
     running = ZERO
     for idx, entry in enumerate(entries, start=1):
         meters = D(entry.meters)
         reject = D(entry.reject_meter or 0)
-        accepted_row = D(entry.good_meter or 0) if entry.good_meter else (meters - reject)
-        total += meters
-        running += meters
+        reprocess = D(entry.reprocess_meter or 0)
+        accepted_row = D(entry.good_meter or 0) if entry.good_meter else max(ZERO, meters - reject - reprocess)
+        entry_status = getattr(entry, "status", "Submitted") or "Submitted"
+
+        if entry_status != "Draft":
+            total += meters
+            total_rejected += reject
+            total_reprocess += reprocess
+            total_accepted += accepted_row
+            running += meters
+
         employee = getattr(entry, "entered_by_employee", None)
         rows.append(
             {
@@ -118,20 +129,25 @@ def instruction_completion(instruction):
                 "date": entry.entry_date.isoformat() if entry.entry_date else None,
                 "produced": meters,
                 "rejected": reject,
+                "reprocess": reprocess,
                 "accepted": accepted_row,
-                "cumulative": running,
-                "balance": compute_balance(order_meter, running),
+                "cumulative": running if entry_status != "Draft" else (running + meters),
+                "balance": compute_balance(order_meter, running if entry_status != "Draft" else (running + meters)),
                 "enteredBy": getattr(employee, "name", "") if employee else "",
                 "employeeCode": getattr(employee, "employee_code", None) if employee else None,
                 "remarks": entry.remarks or "-",
+                "status": entry_status,
+                "createdAt": entry.created_at.isoformat() if hasattr(entry, "created_at") and entry.created_at else None,
             }
         )
 
-    rejected = D(getattr(instruction, "rejected_qty", 0))
-    accepted = total - rejected
-    if accepted < ZERO:
-        accepted = ZERO
-    shortage = order_meter - accepted
+    rejected = total_rejected if total_rejected > ZERO else D(getattr(instruction, "rejected_qty", 0))
+    reprocess = total_reprocess
+    accepted = total_accepted if total_accepted > ZERO else max(ZERO, total - rejected - reprocess)
+    shortage = max(ZERO, order_meter - total)
+    balance_qty = compute_balance(order_meter, total)
+    completion_pct = round((float(total) / float(order_meter) * 100), 1) if order_meter > ZERO else 0
+
     employee = getattr(instruction, "employee", None)
     grey_lot_val = None
     if getattr(instruction, "grey_lot", None):
@@ -140,10 +156,45 @@ def instruction_completion(instruction):
         grey_lot_val = instruction.grey_lot_no
 
     final_po_obj = getattr(instruction, "final_po", None)
+
+    # Aggregate QC inspections for this instruction
+    from apps.inventory.models import QCInspection
+    qc_qs = QCInspection.objects.filter(
+        client_id=instruction.client_id,
+        deleted_at__isnull=True,
+    ).filter(
+        Q(production_instruction=instruction) | Q(source_document_number=instruction.order_reference)
+    ).exclude(status="Draft")
+
+    qc_inspected = sum((D(q.total_inspected_qty) for q in qc_qs), ZERO)
+    qc_accepted = sum((D(q.passed_qty) for q in qc_qs), ZERO)
+    qc_rejected = sum((D(q.rejected_qty) for q in qc_qs), ZERO)
+    qc_reprocess = sum((D(q.reprocess_qty) for q in qc_qs), ZERO)
+    qc_hold = sum((D(q.hold_qty) for q in qc_qs), ZERO)
+    qc_pending = max(ZERO, total - qc_inspected)
+
+    # Parse metadata from instruction notes if JSON
+    meta = {}
+    if getattr(instruction, "notes", None):
+        try:
+            import json
+            meta = json.loads(instruction.notes)
+        except Exception:
+            pass
+
+    physically_verified_val = meta.get("physicallyVerifiedQty")
+    if physically_verified_val is not None:
+        try:
+            physically_verified = D(str(physically_verified_val))
+        except Exception:
+            physically_verified = qc_accepted if qc_accepted > ZERO else total
+    else:
+        physically_verified = qc_accepted if qc_accepted > ZERO else total
+
     return {
         "instructionId": str(instruction.id),
         "piNo": instruction.instruction_number,
-        "piDate": instruction.pi_date.isoformat() if getattr(instruction, "pi_date", None) else None,
+        "piDate": instruction.pi_date.isoformat() if hasattr(getattr(instruction, "pi_date", None), "isoformat") else (str(instruction.pi_date) if getattr(instruction, "pi_date", None) else None),
         "agency": instruction.agency_name,
         "agencyId": str(instruction.agency_id) if instruction.agency_id else None,
         "fabric": getattr(instruction, "fabric", None),
@@ -154,8 +205,11 @@ def instruction_completion(instruction):
         "orderQty": order_meter,
         "totalProduced": total,
         "rejectedQty": rejected,
+        "reprocessQty": reprocess,
         "acceptedQty": accepted,
+        "balanceQty": balance_qty,
         "shortageQty": shortage,
+        "completionPercentage": completion_pct,
         "jobRate": rate,
         "finalAmount": round2(accepted * rate),
         "status": instruction.status,
@@ -165,6 +219,23 @@ def instruction_completion(instruction):
         "finalPoNumber": getattr(final_po_obj, "po_number", None) if final_po_obj else None,
         "finalPoId": str(final_po_obj.id) if final_po_obj else None,
         "dailySummary": rows,
+        "rows": rows,
+        "verificationRemarks": getattr(instruction, "verification_remarks", None) or "",
+        "verifiedBy": getattr(instruction.verified_by, "name", None) or getattr(instruction.verified_by, "email", None),
+        "verifiedAt": instruction.verified_at.isoformat() if instruction.verified_at else None,
+        "physicallyVerifiedQty": physically_verified,
+        "verificationDate": meta.get("verificationDate"),
+        "verifiedByEmployeeId": meta.get("verifiedByEmployeeId") or (str(instruction.supervisor_id) if instruction.supervisor_id else None),
+        "attachments": meta.get("attachments", []),
+        "fjwpoMetadata": meta.get("fjwpoMetadata", {}),
+        "qcSummary": {
+            "totalInspected": qc_inspected,
+            "acceptedQty": qc_accepted,
+            "rejectedQty": qc_rejected,
+            "reprocessQty": qc_reprocess,
+            "holdQty": qc_hold,
+            "pendingQcQty": qc_pending,
+        },
     }
 
 
@@ -177,6 +248,7 @@ def create_instruction(
     agency=None, grey_lot=None, taka_count=0, total_weight=ZERO,
     width=None, gsm=None, tentative_rate=ZERO, agreed_rate=ZERO,
     rate_uom="Meter", special_terms=None, expected_start_date=None,
+    expected_completion_date=None,
     status="Draft",
 ):
     """Create a PROD_INSTRUCTION_NEW row after the employee-status gate (Phase 2.4)."""
@@ -215,6 +287,7 @@ def create_instruction(
         rate_uom=rate_uom or "Meter",
         special_terms=special_terms,
         expected_start_date=expected_start_date,
+        expected_completion_date=expected_completion_date,
         pi_date=pi_date or timezone.localdate(),
         fabric=fabric,
         process_type=process_type,
@@ -330,14 +403,109 @@ def complete_instruction(instruction, *, user=None):
 
 
 @transaction.atomic
-def verify_instruction(instruction, *, user=None, reason=None, rejected_qty=None):
+def verify_instruction(
+    instruction,
+    *,
+    user=None,
+    reason=None,
+    rejected_qty=None,
+    physically_verified_qty=None,
+    action=None,
+    verified_by_employee_id=None,
+    verification_date=None,
+    attachments=None,
+):
     """Approve an instruction and auto-create grey lot at QC Hold (Phase 2.4)."""
+    import json
     from .models import DailyProductionEntry, ProductionInstruction
     from apps.inventory import services as stock
     from apps.inventory.models import LotTaka
     from apps.masters.models import Item
 
     instruction = ProductionInstruction.objects.select_for_update().get(pk=instruction.pk)
+
+    # 1. Handle Draft Save
+    if action in ("save_draft", "draft"):
+        before = {"status": instruction.status}
+        if instruction.status in ("Draft", "Not Started"):
+            instruction.status = "In Progress"
+        if reason is not None:
+            instruction.verification_remarks = reason
+        if rejected_qty is not None:
+            instruction.rejected_qty = D(rejected_qty)
+        meta = {
+            "physicallyVerifiedQty": str(physically_verified_qty if physically_verified_qty is not None else ""),
+            "verificationDate": str(verification_date or ""),
+            "verifiedByEmployeeId": str(verified_by_employee_id or ""),
+            "attachments": attachments or [],
+        }
+        instruction.notes = json.dumps(meta)
+        instruction.save(update_fields=["status", "rejected_qty", "verification_remarks", "notes", "updated_at"])
+        return instruction
+
+    # 2. Handle Return for Correction
+    if action in ("return_for_correction", "correction"):
+        before = {"status": instruction.status}
+        instruction.status = "In Progress"
+        if reason is not None:
+            instruction.verification_remarks = reason
+        meta = {
+            "physicallyVerifiedQty": str(physically_verified_qty if physically_verified_qty is not None else ""),
+            "verificationDate": str(verification_date or ""),
+            "verifiedByEmployeeId": str(verified_by_employee_id or ""),
+            "attachments": attachments or [],
+        }
+        instruction.notes = json.dumps(meta)
+        instruction.save(update_fields=["status", "verification_remarks", "notes", "updated_at"])
+        record_audit(
+            client=instruction.client_id,
+            actor=user,
+            action="production_instruction_correction",
+            entity_type="ProductionInstruction",
+            entity_id=instruction.id,
+            entity_label=instruction.instruction_number,
+            description=reason or "Returned for quantity correction.",
+            before=before,
+            after={"status": "In Progress"},
+            from_value=before["status"],
+            to_value="In Progress",
+            comments=reason,
+        )
+        return instruction
+
+    # 3. Handle Submit for Approval
+    if action in ("submit_for_approval", "submit"):
+        before = {"status": instruction.status}
+        instruction.status = "Verification Pending"
+        if reason is not None:
+            instruction.verification_remarks = reason
+        if rejected_qty is not None:
+            instruction.rejected_qty = D(rejected_qty)
+        meta = {
+            "physicallyVerifiedQty": str(physically_verified_qty if physically_verified_qty is not None else ""),
+            "verificationDate": str(verification_date or ""),
+            "verifiedByEmployeeId": str(verified_by_employee_id or ""),
+            "attachments": attachments or [],
+        }
+        instruction.notes = json.dumps(meta)
+        instruction.save(update_fields=["status", "rejected_qty", "verification_remarks", "notes", "updated_at"])
+        record_audit(
+            client=instruction.client_id,
+            actor=user,
+            action="production_instruction_submit_approval",
+            entity_type="ProductionInstruction",
+            entity_id=instruction.id,
+            entity_label=instruction.instruction_number,
+            description=reason or "Submitted for verification approval.",
+            before=before,
+            after={"status": "Verification Pending"},
+            from_value=before["status"],
+            to_value="Verification Pending",
+            comments=reason,
+        )
+        return instruction
+
+    # 4. Handle Final Approval (approve_complete / verify)
     if instruction.status in ("Verified", "PO Created", "Closed"):
         raise Conflict(
             "This instruction is already verified.", code=Codes.ALREADY_DONE
@@ -449,10 +617,17 @@ def verify_instruction(instruction, *, user=None, reason=None, rejected_qty=None
             )
             instruction.grey_lot = lot_taka
 
+    meta = {
+        "physicallyVerifiedQty": str(physically_verified_qty if physically_verified_qty is not None else ""),
+        "verificationDate": str(verification_date or ""),
+        "verifiedByEmployeeId": str(verified_by_employee_id or ""),
+        "attachments": attachments or [],
+    }
+    instruction.notes = json.dumps(meta)
     instruction.save(
         update_fields=[
             "status", "rejected_qty", "verification_remarks",
-            "verified_by", "verified_at", "grey_lot", "updated_at",
+            "verified_by", "verified_at", "grey_lot", "notes", "updated_at",
         ]
     )
     record_audit(
@@ -484,17 +659,16 @@ def generate_final_job_work_po(instruction, *, user=None, custom_data=None):
     instruction = instruction.__class__.objects.select_for_update().get(pk=instruction.pk)
     custom_data = custom_data or {}
 
-    allowed_statuses = (
-        "PO Pending", "Verified", "Completed", "Running", "In Progress",
-        "Approved", "Partially Completed", "Verification Pending"
-    )
-    if instruction.status not in allowed_statuses:
+    allowed_statuses = ("PO Pending", "Verified", "PO Created", "Running", "In Progress", "Completed", "Draft")
+    action = custom_data.get("action")
+    if instruction.status not in allowed_statuses and not custom_data.get("force"):
         raise ValidationFailed(
-            f"Instruction must be verified or active before generating PO (currently {instruction.status}).",
-            field_errors={"status": ["Must be Verified or Active."]},
+            f"Final Job Work PO can only be generated after completion verification (currently {instruction.status}).",
+            field_errors={"status": ["Must be Verified or PO Pending."]},
         )
-    if instruction.final_po_id and not custom_data.get("allowRecreate"):
-        raise Conflict("Final PO has already been created for this instruction.", code=Codes.ALREADY_DONE)
+    if instruction.final_po_id and not custom_data.get("allowRecreate") and action not in ["save_draft", "submit_for_approval", "approve_complete", "approve_generate"]:
+        if getattr(instruction.final_po, "status", None) not in ["Draft", "Pending Approval"]:
+            raise Conflict("Final PO has already been created for this instruction.", code=Codes.ALREADY_DONE)
 
     completion = instruction_completion(instruction)
     raw_billable = custom_data.get("billableQty") or custom_data.get("acceptedQty")
@@ -574,10 +748,33 @@ def generate_final_job_work_po(instruction, *, user=None, custom_data=None):
 
     from apps.sales.services import recalculate_document
 
-    po_no = custom_data.get("finalPoNo") or allocate_number(instruction.client, "JWPO")
+    po_no = custom_data.get("finalPoNo") or custom_data.get("poNumber")
+    if not po_no:
+        from apps.core.numbering import financial_year_label
+        year_str = financial_year_label(instruction.client, reset_policy="fy") if instruction.client else str(timezone.localdate().year)
+        last_po = PurchaseOrder.objects.filter(
+            client_id=instruction.client_id,
+        ).filter(
+            Q(po_number__startswith="FJWPO") | Q(po_number__startswith="JWPO")
+        ).order_by("-po_number").first()
+        seq = 1
+        if last_po and last_po.po_number:
+            parts = last_po.po_number.split("-")
+            if len(parts) >= 3 and parts[-1].isdigit():
+                seq = int(parts[-1]) + 1
+        po_no = f"FJWPO-{year_str}-{seq:04d}"
+
     po_date = custom_data.get("poDate") or timezone.localdate()
+    expected_comp_date = custom_data.get("expectedCompletionDate") or custom_data.get("expectedDate")
+    action = custom_data.get("action")
     send_to_approval = custom_data.get("sendToApproval", True)
-    po_status = "Pending Approval" if send_to_approval else "Approved"
+
+    if action == "save_draft":
+        po_status = "Draft"
+    elif action in ["approve_complete", "approve_generate"] or not send_to_approval:
+        po_status = "Approved"
+    else:
+        po_status = "Pending Approval"
 
     assigned_emp_id = custom_data.get("assignedEmployeeId")
     salesperson_fk = None
@@ -594,22 +791,38 @@ def generate_final_job_work_po(instruction, *, user=None, custom_data=None):
     remarks = custom_data.get("remarks") or f"Final Job Work PO for Production Instruction {instruction.instruction_number}"
     other_charges = D(str(custom_data.get("otherCharges") or 0))
 
-    po = PurchaseOrder(
-        client=instruction.client,
-        po_number=po_no,
-        party=vendor,
-        doc_date=po_date,
-        status=po_status,
-        reference_number=instruction.instruction_number,
-        purchase_type="Final Job Work",
-        notes=remarks,
-        other_charges=other_charges,
-        salesperson_fk=salesperson_fk,
-        salesperson=salesperson_name,
-        created_by=user if getattr(user, "is_authenticated", False) else None,
-    )
-    po.freeze_party_snapshot()
-    po.save()
+    # Reuse existing final_po if it exists and is Draft/Pending Approval
+    existing_po = instruction.final_po if (instruction.final_po_id and getattr(instruction.final_po, "status", None) in ["Draft", "Pending Approval"]) else None
+    if existing_po:
+        po = existing_po
+        po.po_number = po_no
+        po.party = vendor
+        po.doc_date = po_date
+        po.expected_date = expected_comp_date
+        po.status = po_status
+        po.notes = remarks
+        po.other_charges = other_charges
+        po.freeze_party_snapshot()
+        po.save()
+        po.line_items.all().delete()
+    else:
+        po = PurchaseOrder(
+            client=instruction.client,
+            po_number=po_no,
+            party=vendor,
+            doc_date=po_date,
+            expected_date=expected_comp_date,
+            status=po_status,
+            reference_number=instruction.instruction_number,
+            purchase_type="Final Job Work",
+            notes=remarks,
+            other_charges=other_charges,
+            salesperson_fk=salesperson_fk,
+            salesperson=salesperson_name,
+            created_by=user if getattr(user, "is_authenticated", False) else None,
+        )
+        po.freeze_party_snapshot()
+        po.save()
 
     custom_items = custom_data.get("items") or []
     if custom_items:
@@ -655,8 +868,38 @@ def generate_final_job_work_po(instruction, *, user=None, custom_data=None):
     recalculate_document(po)
 
     instruction.final_po = po
-    instruction.status = "PO Created"
-    instruction.save(update_fields=["final_po", "status", "updated_at"])
+    if po_status == "Draft":
+        instruction.status = "PO Pending"
+    elif po_status == "Approved":
+        instruction.status = "PO Created"
+    else:
+        instruction.status = "PO Pending"
+
+    # Persist draft & attachment metadata in instruction.notes
+    try:
+        import json
+        meta_dict = {}
+        if instruction.notes:
+            try:
+                meta_dict = json.loads(instruction.notes)
+            except Exception:
+                meta_dict = {"originalNotes": instruction.notes}
+        meta_dict["fjwpoMetadata"] = {
+            "poNumber": po_no,
+            "poDate": str(po_date),
+            "expectedCompletionDate": str(expected_comp_date) if expected_comp_date else None,
+            "rate": str(rate),
+            "acceptedQty": str(accepted_qty),
+            "remarks": remarks,
+            "status": po_status,
+            "attachments": custom_data.get("attachments", []),
+            "items": custom_items,
+        }
+        instruction.notes = json.dumps(meta_dict)
+    except Exception as e:
+        pass
+
+    instruction.save(update_fields=["final_po", "status", "notes", "updated_at"])
 
     record_audit(
         client=instruction.client_id,
@@ -738,40 +981,125 @@ def lock_open_instruction(instruction):
 def record_daily_entry(
     *, client, instruction, entry_date, meters, entered_by_employee,
     entered_by_user=None, remarks=None,
-    produced_takas=0, produced_weight=ZERO, good_meter=ZERO,
+    produced_takas=0, produced_weight=ZERO, good_meter=None,
     reject_meter=ZERO, reprocess_meter=ZERO, photo_file=None,
+    status="Submitted",
 ):
     """Post a DAILY_PROD_ENTRY_NEW row with computed cumulative & balance (Phase 2.4)."""
     instruction = lock_open_instruction(instruction)
     validate_employee_for_production(entered_by_employee, field="enteredByEmployeeId")
-    if D(meters) <= ZERO:
+
+    from django.utils import timezone
+    from datetime import date
+
+    # Date validation: no future dates
+    today = timezone.localdate()
+    parsed_date = entry_date if isinstance(entry_date, date) else None
+    if not parsed_date and entry_date:
+        try:
+            from django.utils.dateparse import parse_date
+            parsed_date = parse_date(str(entry_date))
+        except Exception:
+            parsed_date = None
+
+    if parsed_date and parsed_date > today:
         raise ValidationFailed(
-            "Meters must be more than zero.",
+            "Production Date cannot be in the future.",
+            field_errors={"entry_date": ["Future dates not permitted."]},
+        )
+
+    # Quantity validations
+    d_meters = D(meters)
+    if d_meters <= ZERO:
+        raise ValidationFailed(
+            "Today's Produced Quantity must be more than zero.",
             field_errors={"meters": ["Must be more than zero."]},
         )
 
+    d_reject = D(reject_meter or 0)
+    d_reprocess = D(reprocess_meter or 0)
+
+    if d_reject < ZERO:
+        raise ValidationFailed(
+            "Rejected quantity cannot be negative.",
+            field_errors={"reject_meter": ["Cannot be negative."]},
+        )
+    if d_reject > d_meters:
+        raise ValidationFailed(
+            "Rejected quantity cannot exceed today's produced quantity.",
+            field_errors={"reject_meter": ["Cannot exceed today's produced quantity."]},
+        )
+
+    if d_reprocess < ZERO:
+        raise ValidationFailed(
+            "Reprocess quantity cannot be negative.",
+            field_errors={"reprocess_meter": ["Cannot be negative."]},
+        )
+    if d_reprocess > d_meters:
+        raise ValidationFailed(
+            "Reprocess quantity cannot exceed today's produced quantity.",
+            field_errors={"reprocess_meter": ["Cannot exceed today's produced quantity."]},
+        )
+
+    if (d_reject + d_reprocess) > d_meters:
+        raise ValidationFailed(
+            "Sum of rejected and reprocess quantities cannot exceed today's produced quantity.",
+            field_errors={"reject_meter": ["Sum of rejected and reprocess quantities exceeds today's produced quantity."]},
+        )
+
+    d_good = D(good_meter) if (good_meter is not None and D(good_meter) > ZERO) else max(ZERO, d_meters - d_reject - d_reprocess)
+
     from .models import DailyProductionEntry
 
-    # Compute previous cumulative
+    # Compute previous cumulative (from submitted entries only)
     prev_cum = DailyProductionEntry.objects.filter(
-        instruction=instruction, deleted_at__isnull=True
+        instruction=instruction, status="Submitted", deleted_at__isnull=True
     ).aggregate(value=Sum("meters"))["value"] or ZERO
 
     opening_pending = compute_balance(instruction.order_meter, prev_cum)
-    cumulative_meter = D(prev_cum) + D(meters)
-    balance_meter = compute_balance(instruction.order_meter, cumulative_meter)
+
+    # Validate against remaining instructed balance for submitted entries
+    if status == "Submitted" and instruction.order_meter > ZERO:
+        remaining = instruction.order_meter - prev_cum
+        # Over-limit check: reject if meters exceeds remaining balance by more than 25% (allowing standard weaving tolerance)
+        if remaining > ZERO and d_meters > (remaining * Decimal("1.25")):
+            raise ValidationFailed(
+                f"Today's produced quantity ({d_meters} m) exceeds remaining instructed balance ({remaining} m).",
+                field_errors={"meters": [f"Quantity exceeds remaining instructed balance ({remaining} m)."]},
+            )
+
+    # Check rapid duplicate submission within 5 seconds
+    if parsed_date:
+        recent_dup = DailyProductionEntry.objects.filter(
+            client=client,
+            instruction=instruction,
+            entry_date=parsed_date,
+            meters=d_meters,
+            status=status,
+            deleted_at__isnull=True,
+            created_at__gte=timezone.now() - timezone.timedelta(seconds=5),
+        ).first()
+        if recent_dup:
+            return recent_dup
+
+    if status == "Draft":
+        cumulative_meter = prev_cum
+        balance_meter = opening_pending
+    else:
+        cumulative_meter = D(prev_cum) + d_meters
+        balance_meter = compute_balance(instruction.order_meter, cumulative_meter)
 
     entry = DailyProductionEntry.objects.create(
         client=client,
         instruction=instruction,
         entry_date=entry_date,
         opening_pending=opening_pending,
-        meters=D(meters),
+        meters=d_meters,
         produced_takas=int(produced_takas or 0),
         produced_weight=D(produced_weight or 0),
-        good_meter=D(good_meter or meters),
-        reject_meter=D(reject_meter or 0),
-        reprocess_meter=D(reprocess_meter or 0),
+        good_meter=d_good,
+        reject_meter=d_reject,
+        reprocess_meter=d_reprocess,
         cumulative_meter=cumulative_meter,
         balance_meter=balance_meter,
         photo_file=photo_file,
@@ -780,16 +1108,49 @@ def record_daily_entry(
             entered_by_user if getattr(entered_by_user, "is_authenticated", False) else None
         ),
         remarks=remarks,
+        status=status,
         created_by=(
             entered_by_user if getattr(entered_by_user, "is_authenticated", False) else None
         ),
     )
 
-    # Update instruction status
-    if instruction.status in ("Approved", "Not Started"):
-        instruction.status = "Running"
-    elif balance_meter <= ZERO:
+    # Update instruction status only for submitted entries
+    if status == "Submitted":
+        if instruction.status in ("Approved", "Not Started"):
+            instruction.status = "Running"
+        elif balance_meter <= ZERO:
+            instruction.status = "Completed"
+        else:
+            instruction.status = "Partially Completed"
+        instruction.save(update_fields=["status", "updated_at"])
+
+    return entry
+
+
+@transaction.atomic
+def submit_daily_entry(entry, user=None):
+    """Transitions a Draft DailyProductionEntry to Submitted and updates cumulative/balance/instruction status."""
+    if entry.status == "Submitted":
+        return entry
+
+    from .models import DailyProductionEntry
+    instruction = lock_open_instruction(entry.instruction)
+    prev_cum = DailyProductionEntry.objects.filter(
+        instruction=instruction, status="Submitted", deleted_at__isnull=True
+    ).exclude(id=entry.id).aggregate(value=Sum("meters"))["value"] or ZERO
+
+    entry.opening_pending = compute_balance(instruction.order_meter, prev_cum)
+    entry.cumulative_meter = D(prev_cum) + D(entry.meters)
+    entry.balance_meter = compute_balance(instruction.order_meter, entry.cumulative_meter)
+    entry.status = "Submitted"
+    if user and getattr(user, "is_authenticated", False):
+        entry.updated_by = user
+    entry.save()
+
+    if entry.balance_meter <= ZERO:
         instruction.status = "Completed"
+    elif instruction.status in ("Approved", "Not Started"):
+        instruction.status = "Running"
     else:
         instruction.status = "Partially Completed"
     instruction.save(update_fields=["status", "updated_at"])

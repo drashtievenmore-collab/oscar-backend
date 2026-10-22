@@ -564,6 +564,7 @@ class ProductionInstruction(TenantModel):
     rate_uom = models.TextField(default="Meter")
     special_terms = models.TextField(null=True, blank=True)
     expected_start_date = models.DateField(null=True, blank=True)
+    expected_completion_date = models.DateField(null=True, blank=True)
     pi_date = models.DateField(null=True, blank=True)
     fabric = models.TextField(null=True, blank=True)
     process_type = models.TextField(null=True, blank=True)
@@ -651,6 +652,11 @@ class DailyProductionEntry(TenantModel):
     entered_by_user = models.ForeignKey(
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    STATUS_CHOICES = [
+        ("Draft", "Draft"),
+        ("Submitted", "Submitted"),
+    ]
+    status = models.TextField(choices=STATUS_CHOICES, default="Submitted")
     remarks = models.TextField(null=True, blank=True)
 
     class Meta:

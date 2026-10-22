@@ -707,6 +707,22 @@ class QCInspection(TenantModel, LegacyIdMixin):
     rejected_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     hold_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     notes = models.TextField(null=True, blank=True)
+    purchase_order = models.ForeignKey(
+        "purchase.PurchaseOrder", null=True, blank=True, on_delete=models.SET_NULL, related_name="qc_inspections"
+    )
+    production_instruction = models.ForeignKey(
+        "pms.ProductionInstruction", null=True, blank=True, on_delete=models.SET_NULL, related_name="qc_inspections"
+    )
+    fabric_item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    inspection_type = models.TextField(default="Grey Fabric QC")
+    inspection_method = models.TextField(default="Visual + Measurement")
+    gsm = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    width = models.DecimalField(max_digits=9, decimal_places=2, null=True, blank=True)
+    defects_found = models.TextField(null=True, blank=True)
+    quality_grade = models.TextField(default="Grade A", null=True, blank=True)
+    photos = models.JSONField(default=list, blank=True)
     previous_inspection = models.ForeignKey(
         "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="reinspections"
     )
