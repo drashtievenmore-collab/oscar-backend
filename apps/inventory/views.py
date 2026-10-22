@@ -6154,6 +6154,8 @@ class TripViewSet(TenantModelViewSet):
             from_location=data.get("fromLocation") or data.get("from_location"),
             to_location=data.get("toLocation") or data.get("to_location"),
             vehicle_number=data.get("vehicleNumber") or data.get("vehicle_number"),
+            vehicle_id=data.get("vehicleId") or data.get("vehicle_id"),
+            driver_id=data.get("driverId") or data.get("driver_id"),
             trip_date=data.get("tripDate") or data.get("trip_date"),
             transporter_id=data.get("transporterId") or data.get("transporter_id"),
             transporter_party_id=data.get("transporterPartyId") or data.get("transporter_party_id"),
@@ -6179,6 +6181,23 @@ class TripViewSet(TenantModelViewSet):
         trip = self.get_object()
         trip = logistics_services.allocate_trip_freight(trip, user=request.user)
         return Response(self.get_serializer(trip).data)
+
+    @action(detail=True, methods=["post"], url_path="confirm-delivery")
+    def confirm_delivery(self, request, pk=None):
+        trip = self.get_object()
+        data = request.data
+        delivery_time = data.get("deliveryTime") or data.get("delivery_time")
+        proof_file_id = data.get("proofFileId") or data.get("proof_file_id") or data.get("proof_file")
+        remarks = data.get("remarks")
+        trip = logistics_services.confirm_trip_delivery(
+            trip,
+            delivery_time=delivery_time,
+            proof_file_id=proof_file_id,
+            remarks=remarks,
+            user=request.user,
+        )
+        return Response(self.get_serializer(trip).data)
+
 
 
 

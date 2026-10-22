@@ -11,6 +11,8 @@ from .views import (
     ProcessMasterViewSet,
     ReturnReasonMasterViewSet,
     TransporterViewSet,
+    VehicleViewSet,
+    DriverViewSet,
     PartyViewSet,
     ItemViewSet,
 )
@@ -21,6 +23,8 @@ router.register("items", ItemViewSet, basename="masters-items")
 router.register("agencies", AgencyViewSet, basename="masters-agencies")
 router.register("brokers", BrokerViewSet, basename="masters-brokers")
 router.register("transporters", TransporterViewSet, basename="masters-transporters")
+router.register("vehicles", VehicleViewSet, basename="masters-vehicles")
+router.register("drivers", DriverViewSet, basename="masters-drivers")
 router.register("processes", ProcessMasterViewSet, basename="masters-processes")
 router.register("jobwork-rates", JobWorkRateMasterViewSet, basename="masters-jobwork-rates")
 router.register("defects", DefectMasterViewSet, basename="masters-defects")

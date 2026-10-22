@@ -959,6 +959,12 @@ class Trip(TenantModel, LegacyIdMixin):
     transporter_party = models.ForeignKey(
         "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="transporter_trips"
     )
+    vehicle = models.ForeignKey(
+        "masters.Vehicle", null=True, blank=True, on_delete=models.SET_NULL, related_name="trips"
+    )
+    driver = models.ForeignKey(
+        "masters.Driver", null=True, blank=True, on_delete=models.SET_NULL, related_name="trips"
+    )
     vehicle_number = models.TextField()
     driver_name = models.TextField(null=True, blank=True)
     driver_mobile = models.TextField(null=True, blank=True)

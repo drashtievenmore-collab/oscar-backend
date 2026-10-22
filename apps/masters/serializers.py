@@ -14,6 +14,7 @@ from apps.core.serializers import (
 )
 
 from .models import (
+    Vehicle, Driver,
     Agency,
     Broker,
     CategoryCustomField,
@@ -1060,8 +1061,10 @@ class FabricVariantSerializer(TextileMasterSerializer):
         variant = super().update(instance, validated_data)
         self._sync_to_item(variant)
         return variant
-
-
+
+
+
+
 # ---------------------------------------------------------------------------
 # Items (api.md §4.2)
 # ---------------------------------------------------------------------------
@@ -1409,3 +1412,69 @@ class TransporterSerializer(BaseModelSerializer):
         extra_kwargs = {"code": {"required": False, "allow_blank": True}}
 
 
+
+
+class VehicleSerializer(BaseModelSerializer):
+    vehicleNumber = serializers.CharField(source="vehicle_number", required=False)
+    vehicleType = serializers.CharField(source="vehicle_type", required=False, default="Truck")
+    transporterId = TenantPrimaryKeyRelatedField(
+        source="transporter", model="masters.Transporter", required=False, allow_null=True
+    )
+    transporterName = serializers.CharField(source="transporter.name", read_only=True)
+    isActive = serializers.BooleanField(source="is_active", required=False, default=True)
+
+    class Meta:
+        model = Vehicle
+        fields = [
+            "id", "vehicleNumber", "vehicle_number", "vehicleType", "vehicle_type",
+            "capacity", "transporterId", "transporter", "transporterName",
+            "isActive", "is_active", "remarks", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+        extra_kwargs = {
+            "vehicle_number": {"required": False},
+            "vehicle_type": {"required": False},
+            "is_active": {"required": False},
+        }
+
+    def to_internal_value(self, data):
+        data = dict(data)
+        if "vehicleNo" in data and "vehicleNumber" not in data and "vehicle_number" not in data:
+            data["vehicleNumber"] = data["vehicleNo"]
+        if "vehicle_no" in data and "vehicleNumber" not in data and "vehicle_number" not in data:
+            data["vehicleNumber"] = data["vehicle_no"]
+        if "type" in data and "vehicleType" not in data and "vehicle_type" not in data:
+            data["vehicleType"] = data["type"]
+        if "vehicle_number" not in data and "vehicleNumber" in data:
+            data["vehicle_number"] = data["vehicleNumber"]
+        if "vehicle_type" not in data and "vehicleType" in data:
+            data["vehicle_type"] = data["vehicleType"]
+        return super().to_internal_value(data)
+
+
+class DriverSerializer(BaseModelSerializer):
+    transporterId = TenantPrimaryKeyRelatedField(
+        source="transporter", model="masters.Transporter", required=False, allow_null=True
+    )
+    transporterName = serializers.CharField(source="transporter.name", read_only=True)
+    isActive = serializers.BooleanField(source="is_active", required=False, default=True)
+
+    class Meta:
+        model = Driver
+        fields = [
+            "id", "name", "mobile", "licence", "transporterId", "transporter",
+            "transporterName", "isActive", "is_active", "remarks",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+        extra_kwargs = {
+            "is_active": {"required": False},
+        }
+
+    def to_internal_value(self, data):
+        data = dict(data)
+        if "phone" in data and "mobile" not in data:
+            data["mobile"] = data["phone"]
+        if "license" in data and "licence" not in data:
+            data["licence"] = data["license"]
+        return super().to_internal_value(data)

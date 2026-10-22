@@ -530,9 +530,24 @@ class TripSerializer(BaseModelSerializer):
     transporterPartyId = TenantPrimaryKeyRelatedField(
         source="transporter_party", model="masters.Party", required=False, allow_null=True
     )
-    vehicleNumber = serializers.CharField(source="vehicle_number")
+    vehicleId = TenantPrimaryKeyRelatedField(
+        source="vehicle", model="masters.Vehicle", required=False, allow_null=True
+    )
+    driverId = TenantPrimaryKeyRelatedField(
+        source="driver", model="masters.Driver", required=False, allow_null=True
+    )
+    vehicleNumber = serializers.CharField(source="vehicle_number", required=False, allow_blank=True)
     driverName = serializers.CharField(source="driver_name", required=False, allow_null=True, allow_blank=True)
     driverMobile = serializers.CharField(source="driver_mobile", required=False, allow_null=True, allow_blank=True)
+    proofFileId = TenantPrimaryKeyRelatedField(
+        source="proof_file", model="core.File", required=False, allow_null=True
+    )
+    proofFileUrl = serializers.SerializerMethodField()
+
+    def get_proofFileUrl(self, obj):
+        if obj.proof_file_id:
+            return f"/api/v1/files/{obj.proof_file_id}/download/"
+        return None
     lrNumber = serializers.CharField(source="lr_number", required=False, allow_null=True, allow_blank=True)
     lrDate = serializers.DateField(source="lr_date", required=False, allow_null=True)
     tripType = serializers.CharField(source="trip_type", required=False, default="OUTWARD")
@@ -551,7 +566,7 @@ class TripSerializer(BaseModelSerializer):
         fields = [
             "id", "tripNumber", "tripDate", "fromLocation", "toLocation",
             "transporterId", "transporterName", "transporterPartyId",
-            "vehicleNumber", "driverName", "driverMobile", "lrNumber", "lrDate",
+            "vehicleId", "driverId", "proofFileId", "proofFileUrl", "proof_file", "vehicleNumber", "driverName", "driverMobile", "lrNumber", "lrDate",
             "tripType", "status", "freightAmount", "loadingCharges", "unloadingCharges",
             "otherCharges", "totalCharges", "paidBy", "costAllocationTarget",
             "isCostAllocated", "dispatch_time", "delivery_time", "remarks",

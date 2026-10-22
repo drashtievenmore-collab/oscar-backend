@@ -194,6 +194,35 @@ class AlertChecksTests(TestCase):
         self.run_check(alerts.check_qc_rejection_high)
         self.assertTrue(self.incidents("qc_rejection_high").filter(entity_id=str(qc.id)).exists())
 
+    def add_entry(self, pi, meters, reject, rework, on=None):
+        from apps.pms.models import DailyProductionEntry
+
+        return DailyProductionEntry.objects.create(
+            client=self.tenant, instruction=pi, entry_date=on or self.today,
+            meters=Decimal(meters), reject_meter=Decimal(reject), reprocess_meter=Decimal(rework),
+            entered_by_employee=self.employee, status="Submitted",
+        )
+
+    def test_agency_reject_and_reprocess_above_threshold(self):
+        # The screenshot case: 500 produced, 45 rejected, 78 reprocess = 24.6% > 5%.
+        pi = self.make_instruction(status="Partially Completed")
+        self.add_entry(pi, "500", "45", "78")
+        self.run_check(alerts.check_qc_rejection_high)
+        incident = self.incidents("qc_rejection_high").get(entity_id=str(pi.id))
+        self.assertIn("24.60%", incident.title)
+
+    def test_agency_dashboard_splits_quality(self):
+        from apps.pms.production_reports import agency_production_view
+
+        pi = self.make_instruction(status="Partially Completed")
+        self.add_entry(pi, "500", "45", "78")
+        row = next(r for r in agency_production_view(self.tenant.id, day=self.today) if r["agency"] == pi.agency_name)
+        self.assertEqual(row["acceptedMeters"], 377.0)
+        self.assertEqual(row["rejectedMeters"], 45.0)
+        self.assertEqual(row["reprocessMeters"], 78.0)
+        self.assertEqual(row["rejectPct"], 9.0)
+        self.assertEqual(row["reprocessPct"], 15.6)
+
     # -- 6 ----------------------------------------------------------------
     def test_negative_stock(self):
         balance = StockBalance.objects.create(

@@ -484,6 +484,42 @@ def check_qc_rejection_high(client_id, as_of):
                 entity_id=qc.id,
                 entity_number=qc.inspection_number,
             ))
+
+    # External agency production: reject + reprocess share of what the agency
+    # reported, per instruction that got an entry today (PDF §15, §19).
+    from apps.pms.models import DailyProductionEntry, ProductionInstruction
+
+    touched = ProductionInstruction.objects.filter(
+        client_id=client_id,
+        deleted_at__isnull=True,
+        daily_entries__entry_date=as_of,
+        daily_entries__deleted_at__isnull=True,
+    ).distinct()
+    for pi in touched:
+        entries = DailyProductionEntry.objects.filter(
+            instruction=pi, deleted_at__isnull=True
+        ).exclude(status="Draft")
+        produced = sum((D(e.meters or 0) for e in entries), ZERO)
+        if produced <= ZERO:
+            continue
+        rejected = sum((D(e.reject_meter or 0) for e in entries), ZERO)
+        rework = sum((D(e.reprocess_meter or 0) for e in entries), ZERO)
+        failed_pct = round2((rejected + rework) / produced * D(100))
+        if failed_pct > max_pct:
+            _collect(incidents, trigger_incident(
+                client_id=client_id,
+                alert_key="qc_rejection_high",
+                severity="Critical",
+                title=f"High Reject/Reprocess at {pi.agency_name} ({failed_pct}%): {pi.instruction_number}",
+                message=(
+                    f"Of {produced}m produced, {rejected}m rejected and {rework}m sent for reprocess "
+                    f"on {pi.instruction_number}; limit is {max_pct}%."
+                ),
+                entity_type="ProductionInstruction",
+                entity_id=pi.id,
+                entity_number=pi.instruction_number,
+                metadata={"produced": str(produced), "rejected": str(rejected), "reprocess": str(rework)},
+            ))
     return incidents
 
 

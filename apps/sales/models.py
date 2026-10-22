@@ -208,6 +208,7 @@ class SalesOrder(DocumentHeader):
     dispatch_date = models.DateField(null=True, blank=True)
     vehicle_number = models.TextField(null=True, blank=True)
     transporter = models.TextField(null=True, blank=True)
+    allocated_freight_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
 
     class Meta:
         db_table = "sales_orders"
@@ -316,6 +317,7 @@ class DeliveryChallan(DocumentHeader):
     dispatch_date = models.DateField(null=True, blank=True)
     vehicle_number = models.TextField(null=True, blank=True)
     transporter = models.TextField(null=True, blank=True)
+    allocated_freight_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     lr_number = models.TextField(null=True, blank=True)
     delivery_location = models.TextField(null=True, blank=True)
     eway_bill_number = models.TextField(null=True, blank=True)
@@ -396,6 +398,7 @@ class SalesInvoice(DocumentHeader):
     dispatch_date = models.DateField(null=True, blank=True)
     vehicle_number = models.TextField(null=True, blank=True)
     transporter = models.TextField(null=True, blank=True)
+    allocated_freight_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
 
     class Meta:
         db_table = "sales_invoices"

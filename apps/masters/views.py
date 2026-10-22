@@ -17,6 +17,7 @@ from apps.inventory import services as stock
 from apps.masters import uom
 
 from .models import (
+    Vehicle, Driver,
     Agency,
     Broker,
     CategoryPart,
@@ -43,6 +44,7 @@ from .models import (
 )
 from .serializers import slug_code
 from .serializers import (
+    VehicleSerializer, DriverSerializer,
     AgencySerializer,
     BrokerSerializer,
     CategoryPartSerializer,
@@ -1479,3 +1481,46 @@ class TransporterViewSet(TenantModelViewSet):
         return super().perform_create(serializer)
 
 
+
+
+class VehicleViewSet(TenantModelViewSet):
+    queryset = Vehicle.objects.select_related("transporter").all()
+    serializer_class = VehicleSerializer
+    required_permissions = ["view_masters"]
+    permission_map = {
+        "list": ["view_masters"],
+        "retrieve": ["view_masters"],
+        "create": ["manage_masters"],
+        "update": ["manage_masters"],
+        "partial_update": ["manage_masters"],
+        "destroy": ["manage_masters"],
+    }
+    audit_entity_type = "Vehicle"
+    search_fields = ["vehicle_number", "vehicle_type", "capacity", "transporter__name"]
+    filter_map = {
+        "isActive": "is_active",
+        "is_active": "is_active",
+        "transporterId": "transporter_id",
+        "vehicleType": "vehicle_type",
+    }
+
+
+class DriverViewSet(TenantModelViewSet):
+    queryset = Driver.objects.select_related("transporter").all()
+    serializer_class = DriverSerializer
+    required_permissions = ["view_masters"]
+    permission_map = {
+        "list": ["view_masters"],
+        "retrieve": ["view_masters"],
+        "create": ["manage_masters"],
+        "update": ["manage_masters"],
+        "partial_update": ["manage_masters"],
+        "destroy": ["manage_masters"],
+    }
+    audit_entity_type = "Driver"
+    search_fields = ["name", "mobile", "licence", "transporter__name"]
+    filter_map = {
+        "isActive": "is_active",
+        "is_active": "is_active",
+        "transporterId": "transporter_id",
+    }

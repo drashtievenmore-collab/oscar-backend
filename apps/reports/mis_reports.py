@@ -220,6 +220,19 @@ def party_profitability_report(client_id, date_from=None, date_to=None):
         if pid in party_data:
             party_data[pid]["returns"] += D(sr.total or 0)
 
+    # Transport support / allocated freight per party from Sales Orders
+    from apps.sales.models import SalesOrder
+    so_freight = SalesOrder.objects.filter(
+        client_id=client_id,
+        doc_date__gte=date_from,
+        doc_date__lte=date_to,
+        deleted_at__isnull=True,
+    ).exclude(stage="Cancelled")
+    for so in so_freight:
+        pid = str(so.party_id)
+        if pid in party_data and getattr(so, "allocated_freight_cost", None):
+            party_data[pid]["transport"] = party_data[pid].get("transport", ZERO) + D(so.allocated_freight_cost)
+
     rows = []
     for p in party_data.values():
         sales = p["sales"]
@@ -228,7 +241,8 @@ def party_profitability_report(client_id, date_from=None, date_to=None):
         ret = p["returns"]
         # Estimate / allocate COGS at 75% or from lines if available
         cogs = round2(sales * Decimal("0.72"))
-        net = round2(sales - cogs - disc - brok - ret)
+        transport = p.get("transport", ZERO)
+        net = round2(sales - cogs - disc - brok - ret - transport)
         margin = float(round2(net / sales * Decimal("100"))) if sales > ZERO else 0.0
 
         rows.append({
@@ -240,6 +254,7 @@ def party_profitability_report(client_id, date_from=None, date_to=None):
             "discount": float(round2(disc)),
             "brokerage": float(round2(brok)),
             "returns": float(round2(ret)),
+            "transport": float(round2(transport)),
             "netContribution": float(net),
             "marginPct": margin,
         })

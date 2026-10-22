@@ -1022,3 +1022,50 @@ class DocumentLineSerial(TenantModel):
             )
         ]
         indexes = [models.Index(fields=["serial"], name="ix_dls_serial")]
+
+
+class Vehicle(TenantModel, LegacyIdMixin):
+    """Vehicle master for logistics & fleet management (PDF §13)."""
+
+    vehicle_number = models.TextField(db_index=True)
+    vehicle_type = models.TextField(default="Truck")
+    capacity = models.TextField(null=True, blank=True)
+    transporter = models.ForeignKey(
+        Transporter, null=True, blank=True, on_delete=models.SET_NULL, related_name="vehicles_list"
+    )
+    is_active = models.BooleanField(default=True)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "logistics_vehicles"
+        ordering = ["vehicle_number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "vehicle_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_logistics_vehicle_number",
+            )
+        ]
+
+    def __str__(self):
+        return self.vehicle_number
+
+
+class Driver(TenantModel, LegacyIdMixin):
+    """Driver master for transport & fleet operations (PDF §13)."""
+
+    name = models.TextField()
+    mobile = models.TextField(null=True, blank=True)
+    licence = models.TextField(null=True, blank=True)
+    transporter = models.ForeignKey(
+        Transporter, null=True, blank=True, on_delete=models.SET_NULL, related_name="drivers_list"
+    )
+    is_active = models.BooleanField(default=True)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "logistics_drivers"
+        ordering = ["name"]
+
+    def __str__(self):
+        return f"{self.name} ({self.mobile or self.licence or 'Driver'})"
