@@ -141,9 +141,44 @@ def assert_not_pending_approval(client_id, document_type, document_id, action_de
         )
 
 
+#: Document-specific permissions that already let a role approve that document
+#: outside the approval inbox; holding one also allows deciding its request.
+DOCUMENT_APPROVE_PERMISSIONS = {
+    "purchase_order": "approve_purchase_order",
+}
+
+
+def assert_can_decide(req, user, decision):
+    """Only an approver may decide: ``manage_approvals`` (or ``return_approval``
+    for a return), the rule's approver role, or the document's own approve
+    permission."""
+    from apps.core.permissions import has_permission
+    from rest_framework.exceptions import PermissionDenied
+
+    if getattr(user, "is_superuser", False) or has_permission(user, "manage_approvals"):
+        return
+    if decision == "Returned" and has_permission(user, "return_approval"):
+        return
+    role = getattr(user, "role", None)
+    rule = req.rule
+    if role is not None and rule is not None and (
+        (rule.approver_role_id and rule.approver_role_id == role.id)
+        or (rule.approver_role_code and rule.approver_role_code == getattr(role, "code", None))
+    ):
+        return
+    doc_perm = DOCUMENT_APPROVE_PERMISSIONS.get(req.document_type)
+    if doc_perm and has_permission(user, doc_perm):
+        return
+    raise PermissionDenied("You are not an approver for this request.", code="manage_approvals")
+
+
 @transaction.atomic
-def decide_approval_request(request_id, user, decision, comments=""):
-    req = ApprovalRequest.objects.select_for_update().get(id=request_id)
+def decide_approval_request(request_id, user, decision, comments="", client_id=None):
+    qs = ApprovalRequest.objects.select_for_update()
+    if client_id is not None:
+        qs = qs.filter(client_id=client_id)
+    req = qs.get(id=request_id)
+    assert_can_decide(req, user, decision)
     if req.status != "Pending":
         raise ValidationError(f"Approval request is already in '{req.status}' state.")
 

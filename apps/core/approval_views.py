@@ -6,10 +6,13 @@ from rest_framework.response import Response
 from apps.core.models import AlertIncident, AlertSetting, ApprovalRequest, ApprovalRule
 from .approval_serializers import ApprovalRequestSerializer, ApprovalRuleSerializer
 from .approval_services import decide_approval_request
+from .permissions import HasModulePermission
 
 
 class ApprovalRuleViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated]
+    # Anyone may read the rules (the inbox shows them); only rule admins change them.
+    permission_classes = [HasModulePermission]
+    permission_map = {"write": ["manage_approval_rules"]}
     serializer_class = ApprovalRuleSerializer
 
     def get_queryset(self):
@@ -51,23 +54,33 @@ class ApprovalRequestViewSet(viewsets.ModelViewSet):
 
         return qs.order_by("-requested_at")
 
+    # Requests are raised by the system and decided through the actions below;
+    # they are never edited or deleted directly.
+    http_method_names = ["get", "post", "head", "options"]
+
+    def perform_create(self, serializer):
+        client_id = getattr(self.request, "client_id", None) or getattr(self.request.user, "client_id", None)
+        serializer.save(client_id=client_id, requested_by=self.request.user, status="Pending")
+
+    def _decide(self, request, decision):
+        req = self.get_object()  # tenant-scoped: another tenant's id is a 404
+        comments = request.data.get("comments", "")
+        req = decide_approval_request(
+            req.id, request.user, decision, comments=comments, client_id=req.client_id
+        )
+        return Response(ApprovalRequestSerializer(req).data)
+
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
-        comments = request.data.get("comments", "")
-        req = decide_approval_request(pk, request.user, "Approved", comments=comments)
-        return Response(ApprovalRequestSerializer(req).data)
+        return self._decide(request, "Approved")
 
     @action(detail=True, methods=["post"])
     def reject(self, request, pk=None):
-        comments = request.data.get("comments", "")
-        req = decide_approval_request(pk, request.user, "Rejected", comments=comments)
-        return Response(ApprovalRequestSerializer(req).data)
+        return self._decide(request, "Rejected")
 
     @action(detail=True, methods=["post"], url_path="return-for-correction")
     def return_correction(self, request, pk=None):
-        comments = request.data.get("comments", "")
-        req = decide_approval_request(pk, request.user, "Returned", comments=comments)
-        return Response(ApprovalRequestSerializer(req).data)
+        return self._decide(request, "Returned")
 
     @action(detail=False, methods=["get"])
     def badge(self, request):

@@ -140,7 +140,7 @@ def reconcile_party_balances(command):
     for party in Party.objects.filter(deleted_at__isnull=True).iterator(chunk_size=500):
         rows = JournalLine.objects.filter(
             client_id=party.client_id, party_id=party.id, deleted_at__isnull=True
-        ).exclude(journal_entry__status="Reversed").aggregate(
+        ).exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False).aggregate(
             debit=Coalesce(Sum("debit"), Value(Decimal("0.00")), output_field=MONEY),
             credit=Coalesce(Sum("credit"), Value(Decimal("0.00")), output_field=MONEY),
         )

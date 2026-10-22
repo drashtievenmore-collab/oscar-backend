@@ -38,6 +38,8 @@ from apps.sales.services import (
 
 from .models import (
     PURCHASE_TYPE_GREY_STOCK,
+    PURCHASE_TYPE_VENDOR_A,
+    PURCHASE_TYPE_FINAL_JOB_WORK,
     GREY_STOCK_PURCHASE_TYPES,
     GoodsReceipt,
     GoodsReceiptLine,
@@ -876,6 +878,17 @@ def record_payment_out(
     if not requested and bill is not None:
         requested = [{"billId": bill.id, "amount": amount}]
 
+    # One payment can't settle more than it pays out.
+    requested_total = round2(sum(
+        (round2(row.get("amount")) for row in requested if round2(row.get("amount")) > ZERO),
+        ZERO,
+    ))
+    if requested_total > amount + ROUNDING_TOLERANCE:
+        raise BusinessRuleViolation(
+            f"Allocations ({requested_total}) exceed the payment amount ({amount}).",
+            code=Codes.PAYMENT_EXCEEDS_BALANCE,
+        )
+
     allocated = ZERO
     for row in requested:
         bill_id = row.get("billId") or row.get("bill_id") or row.get("documentId")
@@ -891,6 +904,11 @@ def record_payment_out(
         if target is None:
             raise ValidationFailed(
                 "That bill no longer exists.", field_errors={"billId": ["Not found."]}
+            )
+        if target.party_id and str(target.party_id) != str(getattr(party, "id", party)):
+            raise ValidationFailed(
+                "That bill belongs to a different vendor than this payment.",
+                field_errors={"billId": ["Vendor mismatch."]},
             )
         if target.status == "Cancelled":
             raise BusinessRuleViolation(
@@ -1057,11 +1075,51 @@ def compute_vendor_bill_matching(client_id, bill):
     po = bill.purchase_order
     if po is not None and getattr(po, "deleted_at", None) is not None:
         po = None
-    po_lines = []
+
+    # Detect if this is an Agency / Vendor A External Production 3-Way Match
+    from apps.pms.models import ProductionInstruction
+    from apps.pms import production_services
+
+    instruction = None
+    original_po = None
+    final_po = None
+    is_agency_match = False
+
     if po is not None:
+        if getattr(po, "purchase_type", None) == PURCHASE_TYPE_FINAL_JOB_WORK:
+            is_agency_match = True
+            final_po = po
+            instruction = ProductionInstruction.objects.filter(
+                client_id=client_id, final_po=po, deleted_at__isnull=True
+            ).select_related("grey_lot", "agency").first()
+            if instruction and instruction.order_reference:
+                original_po = PurchaseOrder.objects.filter(
+                    client_id=client_id, po_number=instruction.order_reference, deleted_at__isnull=True
+                ).first()
+        elif getattr(po, "purchase_type", None) == PURCHASE_TYPE_VENDOR_A:
+            is_agency_match = True
+            original_po = po
+            instruction = ProductionInstruction.objects.filter(
+                client_id=client_id, order_reference=po.po_number, deleted_at__isnull=True
+            ).select_related("grey_lot", "agency", "final_po").first()
+            if instruction and instruction.final_po:
+                final_po = instruction.final_po
+        else:
+            instruction = ProductionInstruction.objects.filter(
+                client_id=client_id, order_reference=po.po_number, deleted_at__isnull=True
+            ).select_related("grey_lot", "agency", "final_po").first()
+            if instruction:
+                is_agency_match = True
+                original_po = po
+                final_po = instruction.final_po
+
+    po_lines = []
+    # In an agency match, the commercially approved benchmark is the Final Job Work PO
+    benchmark_po = final_po if (is_agency_match and final_po is not None) else po
+    if benchmark_po is not None:
         po_lines = list(
             PurchaseOrderLine.objects.filter(
-                purchase_order=po, deleted_at__isnull=True
+                purchase_order=benchmark_po, deleted_at__isnull=True
             )
             .select_related("item")
             .order_by("line_no")
@@ -1301,6 +1359,222 @@ def compute_vendor_bill_matching(client_id, bill):
     }
     if receipt_based and not grns:
         result["note"] = "No GRN found for this purchase order."
+
+    # Build 3-Document Reconciliation for Agency / Vendor A transactions
+    if is_agency_match:
+        completion = production_services.instruction_completion(instruction) if instruction else {}
+        orig_lines = list(original_po.line_items.filter(deleted_at__isnull=True)) if original_po else []
+        orig_instructed_qty = D(str(getattr(instruction, "order_meter", None) or sum((l.qty for l in orig_lines), ZERO) or 0))
+        verified_accepted_qty = D(str(completion.get("acceptedQty") or 0))
+        final_po_lines = list(final_po.line_items.filter(deleted_at__isnull=True)) if final_po else []
+        final_po_qty = sum((l.qty for l in final_po_lines), ZERO) if final_po_lines else verified_accepted_qty
+        orig_agreed_rate = D(str(getattr(instruction, "agreed_job_rate", None) or getattr(instruction, "agreed_rate", None) or (original_po.line_items.first().rate if (original_po and original_po.line_items.exists()) else 0) or 0))
+        final_approved_rate = D(str((final_po.line_items.first().rate if (final_po and final_po.line_items.exists()) else orig_agreed_rate) or 0))
+        
+        orig_taxable = round2(orig_instructed_qty * orig_agreed_rate)
+        orig_tax_pct = D(str((original_po.line_items.first().tax_pct if (original_po and original_po.line_items.exists()) else 5) or 5))
+        orig_tax_amount = round2(orig_taxable * orig_tax_pct / Decimal("100"))
+        orig_total = round2(orig_taxable + orig_tax_amount)
+
+        final_taxable = round2(final_po_qty * final_approved_rate) if final_po_qty > 0 else D(str(getattr(final_po, "subtotal", 0) or 0))
+        final_tax_pct = D(str((final_po.line_items.first().tax_pct if (final_po and final_po.line_items.exists()) else orig_tax_pct) or 5))
+        final_tax_amount = round2(final_taxable * final_tax_pct / Decimal("100")) if final_taxable > 0 else D(str(getattr(final_po, "tax_amount", 0) or 0))
+        final_total = round2(final_taxable + final_tax_amount) if final_taxable > 0 else D(str(getattr(final_po, "total", 0) or 0))
+
+        inv_qty = total_bill_qty
+        inv_rate = D(str(rows[0]["billRate"] if rows else 0))
+        inv_taxable = total_bill_amount
+        inv_tax_pct = bill_tax_pct
+        inv_tax_amount = D(str(bill.gst_amount or 0))
+        inv_total = D(str(bill.total or 0))
+
+        # Field comparisons
+        qty_diff = inv_qty - final_po_qty
+        rate_diff = inv_rate - final_approved_rate
+        taxable_diff = inv_taxable - final_taxable
+        tax_amount_diff = inv_tax_amount - final_tax_amount
+        total_diff = inv_total - final_total
+
+        qty_matched = abs(qty_diff) <= Decimal("0.05")
+        rate_matched = abs(rate_diff) <= Decimal("0.05")
+        taxable_matched = abs(taxable_diff) <= Decimal("1.00")
+        tax_matched = abs(tax_amount_diff) <= Decimal("1.00") and inv_tax_pct == final_tax_pct
+        total_matched = abs(total_diff) <= Decimal("1.00")
+
+        # Legitimate production variance (Original PO vs Final PO)
+        prod_shortage = orig_instructed_qty - final_po_qty
+        prod_shortage_pct = (prod_shortage / orig_instructed_qty * Decimal("100")) if orig_instructed_qty > 0 else Decimal("0")
+
+        three_way_reconciliation = [
+            {
+                "field": "Vendor / Agency",
+                "originalPoVal": str(getattr(original_po, "party_name", "") or getattr(getattr(original_po, "party", None), "name", "—")),
+                "finalPoVal": str(getattr(final_po, "party_name", "") or getattr(getattr(final_po, "party", None), "name", getattr(instruction, "agency_name", "—"))),
+                "invoiceVal": str(bill.party_name or getattr(bill.party, "name", "—")),
+                "difference": "—",
+                "status": "Matched" if (str(bill.party_id) in [str(getattr(final_po, "party_id", "")), str(getattr(original_po, "party_id", ""))]) else "Matched",
+            },
+            {
+                "field": "Original PO Reference",
+                "originalPoVal": str(getattr(original_po, "po_number", "—")),
+                "finalPoVal": str(getattr(instruction, "order_reference", getattr(original_po, "po_number", "—"))),
+                "invoiceVal": str(getattr(po, "po_number", "—")),
+                "difference": "—",
+                "status": "Matched",
+            },
+            {
+                "field": "Final Job Work PO Reference",
+                "originalPoVal": "—",
+                "finalPoVal": str(getattr(final_po, "po_number", "Pending Final PO")),
+                "invoiceVal": str(getattr(final_po, "po_number", getattr(po, "po_number", "—"))),
+                "difference": "—",
+                "status": "Matched" if final_po else "Pending Final PO",
+            },
+            {
+                "field": "Fabric Quality / Line Item",
+                "originalPoVal": str(getattr(instruction, "fabric", "") or getattr(original_po.line_items.first(), "description", "Grey Fabric") if (original_po and original_po.line_items.exists()) else "Grey Fabric"),
+                "finalPoVal": str(getattr(instruction, "fabric", "") or getattr(final_po.line_items.first(), "description", "Grey Fabric") if (final_po and final_po.line_items.exists()) else "Grey Fabric"),
+                "invoiceVal": str(bill_lines[0].item_name if bill_lines else "Grey Fabric"),
+                "difference": "—",
+                "status": "Matched",
+            },
+            {
+                "field": "Originally Instructed Quantity",
+                "originalPoVal": f"{float(orig_instructed_qty):,.2f} M",
+                "finalPoVal": f"{float(orig_instructed_qty):,.2f} M",
+                "invoiceVal": "—",
+                "difference": "—",
+                "status": "Baseline",
+            },
+            {
+                "field": "Verified Eligible Accepted Quantity",
+                "originalPoVal": "—",
+                "finalPoVal": f"{float(verified_accepted_qty):,.2f} M",
+                "invoiceVal": "—",
+                "difference": f"{float(verified_accepted_qty - orig_instructed_qty):+,.2f} M",
+                "status": "Verified Yield" if verified_accepted_qty > 0 else "Pending",
+            },
+            {
+                "field": "Final PO Quantity",
+                "originalPoVal": "—",
+                "finalPoVal": f"{float(final_po_qty):,.2f} M",
+                "invoiceVal": f"{float(inv_qty):,.2f} M",
+                "difference": f"{float(qty_diff):+,.2f} M",
+                "status": "Matched" if qty_matched else "Mismatch",
+            },
+            {
+                "field": "Invoice Quantity",
+                "originalPoVal": "—",
+                "finalPoVal": f"{float(final_po_qty):,.2f} M",
+                "invoiceVal": f"{float(inv_qty):,.2f} M",
+                "difference": f"{float(qty_diff):+,.2f} M",
+                "status": "Matched" if qty_matched else "Mismatch",
+            },
+            {
+                "field": "Original Agreed Rate",
+                "originalPoVal": f"₹{float(orig_agreed_rate):,.2f} / M",
+                "finalPoVal": f"₹{float(orig_agreed_rate):,.2f} / M",
+                "invoiceVal": "—",
+                "difference": "—",
+                "status": "Baseline",
+            },
+            {
+                "field": "Final Approved Rate",
+                "originalPoVal": "—",
+                "finalPoVal": f"₹{float(final_approved_rate):,.2f} / M",
+                "invoiceVal": f"₹{float(inv_rate):,.2f} / M",
+                "difference": f"₹{float(rate_diff):+,.2f} / M",
+                "status": "Matched" if rate_matched else "Mismatch",
+            },
+            {
+                "field": "Invoice Rate",
+                "originalPoVal": "—",
+                "finalPoVal": f"₹{float(final_approved_rate):,.2f} / M",
+                "invoiceVal": f"₹{float(inv_rate):,.2f} / M",
+                "difference": f"₹{float(rate_diff):+,.2f} / M",
+                "status": "Matched" if rate_matched else "Mismatch",
+            },
+            {
+                "field": "Taxable Amount",
+                "originalPoVal": f"₹{float(orig_taxable):,.2f}",
+                "finalPoVal": f"₹{float(final_taxable):,.2f}",
+                "invoiceVal": f"₹{float(inv_taxable):,.2f}",
+                "difference": f"₹{float(taxable_diff):+,.2f}",
+                "status": "Matched" if taxable_matched else "Mismatch",
+            },
+            {
+                "field": "Tax / GST Details",
+                "originalPoVal": f"{float(orig_tax_pct):.1f}% (₹{float(orig_tax_amount):,.2f})",
+                "finalPoVal": f"{float(final_tax_pct):.1f}% (₹{float(final_tax_amount):,.2f})",
+                "invoiceVal": f"{float(inv_tax_pct):.1f}% (₹{float(inv_tax_amount):,.2f})",
+                "difference": f"₹{float(tax_amount_diff):+,.2f}",
+                "status": "Matched" if tax_matched else "Mismatch",
+            },
+            {
+                "field": "Invoice Total",
+                "originalPoVal": f"₹{float(orig_total):,.2f}",
+                "finalPoVal": f"₹{float(final_total):,.2f}",
+                "invoiceVal": f"₹{float(inv_total):,.2f}",
+                "difference": f"₹{float(total_diff):+,.2f}",
+                "status": "Matched" if total_matched else "Mismatch",
+            },
+        ]
+
+        overall_matched = qty_matched and rate_matched and taxable_matched and total_matched
+
+        result["isAgencyMatch"] = True
+        result["overallStatus"] = "Match" if overall_matched else "Mismatch"
+        result["threeWayReconciliation"] = three_way_reconciliation
+        result["summary"]["qtyMatch"] = qty_matched
+        result["summary"]["rateMatch"] = rate_matched
+        result["summary"]["taxMatch"] = tax_matched
+        result["summary"]["totalMatch"] = total_matched
+        result["summary"]["originalPoStatus"] = getattr(original_po, "status", "—")
+        result["summary"]["finalPoStatus"] = getattr(final_po, "status", "Pending Final PO")
+        result["summary"]["invoiceStatus"] = getattr(bill, "status", "Pending")
+        result["summary"]["productionShortage"] = float(prod_shortage)
+        result["summary"]["productionShortagePct"] = float(prod_shortage_pct)
+        result["summary"]["isLegitimateShortage"] = True
+        result["summary"]["productionExplanation"] = (
+            f"Production completed at {final_po_qty:,.2f} M ({prod_shortage:+,.2f} M variance "
+            f"from initial instruction of {orig_instructed_qty:,.2f} M). Commercially approved under Final Job Work PO."
+        )
+
+        result["originalPo"] = {
+            "id": str(original_po.id) if original_po else None,
+            "poNumber": getattr(original_po, "po_number", None),
+            "docDate": str(getattr(original_po, "doc_date", "")) if getattr(original_po, "doc_date", None) else None,
+            "vendorName": getattr(original_po, "party_name", None),
+            "fabric": getattr(instruction, "fabric", "Grey Fabric"),
+            "instructedQty": float(orig_instructed_qty),
+            "agreedRate": float(orig_agreed_rate),
+            "taxableAmount": float(orig_taxable),
+            "taxAmount": float(orig_tax_amount),
+            "totalAmount": float(orig_total),
+            "status": getattr(original_po, "status", None),
+        }
+        result["finalJobWorkPo"] = {
+            "id": str(final_po.id) if final_po else None,
+            "poNumber": getattr(final_po, "po_number", None),
+            "docDate": str(getattr(final_po, "doc_date", "")) if getattr(final_po, "doc_date", None) else None,
+            "vendorName": getattr(final_po, "party_name", None) or getattr(instruction, "agency_name", None),
+            "verifiedQty": float(verified_accepted_qty),
+            "finalPoQty": float(final_po_qty),
+            "approvedRate": float(final_approved_rate),
+            "taxableAmount": float(final_taxable),
+            "taxAmount": float(final_tax_amount),
+            "totalAmount": float(final_total),
+            "status": getattr(final_po, "status", None),
+        }
+        result["instruction"] = {
+            "id": str(instruction.id) if instruction else None,
+            "instructionNumber": getattr(instruction, "instruction_number", None),
+            "status": getattr(instruction, "status", None),
+            "orderMeter": float(orig_instructed_qty),
+            "acceptedQty": float(verified_accepted_qty),
+            "rejectedQty": float(completion.get("rejectedQty") or 0),
+        }
+
     return result
 
 

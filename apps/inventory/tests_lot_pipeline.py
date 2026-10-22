@@ -25,6 +25,14 @@ from rest_framework.test import APIRequestFactory, force_authenticate
 User = get_user_model()
 
 def run_tests():
+    # This script is NOT a Django TestCase: it writes POs, GRNs, takas and a
+    # superuser into whatever database DB_NAME points at -- normally the real
+    # one. Refuse unless explicitly pointed at a throwaway database.
+    if os.environ.get("OSCAR_ALLOW_LIVE_DB_SCRIPT") != "1":
+        raise SystemExit(
+            "Refusing to run: this script writes to the configured (live) database. "
+            "Point DB_NAME at a scratch database and set OSCAR_ALLOW_LIVE_DB_SCRIPT=1."
+        )
     print("=" * 70)
     print("RUNNING OSCAR ERP — LOT/TAKA PIPELINE & REGISTER INTEGRATION TESTS")
     print("=" * 70)

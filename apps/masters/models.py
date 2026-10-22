@@ -527,6 +527,15 @@ class FabricVariant(TextileMaster):
     )
     hsn_code = models.TextField(null=True, blank=True)
     fabric_type = models.TextField(null=True, blank=True)
+    fabric_type_ref = models.ForeignKey(
+        "masters.FabricType", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_variants"
+    )
+    category = models.ForeignKey(
+        "masters.ItemCategory", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_variants"
+    )
+    item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="fabric_variants"
+    )
     construction = models.TextField(null=True, blank=True)
     image_url = models.TextField(null=True, blank=True)
     #: Standard selling rate per UOM.

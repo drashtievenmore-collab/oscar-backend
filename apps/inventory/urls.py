@@ -75,6 +75,7 @@ urlpatterns = [
     path("qc/disposition/", views.QCDispositionView.as_view(), name="inventory-qc-disposition"),
     path("qc/reinspection/", views.QCReinspectionView.as_view(), name="inventory-qc-reinspection"),
     path("qc/reports/", views.QCReportsView.as_view(), name="inventory-qc-reports"),
+    path("valuation/", views.ValuationView.as_view(), name="inventory-valuation"),
     path("stock/summary/", views.StockSummaryView.as_view(), name="inventory-stock-summary"),
     path("stock/", views.StockPositionView.as_view(), name="inventory-stock"),
     path("combined-grey-stock/", views.CombinedGreyStockView.as_view(), name="inventory-combined-grey-stock"),

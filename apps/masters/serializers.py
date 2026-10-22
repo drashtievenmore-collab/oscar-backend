@@ -815,6 +815,15 @@ class FabricVariantSerializer(TextileMasterSerializer):
     uomId = TenantPrimaryKeyRelatedField(
         source="uom", queryset=Unit.objects.all(), required=False, allow_null=True
     )
+    categoryId = TenantPrimaryKeyRelatedField(
+        source="category", queryset=ItemCategory.objects.all(), required=False, allow_null=True
+    )
+    fabricTypeId = TenantPrimaryKeyRelatedField(
+        source="fabric_type_ref", queryset=FabricType.objects.all(), required=False, allow_null=True
+    )
+    itemId = TenantPrimaryKeyRelatedField(
+        source="item", queryset=Item.objects.all(), required=False, allow_null=True
+    )
 
     def validate_uomId(self, unit):
         """New choices must be active; a record keeps an already-linked unit
@@ -823,6 +832,19 @@ class FabricVariantSerializer(TextileMasterSerializer):
         if unit is not None and not unit.is_active and unit != current:
             raise serializers.ValidationError(f"Unit {unit.code} is inactive.")
         return unit
+
+    def validate_categoryId(self, cat):
+        current = getattr(self.instance, "category", None)
+        if cat is not None and not cat.is_active and cat != current:
+            raise serializers.ValidationError(f"Category '{cat.name}' is inactive.")
+        return cat
+
+    def validate_fabricTypeId(self, ft):
+        current = getattr(self.instance, "fabric_type_ref", None)
+        if ft is not None and not ft.is_active and ft != current:
+            raise serializers.ValidationError(f"Fabric Type '{ft.name}' is inactive.")
+        return ft
+
     imageFileId = TenantPrimaryKeyRelatedField(
         source="image_file", model="core.File", required=False, allow_null=True
     )
@@ -839,6 +861,11 @@ class FabricVariantSerializer(TextileMasterSerializer):
     shadeName = serializers.CharField(source="shade.name", read_only=True, default=None)
     shadeCode = serializers.CharField(source="shade.code", read_only=True, default=None)
     shadeHex = serializers.CharField(source="shade.hex_color", read_only=True, default=None)
+    categoryName = serializers.CharField(source="category.name", read_only=True, default=None)
+    categoryCode = serializers.CharField(source="category.code", read_only=True, default=None)
+    fabricTypeName = serializers.CharField(source="fabric_type_ref.name", read_only=True, default=None)
+    fabricTypeCode = serializers.CharField(source="fabric_type_ref.code", read_only=True, default=None)
+    itemSku = serializers.CharField(source="item.sku", read_only=True, default=None)
     uom = serializers.SerializerMethodField()
     width = serializers.DecimalField(source="quality.width", max_digits=7, decimal_places=2, read_only=True)
     gsm = serializers.DecimalField(source="quality.gsm", max_digits=7, decimal_places=2, read_only=True)
@@ -849,19 +876,24 @@ class FabricVariantSerializer(TextileMasterSerializer):
             "qualityId", "qualityName", "qualityCode",
             "designId", "designName", "designCode",
             "shadeId", "shadeName", "shadeCode", "shadeHex",
+            "categoryId", "categoryName", "categoryCode",
+            "fabricTypeId", "fabricTypeName", "fabricTypeCode",
+            "itemId", "itemSku",
             "uomId", "uom", "width", "gsm", "hsnCode", "rate",
             "fabricType", "construction",
             "imageFileId", "imageUrl",
         ]
 
     def get_uom(self, variant):
-        unit = variant.uom or variant.quality.uom
+        unit = variant.uom or (variant.quality.uom if variant.quality else None)
         return unit.code if unit else None
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
         if not ret.get("imageUrl") and instance.image_file:
             ret["imageUrl"] = public_url(instance.image_file)
+        if not ret.get("fabricTypeName") and instance.fabric_type:
+            ret["fabricTypeName"] = instance.fabric_type
         return ret
 
     def validate_name(self, value):
@@ -910,22 +942,31 @@ class FabricVariantSerializer(TextileMasterSerializer):
         if not attrs.get("uom") and is_create and quality and getattr(quality, "uom", None):
             attrs["uom"] = quality.uom
 
-        # -- Auto-populate fabricType and construction from quality ----------
-        if not attrs.get("fabric_type") and quality:
-            ft = getattr(quality, "fabric_type", None)
-            if ft:
-                attrs["fabric_type"] = ft.name if hasattr(ft, "name") else str(ft)
-        if not attrs.get("construction") and quality:
-            # FabricQuality stores weave info in warp/weft counts; use a
-            # sensible default when the frontend omits the field.
-            pass
+        # -- Auto-populate fabricType and fabric_type_ref from quality ----------
+        if not attrs.get("fabric_type_ref") and quality and getattr(quality, "fabric_type", None):
+            attrs["fabric_type_ref"] = quality.fabric_type
+        if not attrs.get("fabric_type"):
+            ft_ref = attrs.get("fabric_type_ref") or getattr(quality, "fabric_type", None)
+            if ft_ref:
+                attrs["fabric_type"] = ft_ref.name if hasattr(ft_ref, "name") else str(ft_ref)
+
+        # -- Auto-populate category if omitted ----------
+        if not attrs.get("category") and is_create:
+            client_id = self.context.get("client_id")
+            default_cat = ItemCategory.objects.filter(
+                client_id=client_id, code="CAT-FABRIC", deleted_at__isnull=True
+            ).first() or ItemCategory.objects.filter(
+                client_id=client_id, is_active=True, deleted_at__isnull=True
+            ).first()
+            if default_cat:
+                attrs["category"] = default_cat
 
         if self._live_peers().filter(quality=quality, design=design, shade=shade).exists():
             raise serializers.ValidationError(
                 {"qualityId": "A fabric item for this quality, design and shade already exists."}
             )
         if not attrs.get("name") and self.instance is None:
-            name = " – ".join(p.name for p in parts)
+            name = " — ".join(p.name for p in parts)
             if self._live_peers().filter(name__iexact=name).exists():
                 raise serializers.ValidationError({"name": f"This {self.entity_label} already exists."})
             attrs["name"] = name
@@ -940,7 +981,87 @@ class FabricVariantSerializer(TextileMasterSerializer):
             attrs["code"] = code
         return super().validate(attrs)
 
+    def _sync_to_item(self, variant):
+        from decimal import Decimal
+        client = variant.client
+        item = variant.item
+        if not item:
+            item = Item.objects.filter(
+                client=client, sku=variant.code, deleted_at__isnull=True
+            ).first()
 
+        cat = variant.category
+        if not cat:
+            cat = ItemCategory.objects.filter(
+                client=client, code="CAT-FABRIC", deleted_at__isnull=True
+            ).first() or ItemCategory.objects.filter(
+                client=client, is_active=True, deleted_at__isnull=True
+            ).first()
+
+        unit_str = variant.uom.code if variant.uom else (variant.quality.uom.code if variant.quality and variant.quality.uom else "Mtr")
+        quality_name = variant.quality.name if variant.quality else ""
+        design_name = variant.design.name if variant.design else ""
+        shade_name = variant.shade.name if variant.shade else ""
+        width_val = variant.quality.width if variant.quality else None
+        gsm_val = variant.quality.gsm if variant.quality else None
+        rate_val = variant.rate or Decimal("0")
+
+        if not item:
+            item = Item.objects.create(
+                client=client,
+                sku=variant.code,
+                name=variant.name,
+                category=cat,
+                item_kind="Fabric",
+                uom=unit_str,
+                fabric_quality=quality_name,
+                fabric_design=design_name,
+                fabric_color=shade_name,
+                fabric_width=width_val,
+                fabric_gsm=gsm_val,
+                cost_price=rate_val,
+                selling_price=rate_val,
+                lifecycle_status="Active" if variant.is_active else "Inactive",
+            )
+        else:
+            item.name = variant.name
+            item.sku = variant.code
+            item.item_kind = "Fabric"
+            if cat:
+                item.category = cat
+            item.uom = unit_str
+            item.fabric_quality = quality_name
+            item.fabric_design = design_name
+            item.fabric_color = shade_name
+            item.fabric_width = width_val
+            item.fabric_gsm = gsm_val
+            if variant.rate is not None:
+                item.cost_price = rate_val
+                item.selling_price = rate_val
+            item.lifecycle_status = "Active" if variant.is_active else "Inactive"
+            item.save()
+
+        if variant.item_id != item.id:
+            FabricVariant.objects.filter(pk=variant.pk).update(item=item)
+            variant.item = item
+        return item
+
+    def create(self, validated_data):
+        if "client_id" not in validated_data and "client" not in validated_data:
+            client = self.context.get("client")
+            client_id = getattr(client, "id", None) or self.context.get("client_id")
+            if client_id:
+                validated_data["client_id"] = client_id
+        variant = super().create(validated_data)
+        self._sync_to_item(variant)
+        return variant
+
+    def update(self, instance, validated_data):
+        variant = super().update(instance, validated_data)
+        self._sync_to_item(variant)
+        return variant
+
+
 # ---------------------------------------------------------------------------
 # Items (api.md §4.2)
 # ---------------------------------------------------------------------------

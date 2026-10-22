@@ -4,7 +4,6 @@ Company profile, backup / restore and demo-data reset (api.md §3.4).
 These replace ``exportDatabaseSnapshot()``, ``importDatabaseSnapshot()`` and
 ``resetDemoData()``, which today serialise the whole of ``localStorage``.
 """
-from django.conf import settings as django_settings
 from django.db import transaction
 from rest_framework import serializers, status
 from rest_framework.response import Response
@@ -131,7 +130,9 @@ class ResetDemoDataView(APIView):
 
     def post(self, request):
         client = request.user.client
-        if not client.is_demo and not django_settings.DEBUG:
+        # Never on a real workspace -- not even with DEBUG on, which is how
+        # local/dev servers run against real data.
+        if not client.is_demo:
             raise PermissionDenied(
                 "Demo data can only be reset on a demo workspace.",
                 code="NOT_A_DEMO_TENANT",
