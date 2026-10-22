@@ -405,121 +405,32 @@ class UserViewSet(TenantModelViewSet):
         "permissions": ["manage_roles"],
     }
 
+    def get_queryset(self):
+        try:
+            from apps.hrms.services import sync_all_users_and_employees
+            sync_all_users_and_employees(self.get_client_id())
+        except Exception:
+            pass
+        return super().get_queryset()
+
     @staticmethod
-    def _sync_employee_if_role_employee(user):
-        """Connect user in Administrator with HRMS Employee if role is Employee in any department."""
+    def _sync_employee_for_user(user, raw_data=None):
+        """Connect user in Administrator with HRMS Employee."""
         if not user:
-            return
-        is_employee_role = False
-        role = user.role
-        if not role and user.role_id:
-            from apps.accounts.models import Role
-            role = Role.objects.filter(pk=user.role_id).first()
-
-        if role:
-            r_name = str(role.name or "").strip().lower()
-            r_code = str(role.code or "").strip().upper()
-            if r_name == "employee" or r_code in ("EM", "EMPLOYEE") or "employee" in r_name:
-                is_employee_role = True
-
-        if not is_employee_role:
-            return
-
-        from apps.hrms.models import Employee, Department, Designation, Location
-        from apps.core.numbering import allocate_number
-
-        client = user.client
-        client_id = user.client_id
-
-        # Resolve Department (in any department specified)
-        dept = None
-        if user.department and user.department.strip():
-            dept = Department.objects.filter(
-                client_id=client_id, name__iexact=user.department.strip(), deleted_at__isnull=True
-            ).first()
-            if not dept:
-                dept = Department.objects.create(client_id=client_id, name=user.department.strip())
-
-        # Resolve Designation
-        desig = Designation.objects.filter(
-            client_id=client_id, name__iexact="Employee", deleted_at__isnull=True
-        ).first()
-        if not desig:
-            desig = Designation.objects.create(client_id=client_id, name="Employee")
-
-        # Resolve Location
-        loc = None
-        if user.location and user.location.strip():
-            loc = Location.objects.filter(
-                client_id=client_id, name__iexact=user.location.strip(), deleted_at__isnull=True
-            ).first()
-            if not loc:
-                loc = Location.objects.create(client_id=client_id, name=user.location.strip())
-
-        # If user already has an employee record, update its fields
-        if user.employee_id:
-            emp = user.employee
-            if emp and not emp.deleted_at:
-                updates = []
-                if user.name and emp.name != user.name:
-                    emp.name = user.name
-                    updates.append("name")
-                if user.phone and emp.phone != user.phone:
-                    emp.phone = user.phone
-                    updates.append("phone")
-                if dept and emp.department_id != dept.id:
-                    emp.department = dept
-                    updates.append("department")
-                if loc and emp.location_id != loc.id:
-                    emp.location = loc
-                    updates.append("location")
-                if updates:
-                    emp.save(update_fields=updates)
-                return
-
-        # Check if an employee with matching email exists
-        emp = Employee.objects.filter(
-            client_id=client_id, email__iexact=user.email, deleted_at__isnull=True
-        ).first()
-
-        if not emp:
-            try:
-                code = allocate_number(client, "EMP")
-            except Exception:
-                code = f"EMP-{(Employee.objects.filter(client_id=client_id).count() + 1):03d}"
-
-            emp = Employee.objects.create(
-                client_id=client_id,
-                employee_code=code,
-                name=user.name or user.email,
-                email=user.email,
-                phone=user.phone or "",
-                avatar_url=user.avatar_url or "",
-                department=dept,
-                designation=desig,
-                location=loc,
-                joining_date=user.joined_date or timezone.localdate(),
-                status="Active" if user.status in ("Active", "Invited") else "Inactive",
-            )
-        else:
-            updates = []
-            if dept and emp.department_id != dept.id:
-                emp.department = dept
-                updates.append("department")
-            if updates:
-                emp.save(update_fields=updates)
-
-        user.employee = emp
-        user.save(update_fields=["employee"])
+            return None
+        from apps.hrms.services import sync_employee_from_user
+        return sync_employee_from_user(user, raw_data)
 
     def perform_create(self, serializer):
-        user = super().perform_create(serializer)
-        self._sync_employee_if_role_employee(user)
+        super().perform_create(serializer)
+        user = serializer.instance
+        self._sync_employee_for_user(user, getattr(serializer, "initial_data", None))
         return user
 
     def perform_update(self, serializer):
-        user = super().perform_update(serializer)
-        self._sync_employee_if_role_employee(user)
+        super().perform_update(serializer)
+        user = serializer.instance
+        self._sync_employee_for_user(user, getattr(serializer, "initial_data", None))
         return user
 
     def get_aggregates(self, queryset):
@@ -540,6 +451,15 @@ class UserViewSet(TenantModelViewSet):
         UserSession.objects.filter(user=instance, revoked_at__isnull=True).update(
             revoked_at=timezone.now(), revoked_reason="user_deleted"
         )
+        if instance.employee_id:
+            try:
+                emp = instance.employee
+                if emp and not emp.deleted_at:
+                    emp.status = "Terminated"
+                    emp.last_working_day = timezone.localdate()
+                    emp.save(update_fields=["status", "last_working_day", "updated_at"])
+            except Exception:
+                pass
         super().perform_destroy(instance)
 
     @action(detail=False, methods=["get"], url_path="stats")
@@ -552,6 +472,14 @@ class UserViewSet(TenantModelViewSet):
         user.status = "Active"
         user.is_active = True
         user.save(update_fields=["status", "is_active"])
+        if user.employee_id:
+            try:
+                emp = user.employee
+                if emp and emp.status != "Active":
+                    emp.status = "Active"
+                    emp.save(update_fields=["status", "updated_at"])
+            except Exception:
+                pass
         self.write_audit("activate", user, description="Account activated")
         return Response(self.get_serializer(user).data)
 
@@ -570,6 +498,14 @@ class UserViewSet(TenantModelViewSet):
             UserSession.objects.filter(user=user, revoked_at__isnull=True).update(
                 revoked_at=timezone.now(), revoked_reason="user_deactivated"
             )
+            if user.employee_id:
+                try:
+                    emp = user.employee
+                    if emp and emp.status == "Active":
+                        emp.status = "Inactive"
+                        emp.save(update_fields=["status", "updated_at"])
+                except Exception:
+                    pass
             self.write_audit("deactivate", user, description="Account deactivated")
         return Response(self.get_serializer(user).data)
 

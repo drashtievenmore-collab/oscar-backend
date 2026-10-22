@@ -176,7 +176,9 @@ class EmployeeSerializer(BaseModelSerializer):
 # Attendance (api.md §11.2)
 # ---------------------------------------------------------------------------
 class AttendanceSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
     employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
     department = serializers.CharField(source="employee.department.name", read_only=True)
@@ -234,7 +236,9 @@ class BulkAttendanceSerializer(BaseSerializer):
 
 
 class RegularizationSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
     date = serializers.DateField(source="work_date")
     requestedCheckIn = serializers.DateTimeField(
@@ -270,7 +274,9 @@ class LeaveTypeSerializer(BaseModelSerializer):
 
 
 class LeaveRequestSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
     employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
     type = serializers.CharField(source="leave_type.name", read_only=True)
@@ -327,7 +333,9 @@ class LeaveBalanceSerializer(BaseModelSerializer):
 
 
 class CompOffSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
     workedDate = serializers.DateField(source="worked_date")
     workType = serializers.CharField(source="work_type", required=False, allow_null=True)
     expiryDate = serializers.DateField(source="expiry_date", required=False, allow_null=True)
@@ -341,7 +349,9 @@ class CompOffSerializer(BaseModelSerializer):
 
 
 class LeaveEncashmentSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
     leaveTypeId = TenantPrimaryKeyRelatedField(source="leave_type", model="hrms.LeaveType")
     perDayRate = MoneyField(source="per_day_rate")
     # GeneratedField (days * per_day_rate) -- see LeaveBalanceSerializer.balance.
@@ -440,7 +450,9 @@ class ProcessPayrollSerializer(BaseSerializer):
 
 
 class SalaryAdvanceSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
     issuedOn = serializers.DateField(source="issued_on")
     recoveredAmount = MoneyField(source="recovered_amount", read_only=True)
@@ -632,7 +644,9 @@ class AppraisalHistorySerializer(BaseModelSerializer):
 
 
 class AppraisalSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
     managerId = TenantPrimaryKeyRelatedField(
         source="manager", model="hrms.Employee", required=False, allow_null=True
@@ -654,7 +668,9 @@ class AppraisalSerializer(BaseModelSerializer):
 
 
 class GoalSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
 
     class Meta:
         model = Goal
@@ -677,7 +693,9 @@ class TrainerSerializer(BaseModelSerializer):
 
 
 class TrainingParticipantSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
 
     class Meta:
@@ -764,7 +782,9 @@ class AssetSerializer(BaseModelSerializer):
 
 
 class AssetRequestSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
     categoryId = TenantPrimaryKeyRelatedField(
         source="category", model="hrms.AssetCategory", required=False, allow_null=True
@@ -952,7 +972,9 @@ class ApprovalChainSerializer(BaseModelSerializer):
 
 
 class TerminationSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
     lastWorkingDay = serializers.DateField(
         source="last_working_day", required=False, allow_null=True
@@ -973,7 +995,9 @@ class ResignationChecklistItemSerializer(BaseModelSerializer):
 
 
 class ResignationSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
     submittedOn = serializers.DateField(source="submitted_on")
     noticePeriodDays = serializers.IntegerField(source="notice_period_days", required=False)
