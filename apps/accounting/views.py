@@ -288,6 +288,10 @@ class StandaloneNoteViewSet(TenantModelViewSet):
     audit_entity_type = "StandaloneNote"
     audit_label_field = "note_number"
     required_permissions = ["view_ledger"]
+    # Reading needs view_ledger; raising, posting or cancelling a note needs
+    # manage_journal_entries. Approval itself happens in the approvals inbox.
+    permission_map = {"read": ["view_ledger"], "write": ["manage_journal_entries"]}
+    draft_only_writes = True
     status_field = "status"
     ordering = ["-note_date", "-created_at"]
     filter_map = {
@@ -320,10 +324,22 @@ class StandaloneNoteViewSet(TenantModelViewSet):
         serializer.instance = note
         return note
 
+    def _submit(self, request):
+        note, req = note_services.submit_standalone_note(self.get_object(), user=request.user)
+        data = dict(self.get_serializer(note).data)
+        data["approvalRequestId"] = str(req.id)
+        return Response(data)
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        """Send the note to the approvals inbox (Draft → Pending Approval)."""
+        return self._submit(request)
+
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
-        note = note_services.approve_standalone_note(self.get_object(), user=request.user)
-        return Response(self.get_serializer(note).data)
+        """Kept for older clients: now the same as ``submit``. The decision
+        itself is taken in /approvals/requests/."""
+        return self._submit(request)
 
     @action(detail=True, methods=["post"])
     def post(self, request, pk=None):

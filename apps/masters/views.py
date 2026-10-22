@@ -1309,6 +1309,33 @@ class BrokerViewSet(TenantModelViewSet):
             serializer.validated_data["code"] = allocate_number(self.request.client_id, "BRK")
         return super().perform_create(serializer)
 
+    def perform_update(self, serializer):
+        """A change of the default commission rate or type waits for approval
+        (PDF §16); the other broker details save straight away."""
+        from apps.core.money import D
+        from apps.sales import broker_services
+
+        data = serializer.validated_data
+        broker = serializer.instance
+        new_rate = data.pop("default_value", broker.default_value)
+        new_type = data.pop("commission_type", broker.commission_type)
+        if D(new_rate or 0) != D(broker.default_value or 0) or new_type != broker.commission_type:
+            self._pending_request = broker_services.request_rate_change(
+                broker, rate=new_rate, commission_type=new_type, user=self.request.user
+            )
+        return super().perform_update(serializer)
+
+    def update(self, request, *args, **kwargs):
+        self._pending_request = None
+        response = super().update(request, *args, **kwargs)
+        if self._pending_request is not None:
+            response.data["pendingApproval"] = {
+                "approvalRequestId": str(self._pending_request.id),
+                "approverRoleCodes": self._pending_request.new_values.get("approverRoleCodes"),
+                "message": "The new commission rate applies once approved.",
+            }
+        return response
+
 
 class ProcessMasterViewSet(TenantModelViewSet):
     queryset = ProcessMaster.objects.all()

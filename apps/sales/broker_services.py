@@ -58,26 +58,7 @@ def calculate_broker_commission(invoice, *, user=None, rate_override=None, commi
 
     # Basis: exclude GST (use taxable_value)
     taxable_val = D(invoice.taxable_value or invoice.total or 0)
-    total_meters = invoice.line_items.aggregate(val=Sum("qty"))["val"] or ZERO
-    total_meters = D(total_meters)
-
-    if comm_type == "percent":
-        amount = round2(taxable_val * rate / D(100))
-    elif comm_type == "per_meter":
-        amount = round2(total_meters * rate)
-    elif comm_type == "per_taka":
-        # Calculate eligible takas from invoice lines
-        takas_count = 0
-        for line in invoice.line_items.all():
-            if getattr(line, "taka_count", None):
-                takas_count += int(line.taka_count)
-            elif line.line_taka_allocations.exists():
-                takas_count += line.line_taka_allocations.count()
-            else:
-                takas_count += 1
-        amount = round2(D(max(1, takas_count)) * rate)
-    else:  # fixed
-        amount = round2(rate)
+    amount = commission_amount(invoice, comm_type, rate)
 
     comm_no = allocate_number(invoice.client_id, "BRK-COMM")
     commission, created = BrokerCommission.objects.update_or_create(
@@ -97,6 +78,113 @@ def calculate_broker_commission(invoice, *, user=None, rate_override=None, commi
             "status": "Accrued",
         },
     )
+    return commission
+
+
+def commission_amount(invoice, comm_type, rate):
+    """Brokerage on one invoice for a commission type and rate."""
+    rate = D(rate or 0)
+    if comm_type == "percent":
+        # Basis: exclude GST (use taxable_value)
+        return round2(D(invoice.taxable_value or invoice.total or 0) * rate / D(100))
+    if comm_type == "per_meter":
+        total_meters = D(invoice.line_items.aggregate(val=Sum("qty"))["val"] or ZERO)
+        return round2(total_meters * rate)
+    if comm_type == "per_taka":
+        # Calculate eligible takas from invoice lines
+        takas_count = 0
+        for line in invoice.line_items.all():
+            if getattr(line, "taka_count", None):
+                takas_count += int(line.taka_count)
+            elif line.line_taka_allocations.exists():
+                takas_count += line.line_taka_allocations.count()
+            else:
+                takas_count += 1
+        return round2(D(max(1, takas_count)) * rate)
+    return round2(rate)  # fixed
+
+
+# ---------------------------------------------------------------------------
+# Rate changes go through approval (PDF §16 "Brokerage % change")
+# ---------------------------------------------------------------------------
+RATE_CHANGE_TYPE = "brokerage_rate_change"
+RATE_APPROVER_ROLE_CODES = ["SALES_MGR", "OWNER"]
+COMMISSION_TYPES = ("percent", "per_meter", "per_taka", "fixed")
+
+
+def request_rate_change(target, *, rate, commission_type, user):
+    """Hold a change of a broker's default rate or one commission's rate
+    for approval. ``target`` is a ``masters.Broker`` or a ``BrokerCommission``."""
+    from apps.core.approval_services import raise_approval
+
+    is_commission = isinstance(target, BrokerCommission)
+    old_rate = target.rate if is_commission else target.default_value
+    old_type = target.commission_type
+    new_type = commission_type or old_type
+    if new_type not in COMMISSION_TYPES:
+        raise ValidationFailed(
+            "Unknown commission type.", field_errors={"commissionType": [f"One of {', '.join(COMMISSION_TYPES)}."]}
+        )
+    if is_commission and target.status in ("Paid", "Partially Paid", "Cancelled"):
+        raise Conflict(
+            f"Commission {target.commission_number} is {target.status}; its rate can no longer change.",
+            code="COMMISSION_LOCKED",
+        )
+    label = target.commission_number if is_commission else (target.name or target.code)
+    return raise_approval(
+        client_id=target.client_id,
+        document_type=RATE_CHANGE_TYPE,
+        document_id=target.id,
+        document_number=label,
+        requested_by=user,
+        reason=(
+            f"Brokerage change on {'commission' if is_commission else 'broker'} {label}: "
+            f"{old_type} {round4(D(old_rate or 0))} -> {new_type} {round4(D(rate))}"
+        ),
+        approver_role_code=RATE_APPROVER_ROLE_CODES[0],
+        allowed_role_codes=RATE_APPROVER_ROLE_CODES,
+        old_values={"rate": str(old_rate), "commissionType": old_type},
+        new_values={
+            "target": "BrokerCommission" if is_commission else "Broker",
+            "rate": str(D(rate)),
+            "commissionType": new_type,
+        },
+    )
+
+
+@transaction.atomic
+def apply_rate_change(req):
+    """Apply an approved rate change. A commission keeps its number; its
+    amount is recomputed, and if already approved its accrual is trued up."""
+    values = req.new_values or {}
+    rate = D(values["rate"])
+    comm_type = values.get("commissionType")
+    if values.get("target") == "Broker":
+        broker = Broker.objects.select_for_update().get(client_id=req.client_id, id=req.document_id)
+        broker.default_value = rate
+        broker.commission_type = comm_type or broker.commission_type
+        broker.save(update_fields=["default_value", "commission_type", "updated_at"])
+        return broker
+
+    commission = BrokerCommission.objects.select_for_update().select_related("invoice").get(
+        client_id=req.client_id, id=req.document_id
+    )
+    if commission.status in ("Paid", "Partially Paid", "Cancelled"):
+        raise Conflict(
+            f"Commission {commission.commission_number} is {commission.status}; the rate change cannot apply.",
+            code="COMMISSION_LOCKED",
+        )
+    commission.rate = rate
+    commission.commission_type = comm_type or commission.commission_type
+    commission.commission_basis = (
+        "QUANTITY" if commission.commission_type in ("per_meter", "per_taka") else "INVOICE"
+    )
+    commission.commission_amount = commission_amount(commission.invoice, commission.commission_type, rate)
+    commission.save(update_fields=[
+        "rate", "commission_type", "commission_basis", "commission_amount", "updated_at",
+    ])
+    if commission.status in ("Approved", "Payable"):
+        _sync_accrual(commission, user=req.decided_by, note="Brokerage rate change")
     return commission
 
 

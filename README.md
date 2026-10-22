@@ -139,14 +139,30 @@ return 404, never 403 (api.md §1.11).
 | `seed_demo [--reset]` | Demo tenant built by posting real documents, so every derived number has a cause (db.md §14.1) |
 | `smoke_test` | The api-integration.md §12.3 checklist over real HTTP |
 | `seed_phase4_roles [--tenant <slug>]` | Seed or refresh the 12 core textile roles and permission catalogue (PDF §16) |
-| `run_alerts [--tenant <slug>] [--as-of YYYY-MM-DD]` | Scheduled alert engine: checks 12 operational thresholds & generates incidents (PDF §19) |
+| `run_alerts [--tenant <slug>] [--as-of YYYY-MM-DD]` | Scheduled alert engine: runs the 13 alert checks & generates incidents (PDF §19) |
 | `run_maintenance --job {hourly,nightly,all}` | The db.md §13 jobs. Reconcilers **alert, never auto-correct** |
 | `enable_rls [--dry-run] [--drop]` | Install row-level security on all 160 tenant tables |
 
 `run_maintenance` exits non-zero when it finds drift, so it can be wired
 straight into an alerting cron.
 
-`run_alerts` evaluates the 12 operational exceptions (delayed JWOs, pending updates, overdue samples, credit limits, etc.) and should be scheduled every 15 minutes + EOD.
+`run_alerts` evaluates the 13 alert checks (delayed JWOs, pending updates, overdue samples, credit limits, etc.) and should be scheduled every 15 minutes + EOD. A check that fails is logged with its traceback and printed to stderr; the other checks still run. Thresholds come from each tenant's `AlertSetting` rows (Alert Center → settings).
+
+There is no in-process scheduler, so schedule the command from the OS:
+
+- **Windows Task Scheduler** (every 15 minutes):
+
+  ```powershell
+  schtasks /Create /TN "Oscar ERP alerts" /SC MINUTE /MO 15 /TR "C:\path\to\oscar-backend\.venv\Scripts\python.exe C:\path\to\oscar-backend\manage.py run_alerts"
+  ```
+
+- **cron** (Linux):
+
+  ```cron
+  */15 * * * * cd /srv/oscar-backend && .venv/bin/python manage.py run_alerts >> /var/log/oscar/alerts.log 2>&1
+  ```
+
+An admin (permission `manage_alerts`) can also run the checks for their own tenant on demand with `POST /api/v1/alerts/incidents/run/` (optional body `{"asOf": "YYYY-MM-DD"}`). The response lists the incidents and any checks that failed.
 
 ---
 
@@ -255,7 +271,8 @@ Stated plainly rather than stubbed silently:
 
 ### 3. Alerts & Exception Engine (PDF §19)
 - **Runner**: `python manage.py run_alerts [--tenant <slug>] [--as-of YYYY-MM-DD]`
-- Evaluates 12 operational alert rules: delayed job work orders, missing daily production updates by EOD, un-returned samples, excessive loss/wastage, credit limit/overdue invoices, below-cost sales, un-invoiced challans, and slow-moving stock (>180 days).
+- Evaluates 13 alert rules (`apps/core/alert_services.py`, one `check_*` function each): missing daily production updates, delayed production/job orders, material pending with agency, loss above tolerance (only once a JWO is fully returned), high QC rejection/reprocess, negative stock, overdue invoices and credit-limit exposure, below-cost/below-margin sales, large discounts, overdue returnable samples, vendor bill three-way mismatch, slow-moving finished stock, and combined grey stock below minimum. Day/percent/amount thresholds are read from `AlertSetting`.
+- **On demand**: `POST /api/v1/alerts/incidents/run/` (requires `manage_alerts`).
 - **Incident Center**: In-app notifications and dedicated Alert Center page at `/administration/alerts` with severity tags, acknowledgement, and resolution workflows.
 
 ### 4. Dashboards & Owner MIS (PDF §15)

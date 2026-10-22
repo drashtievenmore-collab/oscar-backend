@@ -1795,6 +1795,66 @@ class VendorBillViewSet(TenantModelViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    MISMATCH_TYPE = "vendor_bill_mismatch"
+    MISMATCH_APPROVER_ROLE_CODES = ["ACCOUNTS_MGR", "ACCOUNTS", "OWNER"]
+
+    def _mismatch_gate(self, bill, matching, remarks):
+        """None when this mismatched bill may be approved now; otherwise a 409
+        with the approval request that was opened for it."""
+        from apps.core.approval_services import raise_approval
+        from apps.core.models import ApprovalRequest
+        from apps.core.permissions import has_permission
+
+        if has_permission(self.request.user, "approve_bill_mismatch"):
+            return None
+        summary = matching.get("summary") or {}
+        fingerprint = {"billTotal": str(D(bill.total or 0)), "amountDiff": str(summary.get("amountDiff"))}
+        approved = ApprovalRequest.objects.filter(
+            client_id=bill.client_id,
+            document_type=self.MISMATCH_TYPE,
+            document_id=str(bill.id),
+            status="Approved",
+            new_values__system=True,
+        )
+        # An approval covers the bill only as it was when approved.
+        if any(
+            (req.new_values or {}).get("billTotal") == fingerprint["billTotal"]
+            and (req.new_values or {}).get("amountDiff") == fingerprint["amountDiff"]
+            for req in approved
+        ):
+            return None
+        req = raise_approval(
+            client_id=bill.client_id,
+            document_type=self.MISMATCH_TYPE,
+            document_id=bill.id,
+            document_number=bill.vendor_bill_number,
+            requested_by=self.request.user,
+            reason=(
+                f"Vendor bill {bill.vendor_bill_number} does not match PO/GRN: "
+                + ("; ".join((matching.get("reasons") or [])[:3]) or "variance")
+                + (f". Remarks: {remarks}" if remarks else "")
+            ),
+            approver_role_code=self.MISMATCH_APPROVER_ROLE_CODES[0],
+            allowed_role_codes=self.MISMATCH_APPROVER_ROLE_CODES,
+            new_values={**fingerprint, "reasons": matching.get("reasons") or []},
+            variance_amount=D(str(summary.get("amountDiff") or 0)),
+        )
+        return Response(
+            {
+                "message": (
+                    f"Bill {bill.vendor_bill_number} does not match and needs approval by accounts "
+                    "management. The request is in the approvals inbox; approve the bill again once it is approved."
+                ),
+                "code": "APPROVAL_REQUIRED",
+                "payload": {
+                    "approvalRequestId": str(req.id),
+                    "approverRoleCodes": self.MISMATCH_APPROVER_ROLE_CODES,
+                    "matching": matching,
+                },
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
     @action(detail=True, methods=["post"])
     @transaction.atomic
     def approve(self, request, pk=None):
@@ -1825,6 +1885,13 @@ class VendorBillViewSet(TenantModelViewSet):
                 field_errors={"remarks": ["Required to approve a mismatched bill."]},
                 payload={"matching": matching},
             )
+        if is_mismatch:
+            # A mismatched bill releases a payable the records do not support,
+            # so it needs approve_bill_mismatch (PDF §16) -- either held by the
+            # user approving now, or given through the approvals inbox.
+            blocked = self._mismatch_gate(bill, matching, remarks)
+            if blocked is not None:
+                return blocked
         now = timezone.now()
         bill.status = "Approved"
         if remarks is not None:

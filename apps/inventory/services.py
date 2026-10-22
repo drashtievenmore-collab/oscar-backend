@@ -1265,24 +1265,32 @@ def trace_lot_lineage(client_id, lot_taka_id_or_number):
             "gsm": float(t.gsm) if t.gsm else None,
         }
 
-    # Trace ancestors
+    # Trace ancestors through both links, all the way back: a split / processed
+    # taka points at its parent_taka, a merged batch at its parent_lots, and a
+    # finished lot can sit on top of either (PDF §06 parent-child traceability).
     ancestors = []
-    curr = lt.parent_taka
     visited = {str(lt.id)}
-    while curr and str(curr.id) not in visited:
-        visited.add(str(curr.id))
-        ancestors.append(serialize_taka(curr))
-        curr = curr.parent_taka
-
-    for p_lot in lt.parent_lots.all():
-        if str(p_lot.id) not in visited:
-            visited.add(str(p_lot.id))
-            ancestors.append(serialize_taka(p_lot))
+    queue = [lt]
+    while queue:
+        node = queue.pop(0)
+        parents = list(node.parent_lots.filter(deleted_at__isnull=True))
+        if node.parent_taka_id:
+            parents.insert(0, node.parent_taka)
+        for parent in parents:
+            if parent is None or str(parent.id) in visited:
+                continue
+            visited.add(str(parent.id))
+            ancestors.append(serialize_taka(parent))
+            queue.append(parent)
 
     # Trace descendants
+    # A processed taka can point back through both links; list it once.
     descendants = []
-    for c in lt.child_takas.filter(deleted_at__isnull=True):
-        descendants.append(serialize_taka(c))
+    seen_children = set()
+    for c in [*lt.child_takas.filter(deleted_at__isnull=True), *lt.derived_lots.filter(deleted_at__isnull=True)]:
+        if str(c.id) not in seen_children:
+            seen_children.add(str(c.id))
+            descendants.append(serialize_taka(c))
 
     # Stock movements
     movs = StockMovement.objects.filter(

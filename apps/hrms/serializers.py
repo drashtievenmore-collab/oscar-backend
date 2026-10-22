@@ -10,6 +10,7 @@ from apps.core.serializers import (
 
 from . import services
 from .models import (
+    EmployeeTransfer, EmployeePromotion, EmployeeWarning, EmployeeAward,
     Appraisal,
     AppraisalCycle,
     AppraisalHistory,
@@ -1068,6 +1069,129 @@ class BrokerCommissionRecordSerializer(BaseModelSerializer):
             "invoice_date", "invoice_amount", "commission_basis", "commission_type",
             "rate", "commission_amount", "paid_amount", "status",
             "approved_by", "approved_at", "paid_at", "notes",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+# ---------------------------------------------------------------------------
+# Employee Lifecycle Serializers (§11.9)
+# ---------------------------------------------------------------------------
+class EmployeeTransferSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    fromDepartmentName = serializers.SerializerMethodField()
+    toDepartmentName = serializers.SerializerMethodField()
+    from_department = serializers.SerializerMethodField()
+    to_department = serializers.SerializerMethodField()
+    effectiveDate = serializers.DateField(source="effective_date", required=False)
+
+    def get_fromDepartmentName(self, obj):
+        return (obj.from_department.name if obj.from_department else None) or obj.from_department_name or ""
+
+    def get_toDepartmentName(self, obj):
+        return (obj.to_department.name if obj.to_department else None) or obj.to_department_name or ""
+
+    def get_from_department(self, obj):
+        return self.get_fromDepartmentName(obj)
+
+    def get_to_department(self, obj):
+        return self.get_toDepartmentName(obj)
+
+    class Meta:
+        model = EmployeeTransfer
+        fields = [
+            "id", "employee", "employeeId", "employeeName",
+            "from_department", "to_department",
+            "fromDepartmentName", "toDepartmentName",
+            "from_location", "to_location",
+            "effective_date", "effectiveDate",
+            "reason", "status", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class EmployeePromotionSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    fromDesignationTitle = serializers.SerializerMethodField()
+    toDesignationTitle = serializers.SerializerMethodField()
+    previous_designation = serializers.SerializerMethodField()
+    new_designation = serializers.SerializerMethodField()
+    effectiveDate = serializers.DateField(source="effective_date", required=False)
+    previousSalary = serializers.DecimalField(source="previous_salary", max_digits=18, decimal_places=2, required=False)
+    newSalary = serializers.DecimalField(source="new_salary", max_digits=18, decimal_places=2, required=False)
+
+    def get_fromDesignationTitle(self, obj):
+        return (obj.previous_designation.title if obj.previous_designation else None) or obj.previous_designation_title or ""
+
+    def get_toDesignationTitle(self, obj):
+        return (obj.new_designation.title if obj.new_designation else None) or obj.new_designation_title or ""
+
+    def get_previous_designation(self, obj):
+        return self.get_fromDesignationTitle(obj)
+
+    def get_new_designation(self, obj):
+        return self.get_toDesignationTitle(obj)
+
+    class Meta:
+        model = EmployeePromotion
+        fields = [
+            "id", "employee", "employeeId", "employeeName",
+            "previous_designation", "new_designation",
+            "fromDesignationTitle", "toDesignationTitle",
+            "previous_salary", "previousSalary",
+            "new_salary", "newSalary",
+            "effective_date", "effectiveDate",
+            "notes", "status", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class EmployeeWarningSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    title = serializers.CharField(source="subject", required=False)
+    severity = serializers.CharField(source="warning_level", required=False)
+    warning_date = serializers.DateField(source="issue_date", required=False)
+    date = serializers.DateField(source="issue_date", required=False)
+    explanation = serializers.CharField(source="description", required=False)
+
+    class Meta:
+        model = EmployeeWarning
+        fields = [
+            "id", "employee", "employeeId", "employeeName",
+            "subject", "title", "warning_level", "severity",
+            "issue_date", "warning_date", "date",
+            "description", "explanation", "status",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class EmployeeAwardSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    title = serializers.CharField(source="award_name", required=False)
+    presentation_date = serializers.DateField(source="award_date", required=False)
+    date = serializers.DateField(source="award_date", required=False)
+    cash_reward = serializers.DecimalField(source="gift_amount", max_digits=18, decimal_places=2, required=False)
+
+    class Meta:
+        model = EmployeeAward
+        fields = [
+            "id", "employee", "employeeId", "employeeName",
+            "award_name", "title", "category",
+            "award_date", "presentation_date", "date",
+            "gift_amount", "cash_reward", "citation",
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]

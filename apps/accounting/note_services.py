@@ -86,6 +86,53 @@ def create_standalone_note(
     return note
 
 
+NOTE_APPROVAL_TYPE = "standalone_note"
+NOTE_APPROVER_ROLE_CODES = ["ACCOUNTS_MGR", "OWNER"]
+
+
+@transaction.atomic
+def submit_standalone_note(note, *, user=None):
+    """Draft → Pending Approval, with a request in the approvals inbox.
+    ``approve_standalone_note`` runs when an approver approves it."""
+    from apps.core.approval_services import raise_approval
+
+    note = note.__class__.objects.select_for_update().get(pk=note.pk)
+    if note.status not in ("Draft", "Pending Approval"):
+        raise ValidationFailed(
+            f"Only a draft note can be submitted for approval (currently '{note.status}').",
+            field_errors={"status": ["Must be Draft."]},
+        )
+    note.status = "Pending Approval"
+    note.save(update_fields=["status", "updated_at"])
+    req = raise_approval(
+        client_id=note.client_id,
+        document_type=NOTE_APPROVAL_TYPE,
+        document_id=note.id,
+        document_number=note.note_number,
+        requested_by=user,
+        reason=(
+            f"{note.get_note_type_display()} {note.note_number} for "
+            f"{getattr(note.party, 'name', '')}: {note.total_amount}"
+            + (f" — {note.reason_notes}" if note.reason_notes else "")
+        ),
+        approver_role_code=NOTE_APPROVER_ROLE_CODES[0],
+        allowed_role_codes=NOTE_APPROVER_ROLE_CODES,
+        new_values={"totalAmount": str(note.total_amount), "noteType": note.note_type},
+        variance_amount=note.total_amount,
+    )
+    return note, req
+
+
+@transaction.atomic
+def return_standalone_note(note, *, user=None):
+    """A rejected or returned note goes back to Draft for correction."""
+    note = note.__class__.objects.select_for_update().get(pk=note.pk)
+    if note.status == "Pending Approval":
+        note.status = "Draft"
+        note.save(update_fields=["status", "updated_at"])
+    return note
+
+
 @transaction.atomic
 def approve_standalone_note(note, *, user=None):
     """Draft / Pending Approval → Approved (PDF §14)."""
@@ -120,7 +167,9 @@ def approve_standalone_note(note, *, user=None):
 def post_standalone_note(note, *, user=None):
     """Approved → Posted (PDF §14). Posts journal entry to ledger."""
     note = note.__class__.objects.select_for_update().get(pk=note.pk)
-    if note.status not in ("Approved", "Draft"):
+    # A Draft is never posted: every debit / credit note is approved first
+    # (PDF §16 approval points).
+    if note.status != "Approved":
         raise ValidationFailed(
             f"Note must be approved before posting (currently '{note.status}').",
             field_errors={"status": ["Must be Approved."]},

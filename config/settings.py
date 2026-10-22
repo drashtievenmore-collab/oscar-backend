@@ -320,7 +320,7 @@ LOGGING = {
     },
 }
 
-# Stock adjustments whose value (qty x cost) exceeds this need approval.
-# Placeholder until the Phase 4 approval engine exists: the adjustment API only
-# reports ``exceedsApprovalLimit``. Unset (empty) means no limit.
+# Stock adjustments whose value (qty x cost) exceeds this are not posted: they
+# wait in the approvals inbox and post once approved (apps/inventory/adjustments.py).
+# Unset (empty) means no limit.
 STOCK_ADJUSTMENT_APPROVAL_LIMIT = env("STOCK_ADJUSTMENT_APPROVAL_LIMIT", None) or None

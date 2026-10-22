@@ -3,14 +3,192 @@
 Handles approval rule evaluation, approval request creation, pending state validation,
 and authorization decisions (Approve / Reject) with notifications and audit trails.
 """
+import logging
 from decimal import Decimal
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
+from django.utils.module_loading import autodiscover_modules
 
 from apps.core.audit import record_audit
 from apps.core.models import ApprovalRequest, ApprovalRule, Notification
 from apps.core.money import ZERO, round2, D
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Decision handlers
+# ---------------------------------------------------------------------------
+#: ``document_type -> fn(request, decision)``. A handler moves the document on
+#: once its request is decided. It runs inside the decision's transaction, so
+#: a handler that raises undoes the decision too.
+APPROVAL_HANDLERS = {}
+_handlers_loaded = False
+
+
+def approval_handler(*document_types):
+    """Register the function that applies a decision for these document types.
+
+    Put handlers in ``apps/<app>/approval_handlers.py``; they are discovered
+    the first time a request is decided::
+
+        @approval_handler("stock_adjustment")
+        def on_stock_adjustment(req, decision):
+            ...
+    """
+    def register(fn):
+        for document_type in document_types:
+            APPROVAL_HANDLERS[document_type] = fn
+        return fn
+    return register
+
+
+def document_uuid(req):
+    """The request's document id as a UUID, or None for a free-text id
+    (hand-made requests may carry a document number instead)."""
+    import uuid
+
+    try:
+        return uuid.UUID(str(req.document_id))
+    except (TypeError, ValueError):
+        return None
+
+
+def load_approval_handlers():
+    global _handlers_loaded
+    if not _handlers_loaded:
+        autodiscover_modules("approval_handlers")
+        _handlers_loaded = True
+
+
+def system_rule(client_id, document_type, approver_role_code, level=1):
+    """The rule a system-raised request points at, so the inbox and
+    ``assert_can_decide`` know whose decision it is."""
+    rule, _ = ApprovalRule.objects.get_or_create(
+        client_id=client_id,
+        document_type=document_type,
+        approver_role_code=approver_role_code,
+        min_level=level,
+        defaults={
+            "name": f"{document_type.replace('_', ' ').title()} ({approver_role_code})",
+            "description": "Created by the system for requests it raises.",
+            "condition_type": "always",
+        },
+    )
+    return rule
+
+
+@transaction.atomic
+def raise_approval(
+    client_id,
+    document_type,
+    document_id,
+    document_number,
+    requested_by,
+    reason,
+    approver_role_code,
+    level=1,
+    allowed_role_codes=None,
+    new_values=None,
+    old_values=None,
+    variance_amount=None,
+    variance_pct=None,
+    urgency="Normal",
+):
+    """Open (or refresh) the pending request for a document that a business
+    rule says needs approval. Unlike ``create_approval_request`` the caller
+    has already decided approval is needed and who must give it.
+
+    A second call for the same document refreshes the pending request; if the
+    new reason needs a higher approver, the request moves to that approver.
+
+    ``allowed_role_codes`` (default: just ``approver_role_code``) are the only
+    roles that may decide it -- ``manage_approvals`` alone is not enough, so a
+    manager cannot clear a request that is addressed to the owner.
+    """
+    rule = system_rule(client_id, document_type, approver_role_code, level)
+    existing = ApprovalRequest.objects.select_for_update().filter(
+        client_id=client_id,
+        document_type=document_type,
+        document_id=str(document_id),
+        status="Pending",
+    ).first()
+    values = dict(new_values or {})
+    values["approverRoleCode"] = approver_role_code
+    values["approverRoleCodes"] = list(allowed_role_codes or [approver_role_code])
+    values["level"] = level
+    values["system"] = True
+    if existing:
+        existing.rule = rule
+        existing.reason = reason
+        existing.new_values = values
+        existing.old_values = old_values or existing.old_values
+        existing.variance_amount = round2(variance_amount) if variance_amount is not None else None
+        existing.variance_pct = round2(variance_pct) if variance_pct is not None else None
+        existing.urgency = urgency
+        existing.save()
+        return existing
+
+    req = ApprovalRequest.objects.create(
+        client_id=client_id,
+        rule=rule,
+        document_type=document_type,
+        document_id=str(document_id),
+        document_number=str(document_number or ""),
+        requested_by=requested_by,
+        reason=reason,
+        old_values=old_values or {},
+        new_values=values,
+        variance_amount=round2(variance_amount) if variance_amount is not None else None,
+        variance_pct=round2(variance_pct) if variance_pct is not None else None,
+        status="Pending",
+        urgency=urgency,
+    )
+    _notify_approvers(req)
+    return req
+
+
+def _notify_approvers(req):
+    try:
+        from apps.accounts.models import User
+        rule = req.rule
+        approver_users = User.objects.filter(client_id=req.client_id, status="Active")
+        if rule and rule.approver_role_id:
+            approver_users = approver_users.filter(role=rule.approver_role)
+        elif rule and rule.approver_role_code:
+            approver_users = approver_users.filter(role__code=rule.approver_role_code)
+        else:
+            approver_users = approver_users.filter(is_superuser=True)
+        requester = req.requested_by
+        for u in approver_users[:10]:
+            Notification.objects.create(
+                client_id=req.client_id,
+                recipient=u,
+                type="approval_required",
+                category="system",
+                title=f"Approval Required: {req.document_number or req.document_type}",
+                body=f"{req.reason} (Requested by {requester.name if requester else 'System'})",
+                entity_type=req.document_type,
+                entity_id=req.id,
+            )
+    except Exception:
+        # The request stands; approvers still see it in the inbox.
+        logger.exception("Approval %s: notifying approvers failed", req.id)
+
+
+def latest_decision(client_id, document_types, document_ids):
+    """The newest decided request for any of these documents, or None."""
+    return (
+        ApprovalRequest.objects.filter(
+            client_id=client_id,
+            document_type__in=list(document_types),
+            document_id__in=[str(d) for d in document_ids if d],
+        )
+        .exclude(status="Pending")
+        .order_by("-decided_at", "-requested_at")
+        .first()
+    )
 
 
 def get_matching_rule(client_id, document_type, variance_amount=None, variance_pct=None, value=None):
@@ -94,32 +272,7 @@ def create_approval_request(
         urgency=urgency,
     )
 
-    # In-app notification for approvers
-    try:
-        from apps.accounts.models import User
-        approver_users = User.objects.filter(client_id=client_id, status="Active")
-        if rule and rule.approver_role:
-            approver_users = approver_users.filter(role=rule.approver_role)
-        elif rule and rule.approver_role_code:
-            approver_users = approver_users.filter(role__code=rule.approver_role_code)
-        else:
-            # Default to superusers / owners
-            approver_users = approver_users.filter(is_superuser=True)
-
-        for u in approver_users[:10]:
-            Notification.objects.create(
-                client_id=client_id,
-                recipient=u,
-                type="approval_required",
-                category="system",
-                title=f"Approval Required: {document_number or document_type}",
-                body=f"{reason} (Requested by {requested_by.name if requested_by else 'System'})",
-                entity_type=document_type,
-                entity_id=req.id,
-            )
-    except Exception:
-        pass
-
+    _notify_approvers(req)
     return req
 
 
@@ -155,7 +308,19 @@ def assert_can_decide(req, user, decision):
     from apps.core.permissions import has_permission
     from rest_framework.exceptions import PermissionDenied
 
-    if getattr(user, "is_superuser", False) or has_permission(user, "manage_approvals"):
+    if getattr(user, "is_superuser", False):
+        return
+    # A request the system addressed to specific roles (raise_approval) may
+    # only be decided by those roles.
+    allowed_codes = (req.new_values or {}).get("approverRoleCodes")
+    if allowed_codes:
+        if getattr(getattr(user, "role", None), "code", None) in allowed_codes:
+            return
+        raise PermissionDenied(
+            f"This request needs approval by {', '.join(allowed_codes)}.",
+            code="manage_approvals",
+        )
+    if has_permission(user, "manage_approvals"):
         return
     if decision == "Returned" and has_permission(user, "return_approval"):
         return
@@ -194,20 +359,10 @@ def decide_approval_request(request_id, user, decision, comments="", client_id=N
     req.comments = comments
     req.save()
 
-    if req.document_type == "purchase_order":
-        try:
-            from apps.purchase.models import PurchaseOrder
-            po = PurchaseOrder.objects.filter(client_id=req.client_id, id=req.document_id).first()
-            if po and po.status == "Pending Approval":
-                if decision == "Approved":
-                    po.status = "Approved"
-                elif decision == "Rejected":
-                    po.status = "Rejected"
-                elif decision == "Returned":
-                    po.status = "Draft"
-                po.save(update_fields=["status", "updated_at"])
-        except Exception:
-            pass
+    load_approval_handlers()
+    handler = APPROVAL_HANDLERS.get(req.document_type)
+    if handler is not None:
+        handler(req, decision)
 
     record_audit(
         client=req.client,

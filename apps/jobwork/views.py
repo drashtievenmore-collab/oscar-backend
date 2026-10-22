@@ -45,6 +45,18 @@ from .services import (
 )
 
 
+def _parse_date(value):
+    """A YYYY-MM-DD query parameter as a date, or None when absent."""
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        from apps.core.exceptions import ValidationFailed
+
+        raise ValidationFailed("Dates must be YYYY-MM-DD.", field_errors={"date": [f"Not a date: {value}"]})
+
+
 class ProcessPlanViewSet(TenantModelViewSet):
     permission_classes = [HasModulePermission]
     required_permissions = ["view_jobwork"]
@@ -280,12 +292,13 @@ class JobWorkOrderViewSet(TenantModelViewSet):
         One row per JWO with material sent out, computed live from the
         JWO's outwards/inwards (same records the detail tabs read/write):
 
-            totalOutward = Σ outwards.qty
-            totalInward  = Σ inwards.qty
-            acceptedQty  = Σ inwards.accepted
-            rejectedQty  = Σ inwards.rejected
-            pendingQty   = totalOutward − totalInward
-            difference   = pendingQty (the unreconciled balance)
+            totalOutward    = Σ outwards.qty
+            totalInward     = Σ inwards.qty
+            acceptedQty     = Σ inwards.accepted
+            rejectedQty     = Σ inwards.rejected
+            approvedLossQty = Σ approved loss entries
+            pendingQty      = totalOutward − totalInward − approvedLossQty (PDF §07)
+            difference      = pendingQty (the unreconciled balance)
 
         Status: pendingQty = 0 → Reconciled; else expected_completion
         passed → Mismatch; else Pending.
@@ -293,7 +306,7 @@ class JobWorkOrderViewSet(TenantModelViewSet):
         today = date.today().isoformat()
         queryset = (
             self.filter_queryset(self.get_queryset())
-            .prefetch_related("materials", "outwards", "inwards")
+            .prefetch_related("materials", "outwards", "inwards", "loss_entries")
             .order_by("jwo_no")
         )
         rows = []
@@ -304,7 +317,11 @@ class JobWorkOrderViewSet(TenantModelViewSet):
                 continue
             accepted = sum((i.accepted or ZERO for i in live(order.inwards)), ZERO)
             rejected = sum((i.rejected or ZERO for i in live(order.inwards)), ZERO)
-            pending = total_outward - total_inward
+            approved_loss = sum(
+                (l.qty or ZERO for l in order.loss_entries.all() if l.deleted_at is None and l.status == "Approved"),
+                ZERO,
+            )
+            pending = total_outward - total_inward - approved_loss
             if pending < ZERO:
                 pending = ZERO
             expected = order.expected_completion.isoformat() if order.expected_completion else None
@@ -328,6 +345,7 @@ class JobWorkOrderViewSet(TenantModelViewSet):
                 "totalInward": float(total_inward),
                 "acceptedQty": float(accepted),
                 "rejectedQty": float(rejected),
+                "approvedLossQty": float(approved_loss),
                 "pendingQty": float(pending),
                 "difference": float(pending),
                 "status": recon_status,
@@ -433,13 +451,28 @@ class JobWorkOrderViewSet(TenantModelViewSet):
         processor_id = request.query_params.get("processorId") or request.query_params.get("vendorId")
         from apps.masters.models import Party
 
+        """Material ledger per processor (PDF §07):
+
+            Opening + Sent − Received − Approved Loss = Closing
+
+        ``fromDate`` / ``toDate`` (YYYY-MM-DD) bound the period; movements
+        before ``fromDate`` make up the opening balance. Entries are sorted by
+        date before the running balance is taken.
+        """
         client_id = request.client_id
+        date_from = _parse_date(request.query_params.get("fromDate") or request.query_params.get("date_from"))
+        date_to = _parse_date(request.query_params.get("toDate") or request.query_params.get("date_to"))
+
         parties = Party.objects.filter(client_id=client_id, deleted_at__isnull=True)
         if processor_id:
             parties = parties.filter(id=processor_id)
         else:
-            parties = parties.filter(type__in=["Vendor", "Both"])
+            parties = parties.filter(
+                Q(type__in=["Vendor", "Both", "Processor"]) | Q(is_processor=True)
+            )
 
+        # Same day: material goes out before it can come back or be written off.
+        doc_order = {"Outward": 0, "Inward": 1, "Loss": 2}
         results = []
         for p in parties:
             orders = JobWorkOrder.objects.filter(
@@ -449,68 +482,56 @@ class JobWorkOrderViewSet(TenantModelViewSet):
                 Q(vendor=p) | Q(vendor_name=p.name)
             ).prefetch_related("outwards", "inwards", "loss_entries")
 
-            entries = []
-            running_bal = ZERO
-
+            raw = []
             for o in orders:
                 for ow in live(o.outwards):
-                    qty = ow.qty or ZERO
-                    running_bal += qty
-                    entries.append({
-                        "date": ow.date.isoformat() if ow.date else None,
-                        "jwoNo": o.jwo_no,
-                        "docType": "Outward",
-                        "docNo": ow.no,
-                        "challanNo": ow.challan_no,
-                        "debitQty": float(qty),
-                        "creditQty": 0.0,
-                        "lossQty": 0.0,
-                        "balanceQty": float(running_bal),
-                    })
+                    raw.append((ow.date, "Outward", o.jwo_no, ow.no, ow.challan_no, D(ow.qty or 0)))
                 for iw in live(o.inwards):
-                    qty = iw.qty or ZERO
-                    running_bal -= qty
-                    entries.append({
-                        "date": iw.date.isoformat() if iw.date else None,
-                        "jwoNo": o.jwo_no,
-                        "docType": "Inward",
-                        "docNo": iw.no,
-                        "challanNo": iw.challan_no,
-                        "debitQty": 0.0,
-                        "creditQty": float(qty),
-                        "lossQty": 0.0,
-                        "balanceQty": float(running_bal),
-                    })
+                    raw.append((iw.date, "Inward", o.jwo_no, iw.no, iw.challan_no, D(iw.qty or 0)))
                 for loss in o.loss_entries.filter(deleted_at__isnull=True, status="Approved"):
-                    qty = loss.qty or ZERO
-                    running_bal -= qty
-                    entries.append({
-                        "date": loss.approved_at.date().isoformat() if loss.approved_at else None,
-                        "jwoNo": o.jwo_no,
-                        "docType": "Loss",
-                        "docNo": f"LOSS-{str(loss.id)[:8]}",
-                        "challanNo": None,
-                        "debitQty": 0.0,
-                        "creditQty": 0.0,
-                        "lossQty": float(qty),
-                        "balanceQty": float(running_bal),
-                    })
+                    on = loss.approved_at.date() if loss.approved_at else None
+                    raw.append((on, "Loss", o.jwo_no, f"LOSS-{str(loss.id)[:8]}", None, D(loss.qty or 0)))
+            raw.sort(key=lambda r: (r[0] or date.min, doc_order[r[1]], r[2] or "", r[3] or ""))
 
-            entries.sort(key=lambda x: x["date"] or "")
-            total_debit = sum(e["debitQty"] for e in entries)
-            total_credit = sum(e["creditQty"] for e in entries)
-            total_loss = sum(e["lossQty"] for e in entries)
-            net_balance = total_debit - total_credit - total_loss
+            def signed(row):
+                return row[5] if row[1] == "Outward" else -row[5]
 
-            if entries or processor_id:
+            opening = sum((signed(r) for r in raw if date_from and r[0] and r[0] < date_from), ZERO)
+            running = opening
+            entries = []
+            sent = received = lost = ZERO
+            for row in raw:
+                on, doc_type, jwo_no, doc_no, challan, qty = row
+                if date_from and on and on < date_from:
+                    continue
+                if date_to and on and on > date_to:
+                    continue
+                running += signed(row)
+                sent += qty if doc_type == "Outward" else ZERO
+                received += qty if doc_type == "Inward" else ZERO
+                lost += qty if doc_type == "Loss" else ZERO
+                entries.append({
+                    "date": on.isoformat() if on else None,
+                    "jwoNo": jwo_no,
+                    "docType": doc_type,
+                    "docNo": doc_no,
+                    "challanNo": challan,
+                    "debitQty": float(qty) if doc_type == "Outward" else 0.0,
+                    "creditQty": float(qty) if doc_type == "Inward" else 0.0,
+                    "lossQty": float(qty) if doc_type == "Loss" else 0.0,
+                    "balanceQty": float(running),
+                })
+
+            if entries or processor_id or opening:
                 results.append({
                     "processorId": str(p.id),
                     "processorName": p.name,
                     "processorCode": p.code,
-                    "totalSent": total_debit,
-                    "totalReceived": total_credit,
-                    "totalLoss": total_loss,
-                    "closingBalance": net_balance,
+                    "openingBalance": float(opening),
+                    "totalSent": float(sent),
+                    "totalReceived": float(received),
+                    "totalLoss": float(lost),
+                    "closingBalance": float(opening + sent - received - lost),
                     "entries": entries,
                 })
 

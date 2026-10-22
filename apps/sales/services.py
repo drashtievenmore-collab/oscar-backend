@@ -97,6 +97,9 @@ def recalculate_document(document, *, lines=None, save=True):
     line_rows = list(lines if lines is not None else document.line_items.all())
 
     from apps.inventory.costing_services import check_item_margin
+    from apps.sales.discount_control import get_policy
+
+    min_margin_pct = get_policy(document.client_id).min_margin_pct
 
     computed = []
     for line in line_rows:
@@ -106,7 +109,9 @@ def recalculate_document(document, *, lines=None, save=True):
         line.tax_amount = totals.tax_amount
         line.line_total = totals.line_total
         below_cost, below_margin, landed_cost, margin_pct = check_item_margin(
-            document.client_id, line.item_id, line.rate, lot_number=getattr(line, "lot_preference", None)
+            document.client_id, line.item_id, line.rate,
+            lot_number=getattr(line, "lot_preference", None),
+            min_margin_pct=min_margin_pct,
         )
         line.landed_cost = landed_cost
         line.margin_pct = margin_pct
@@ -180,6 +185,25 @@ def assert_client_totals_match(document, claimed):
 # ---------------------------------------------------------------------------
 # Credit limit (api.md §4.1)
 # ---------------------------------------------------------------------------
+def party_credit_exposure(party):
+    """Derived balance plus open unbilled orders (db.md §4.1).
+
+    Returns ``(exposure, open_orders)``. Shared by the credit-limit gate and
+    the credit alert, so both read the same number.
+    """
+    open_orders = SalesOrder.objects.filter(
+        client_id=party.client_id,
+        party_id=party.id,
+        deleted_at__isnull=True,
+    ).exclude(stage__in=["Invoiced", "Cancelled"]).aggregate(
+        value=Coalesce(
+            Sum("total"), Value(Decimal("0.00")),
+            output_field=DecimalField(max_digits=18, decimal_places=2),
+        )
+    )["value"]
+    return round2(D(party.balance) + D(open_orders)), open_orders
+
+
 def assert_credit_limit(party, additional_amount, *, user=None, override=False):
     """422 CREDIT_LIMIT_EXCEEDED unless the caller holds the override permission
     **and** passes ``{"overrideCreditLimit": true}``.
@@ -212,18 +236,8 @@ def assert_credit_limit(party, additional_amount, *, user=None, override=False):
     if not has_limit:
         return
 
-    open_orders = SalesOrder.objects.filter(
-        client_id=party.client_id,
-        party_id=party.id,
-        deleted_at__isnull=True,
-    ).exclude(stage__in=["Invoiced", "Cancelled"]).aggregate(
-        value=Coalesce(
-            Sum("total"), Value(Decimal("0.00")),
-            output_field=DecimalField(max_digits=18, decimal_places=2),
-        )
-    )["value"]
-
-    exposure = round2(D(party.balance) + D(open_orders) + D(additional_amount))
+    current_exposure, open_orders = party_credit_exposure(party)
+    exposure = round2(current_exposure + D(additional_amount))
     if exposure <= D(limit):
         return
 
@@ -729,7 +743,7 @@ def derive_order_stage(order):
     Fully Dispatched; something dispatched -> Partially Dispatched; else
     Confirmed.
     """
-    if order.stage in ("Draft", "Cancelled", "Closed"):
+    if order.stage in ("Draft", "Pending Approval", "Cancelled", "Closed"):
         return order.stage
     lines = list(order.line_items.filter(deleted_at__isnull=True))
     if not lines:

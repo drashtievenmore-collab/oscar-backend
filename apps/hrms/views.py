@@ -27,6 +27,7 @@ from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
 
 from . import services
 from .models import (
+    EmployeeTransfer, EmployeePromotion, EmployeeWarning, EmployeeAward,
     Appraisal,
     AppraisalCycle,
     AppraisalHistory,
@@ -78,6 +79,7 @@ from .models import (
     BrokerCommissionRecord,
 )
 from .serializers import (
+    EmployeeTransferSerializer, EmployeePromotionSerializer, EmployeeWarningSerializer, EmployeeAwardSerializer,
     AppraisalCycleSerializer,
     AppraisalSerializer,
     ApprovalChainSerializer,
@@ -2403,3 +2405,45 @@ class StubLifecycleViewSet(viewsets.ViewSet):
 
     def retrieve(self, request, pk=None):
         return Response({})
+
+
+# ---------------------------------------------------------------------------
+# Employee Lifecycle ViewSets (§11.9)
+# ---------------------------------------------------------------------------
+class EmployeeTransferViewSet(TenantModelViewSet):
+    queryset = EmployeeTransfer.objects.select_related("employee", "from_department", "to_department")
+    serializer_class = EmployeeTransferSerializer
+    audit_entity_type = "EmployeeTransfer"
+    status_field = "status"
+    ordering = ["-effective_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "employee": "employee_id"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+
+class EmployeePromotionViewSet(TenantModelViewSet):
+    queryset = EmployeePromotion.objects.select_related("employee", "previous_designation", "new_designation")
+    serializer_class = EmployeePromotionSerializer
+    audit_entity_type = "EmployeePromotion"
+    status_field = "status"
+    ordering = ["-effective_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "employee": "employee_id"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+
+class EmployeeWarningViewSet(TenantModelViewSet):
+    queryset = EmployeeWarning.objects.select_related("employee")
+    serializer_class = EmployeeWarningSerializer
+    audit_entity_type = "EmployeeWarning"
+    status_field = "status"
+    ordering = ["-issue_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "employee": "employee_id"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+
+class EmployeeAwardViewSet(TenantModelViewSet):
+    queryset = EmployeeAward.objects.select_related("employee")
+    serializer_class = EmployeeAwardSerializer
+    audit_entity_type = "EmployeeAward"
+    ordering = ["-award_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "employee": "employee_id"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}

@@ -48,6 +48,10 @@ MOVEMENT_TYPES = [
     ("SALES_RETURN_REPROCESS", "SALES_RETURN_REPROCESS"),
     ("SALES_RETURN_SECOND_QUALITY", "SALES_RETURN_SECOND_QUALITY"),
     ("SALES_RETURN_REJECT", "SALES_RETURN_REJECT"),
+    # Several small lots combined into one processing batch (PDF §06 lot
+    # merge): out of each source taka, into the merged taka, same godown.
+    ("LOT_MERGE_OUT", "LOT_MERGE_OUT"),
+    ("LOT_MERGE_IN", "LOT_MERGE_IN"),
 ]
 
 #: Movements that reverse an earlier one, keyed to what they reverse.

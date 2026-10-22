@@ -46,35 +46,35 @@ def issue_sample(
     if quantity <= ZERO:
         raise ValidationFailed("Sample quantity must be greater than zero.")
 
-    source_taka = None
-    estimated_cost = ZERO
+    # A sample is cut from a real taka, so the stock always comes off it
+    # (PDF §10: sampling is a stock movement, not only a photo record).
+    if not source_lot_taka_id:
+        raise ValidationFailed(
+            "Choose the lot / taka the sample is cut from.",
+            field_errors={"sourceLotTakaId": ["Required: the sample is deducted from this taka."]},
+        )
+    source_taka = LotTaka.objects.select_for_update().filter(
+        client_id=client_id, pk=source_lot_taka_id, deleted_at__isnull=True
+    ).first()
+    if source_taka is None:
+        raise NotFound("Source lot taka not found.")
 
-    if source_lot_taka_id:
-        source_taka = LotTaka.objects.select_for_update().filter(
-            client_id=client_id, pk=source_lot_taka_id, deleted_at__isnull=True
-        ).first()
-        if source_taka is None:
-            raise NotFound("Source lot taka not found.")
+    # The SAMPLE_ISSUE movement below takes the quantity off the taka; it
+    # is not reduced here as well (that deducted the sample twice).
+    if sample_type == "FULL_TAKA":
+        if source_taka.available_quantity <= ZERO:
+            raise BusinessRuleViolation("Taka has zero available quantity.")
+        quantity = source_taka.available_quantity
+    elif source_taka.available_quantity < quantity:
+        raise BusinessRuleViolation(
+            f"Taka only has {source_taka.available_quantity} available, {quantity} requested."
+        )
 
-        if sample_type == "FULL_TAKA":
-            if source_taka.available_quantity <= ZERO:
-                raise BusinessRuleViolation("Taka has zero available quantity.")
-            quantity = source_taka.available_quantity
-            source_taka.status = LotTaka.STATUS_SAMPLE
-            source_taka.save(update_fields=["status", "updated_at"])
-        else:
-            if source_taka.available_quantity < quantity:
-                raise BusinessRuleViolation(
-                    f"Taka only has {source_taka.available_quantity} available, {quantity} requested."
-                )
-            source_taka.available_quantity = round4(source_taka.available_quantity - quantity)
-            source_taka.save(update_fields=["available_quantity", "updated_at"])
-
-        fabric_quality_id = fabric_quality_id or source_taka.fabric_quality_id
-        design_id = design_id or source_taka.design_id
-        shade_id = shade_id or source_taka.shade_id
-        unit_rate = D(source_taka.rate) if source_taka.rate else ZERO
-        estimated_cost = round2(quantity * unit_rate)
+    fabric_quality_id = fabric_quality_id or source_taka.fabric_quality_id
+    design_id = design_id or source_taka.design_id
+    shade_id = shade_id or source_taka.shade_id
+    unit_rate = D(source_taka.rate) if source_taka.rate else ZERO
+    estimated_cost = round2(quantity * unit_rate)
 
     sample_no = allocate_number(client_id, "SMP")
     sample = Sample.objects.create(
@@ -99,24 +99,24 @@ def issue_sample(
         remarks=remarks,
     )
 
-    # Post SAMPLE_ISSUE movement if source taka was linked
-    if source_taka:
-        stock.post_movement(
-            client_id=client_id,
-            item=source_taka.item,
-            location=source_taka.location,
-            type="SAMPLE_ISSUE",
-            quantity=-quantity,
-            uom=uom,
-            unit_cost=source_taka.rate,
-            reference_type="Sample",
-            reference_id=sample.id,
-            reference_number=sample.sample_number,
-            movement_date=sample.sample_date,
-            user=user,
-            lot_taka=source_taka,
-            notes=f"Sample issue {sample.sample_number}",
-        )
+    stock.post_movement(
+        client_id=client_id,
+        item=source_taka.item,
+        location=source_taka.location,
+        type="SAMPLE_ISSUE",
+        quantity=-quantity,
+        uom=uom,
+        unit_cost=source_taka.rate,
+        reference_type="Sample",
+        reference_id=sample.id,
+        reference_number=sample.sample_number,
+        movement_date=sample.sample_date,
+        user=user,
+        lot_taka=source_taka,
+        notes=f"Sample issue {sample.sample_number}",
+    )
+    if sample_type == "FULL_TAKA":
+        LotTaka.objects.filter(pk=source_taka.pk).update(status=LotTaka.STATUS_SAMPLE)
 
     return sample
 
@@ -144,15 +144,13 @@ def return_sample(sample, return_qty, *, condition="Good", user=None, remarks=No
 
     sample.save(update_fields=["returned_quantity", "status", "updated_at"])
 
-    # Restore inventory
+    # Restore inventory: the SAMPLE_RETURN movement puts the quantity back on
+    # the taka; it is not added here as well (that returned it twice).
     source_taka = sample.source_lot_taka
     if source_taka:
         if sample.sample_type == "FULL_TAKA":
             source_taka.status = LotTaka.STATUS_FINISHED if condition == "Good" else LotTaka.STATUS_QC_HOLD
             source_taka.save(update_fields=["status", "updated_at"])
-        else:
-            source_taka.available_quantity = round4(source_taka.available_quantity + return_qty)
-            source_taka.save(update_fields=["available_quantity", "updated_at"])
 
         mv_type = "SAMPLE_RETURN" if condition == "Good" else "SAMPLE_RETURN_HOLD"
         stock.post_movement(
