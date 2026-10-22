@@ -405,6 +405,123 @@ class UserViewSet(TenantModelViewSet):
         "permissions": ["manage_roles"],
     }
 
+    @staticmethod
+    def _sync_employee_if_role_employee(user):
+        """Connect user in Administrator with HRMS Employee if role is Employee in any department."""
+        if not user:
+            return
+        is_employee_role = False
+        role = user.role
+        if not role and user.role_id:
+            from apps.accounts.models import Role
+            role = Role.objects.filter(pk=user.role_id).first()
+
+        if role:
+            r_name = str(role.name or "").strip().lower()
+            r_code = str(role.code or "").strip().upper()
+            if r_name == "employee" or r_code in ("EM", "EMPLOYEE") or "employee" in r_name:
+                is_employee_role = True
+
+        if not is_employee_role:
+            return
+
+        from apps.hrms.models import Employee, Department, Designation, Location
+        from apps.core.numbering import allocate_number
+
+        client = user.client
+        client_id = user.client_id
+
+        # Resolve Department (in any department specified)
+        dept = None
+        if user.department and user.department.strip():
+            dept = Department.objects.filter(
+                client_id=client_id, name__iexact=user.department.strip(), deleted_at__isnull=True
+            ).first()
+            if not dept:
+                dept = Department.objects.create(client_id=client_id, name=user.department.strip())
+
+        # Resolve Designation
+        desig = Designation.objects.filter(
+            client_id=client_id, name__iexact="Employee", deleted_at__isnull=True
+        ).first()
+        if not desig:
+            desig = Designation.objects.create(client_id=client_id, name="Employee")
+
+        # Resolve Location
+        loc = None
+        if user.location and user.location.strip():
+            loc = Location.objects.filter(
+                client_id=client_id, name__iexact=user.location.strip(), deleted_at__isnull=True
+            ).first()
+            if not loc:
+                loc = Location.objects.create(client_id=client_id, name=user.location.strip())
+
+        # If user already has an employee record, update its fields
+        if user.employee_id:
+            emp = user.employee
+            if emp and not emp.deleted_at:
+                updates = []
+                if user.name and emp.name != user.name:
+                    emp.name = user.name
+                    updates.append("name")
+                if user.phone and emp.phone != user.phone:
+                    emp.phone = user.phone
+                    updates.append("phone")
+                if dept and emp.department_id != dept.id:
+                    emp.department = dept
+                    updates.append("department")
+                if loc and emp.location_id != loc.id:
+                    emp.location = loc
+                    updates.append("location")
+                if updates:
+                    emp.save(update_fields=updates)
+                return
+
+        # Check if an employee with matching email exists
+        emp = Employee.objects.filter(
+            client_id=client_id, email__iexact=user.email, deleted_at__isnull=True
+        ).first()
+
+        if not emp:
+            try:
+                code = allocate_number(client, "EMP")
+            except Exception:
+                code = f"EMP-{(Employee.objects.filter(client_id=client_id).count() + 1):03d}"
+
+            emp = Employee.objects.create(
+                client_id=client_id,
+                employee_code=code,
+                name=user.name or user.email,
+                email=user.email,
+                phone=user.phone or "",
+                avatar_url=user.avatar_url or "",
+                department=dept,
+                designation=desig,
+                location=loc,
+                joining_date=user.joined_date or timezone.localdate(),
+                status="Active" if user.status in ("Active", "Invited") else "Inactive",
+            )
+        else:
+            updates = []
+            if dept and emp.department_id != dept.id:
+                emp.department = dept
+                updates.append("department")
+            if updates:
+                emp.save(update_fields=updates)
+
+        user.employee = emp
+        user.save(update_fields=["employee"])
+
+    def perform_create(self, serializer):
+        user = super().perform_create(serializer)
+        self._sync_employee_if_role_employee(user)
+        return user
+
+    def perform_update(self, serializer):
+        user = super().perform_update(serializer)
+        self._sync_employee_if_role_employee(user)
+        return user
+
     def get_aggregates(self, queryset):
         """api.md §3.1 -- "KPI tiles: total, active, inactive, admins"."""
         rows = queryset.aggregate(

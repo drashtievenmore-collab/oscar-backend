@@ -193,6 +193,21 @@ class DocumentSerializer(BaseModelSerializer):
             if field in validated_data
         }
 
+        # Sync salesperson text and salesperson_fk
+        sp_obj = validated_data.get("salesperson_fk")
+        sp_text = validated_data.get("salesperson")
+        if sp_obj and not sp_text:
+            validated_data["salesperson"] = sp_obj.name
+        elif sp_text and not sp_obj:
+            from apps.hrms.models import Employee
+            client_id = getattr(self.context.get("request"), "client_id", None)
+            if client_id:
+                matched_emp = Employee.objects.filter(
+                    client_id=client_id, name__iexact=str(sp_text).strip(), deleted_at__isnull=True
+                ).first()
+                if matched_emp:
+                    validated_data["salesperson_fk"] = matched_emp
+
         document = super().create(validated_data)
         document.freeze_party_snapshot()
         document.save()
@@ -206,6 +221,17 @@ class DocumentSerializer(BaseModelSerializer):
 
     def update(self, instance, validated_data):
         line_payloads = validated_data.pop("lineItems", None)
+        sp_obj = validated_data.get("salesperson_fk")
+        sp_text = validated_data.get("salesperson")
+        if sp_obj and not sp_text:
+            validated_data["salesperson"] = sp_obj.name
+        elif sp_text and not sp_obj:
+            from apps.hrms.models import Employee
+            matched_emp = Employee.objects.filter(
+                client_id=instance.client_id, name__iexact=str(sp_text).strip(), deleted_at__isnull=True
+            ).first()
+            if matched_emp:
+                validated_data["salesperson_fk"] = matched_emp
         document = super().update(instance, validated_data)
         if line_payloads is not None:
             self._write_lines(document, line_payloads, replace=True)

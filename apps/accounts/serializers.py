@@ -222,6 +222,16 @@ class UserSerializer(BaseModelSerializer):
 
     def create(self, validated_data):
         password = validated_data.pop("password", None)
+        # If roleId was not provided, but role name was in raw input, resolve it
+        if not validated_data.get("role"):
+            raw_role = self.initial_data.get("role") or self.initial_data.get("roleName")
+            if raw_role:
+                client_id = self.context.get("client_id")
+                matched_role = Role.objects.filter(client_id=client_id, name__iexact=str(raw_role).strip()).first()
+                if not matched_role:
+                    matched_role = Role.objects.filter(client_id=client_id, code__iexact=str(raw_role).strip()).first()
+                if matched_role:
+                    validated_data["role"] = matched_role
         user = User(**validated_data)
         if password:
             user.set_password(password)
@@ -235,6 +245,15 @@ class UserSerializer(BaseModelSerializer):
 
     def update(self, instance, validated_data):
         password = validated_data.pop("password", None)
+        if "role" not in validated_data and ("role" in self.initial_data or "roleName" in self.initial_data):
+            raw_role = self.initial_data.get("role") or self.initial_data.get("roleName")
+            if raw_role:
+                client_id = self.context.get("client_id") or getattr(instance, "client_id", None)
+                matched_role = Role.objects.filter(client_id=client_id, name__iexact=str(raw_role).strip()).first()
+                if not matched_role:
+                    matched_role = Role.objects.filter(client_id=client_id, code__iexact=str(raw_role).strip()).first()
+                if matched_role:
+                    validated_data["role"] = matched_role
         user = super().update(instance, validated_data)
         if password:
             user.set_password(password)

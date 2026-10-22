@@ -75,6 +75,12 @@ from .models import (
     Training,
     TrainingParticipant,
     WorkingDay,
+    SalespersonIncentiveScheme,
+    SalespersonIncentiveAccrual,
+    AgencyStaffAssignment,
+    DailyAgencyProductionEntry,
+    PayrollCommercialAllocation,
+    BrokerCommissionRecord,
 )
 from .serializers import (
     AppraisalCycleSerializer,
@@ -124,6 +130,12 @@ from .serializers import (
     TrainingParticipantSerializer,
     TrainingSerializer,
     WorkingDaySerializer,
+    SalespersonIncentiveSchemeSerializer,
+    SalespersonIncentiveAccrualSerializer,
+    AgencyStaffAssignmentSerializer,
+    DailyAgencyProductionEntrySerializer,
+    PayrollCommercialAllocationSerializer,
+    BrokerCommissionRecordSerializer,
 )
 
 
@@ -150,6 +162,79 @@ class EmployeeViewSet(TenantModelViewSet):
         "employmentType": "employment_type",
     }
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"], "create": ["create_staff"]}
+    def get_queryset(self):
+        self._ensure_employee_users_linked()
+        return super().get_queryset()
+
+    def _ensure_employee_users_linked(self):
+        try:
+            from apps.accounts.models import User
+            from django.db.models import Q
+            client_id = self.get_client_id()
+            unlinked_employee_users = User.objects.filter(
+                client_id=client_id,
+                deleted_at__isnull=True,
+                employee__isnull=True,
+            ).filter(
+                Q(role__name__iexact="Employee") |
+                Q(role__code__iexact="EM") |
+                Q(role__code__iexact="EMPLOYEE")
+            )
+            for u in unlinked_employee_users:
+                self._link_user_to_employee(u)
+        except Exception as e:
+            pass
+
+    @staticmethod
+    def _link_user_to_employee(user):
+        from apps.hrms.models import Employee, Department, Designation, Location
+        from apps.core.numbering import allocate_number
+
+        dept = None
+        if user.department and user.department.strip():
+            dept = Department.objects.filter(
+                client_id=user.client_id, name__iexact=user.department.strip(), deleted_at__isnull=True
+            ).first()
+            if not dept:
+                dept = Department.objects.create(client_id=user.client_id, name=user.department.strip())
+
+        desig = Designation.objects.filter(
+            client_id=user.client_id, name__iexact="Employee", deleted_at__isnull=True
+        ).first()
+        if not desig:
+            desig = Designation.objects.create(client_id=user.client_id, name="Employee")
+
+        loc = None
+        if user.location and user.location.strip():
+            loc = Location.objects.filter(
+                client_id=user.client_id, name__iexact=user.location.strip(), deleted_at__isnull=True
+            ).first()
+            if not loc:
+                loc = Location.objects.create(client_id=user.client_id, name=user.location.strip())
+
+        emp = Employee.objects.filter(
+            client_id=user.client_id, email__iexact=user.email, deleted_at__isnull=True
+        ).first()
+
+        if not emp:
+            try:
+                code = allocate_number(user.client, "EMP")
+            except Exception:
+                code = f"EMP-{(Employee.objects.filter(client_id=user.client_id).count() + 1):03d}"
+            emp = Employee.objects.create(
+                client_id=user.client_id,
+                employee_code=code,
+                name=user.name or user.email,
+                email=user.email,
+                phone=user.phone or "",
+                department=dept,
+                designation=desig,
+                location=loc,
+                joining_date=user.joined_date or timezone.localdate(),
+                status="Active" if user.status in ("Active", "Invited") else "Inactive",
+            )
+        user.employee = emp
+        user.save(update_fields=["employee"])
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -281,10 +366,16 @@ class EmployeeViewSet(TenantModelViewSet):
                 if value and getattr(existing, field) != value:
                     setattr(existing, field, value)
                     updates.append(field)
-            if existing.status != "Active" or not existing.is_active:
-                existing.status = "Active"
-                existing.is_active = True
-                updates.extend(["status", "is_active"])
+            if employee.status in ["Resigned", "Terminated", "Exited", "Suspended"]:
+                if existing.is_active or existing.status != "Inactive":
+                    existing.is_active = False
+                    existing.status = "Inactive"
+                    updates.extend(["status", "is_active"])
+            else:
+                if existing.status != "Active" or not existing.is_active:
+                    existing.status = "Active"
+                    existing.is_active = True
+                    updates.extend(["status", "is_active"])
             if updates:
                 updates.append("updated_at")
                 existing.save(update_fields=list(dict.fromkeys(updates)))
@@ -511,7 +602,13 @@ class AttendanceViewSet(TenantModelViewSet):
         "department": "employee__department__name",
         "date": "work_date",
     }
-    permission_map = {"read": ["view_team_attendance"], "write": ["mark_attendance"]}
+    permission_map = {
+        "read": ["view_team_attendance"],
+        "write": ["mark_attendance"],
+        "today": [],
+        "punch": [],
+        "punch_timeline": [],
+    }
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -649,6 +746,141 @@ class AttendanceViewSet(TenantModelViewSet):
         )[:200]
         return Response(envelope(AuditLogSerializer(rows, many=True).data))
 
+    def _resolve_employee(self, request, employee_id=None):
+        client_id = getattr(request, "client_id", None) or getattr(request.user, "client_id", None)
+        if employee_id:
+            try:
+                emp = Employee.objects.filter(
+                    pk=employee_id, client_id=client_id, deleted_at__isnull=True
+                ).first()
+                if emp:
+                    return emp
+            except (ValueError, TypeError, Exception):
+                pass
+            return Employee.objects.filter(
+                employee_code=employee_id, client_id=client_id, deleted_at__isnull=True
+            ).first()
+
+        if getattr(request.user, "employee", None):
+            return request.user.employee
+
+        if getattr(request.user, "email", None):
+            emp = Employee.objects.filter(
+                client_id=client_id, email__iexact=request.user.email, deleted_at__isnull=True
+            ).first()
+            if emp:
+                if not getattr(request.user, "employee_id", None) and hasattr(request.user, "save"):
+                    request.user.employee = emp
+                    request.user.save(update_fields=["employee"])
+                return emp
+
+        from apps.hrms.models import Designation
+        desig = Designation.objects.filter(client_id=client_id, name__iexact="Employee").first()
+        if not desig:
+            desig = Designation.objects.create(client_id=client_id, name="Employee")
+        code = f"EMP-{(Employee.objects.filter(client_id=client_id).count() + 1):03d}"
+        emp = Employee.objects.create(
+            client_id=client_id,
+            employee_code=code,
+            name=getattr(request.user, "name", "") or request.user.email,
+            email=request.user.email,
+            phone=getattr(request.user, "phone", "") or "",
+            designation=desig,
+            joining_date=timezone.localdate(),
+            status="Active",
+        )
+        request.user.employee = emp
+        request.user.save(update_fields=["employee"])
+        return emp
+
+    @action(detail=False, methods=["get"])
+    def today(self, request):
+        """GET /hrms/attendance/today/ -- punch state for current employee today."""
+        employee_id = request.query_params.get("employeeId")
+        employee = self._resolve_employee(request, employee_id)
+        if not employee:
+            return Response({
+                "has_employee": False,
+                "status": "Not Punched In",
+                "is_punched_in": False,
+                "punches": [],
+                "formatted_working_time": "00h 00m",
+                "working_seconds": 0,
+                "working_hours": 0.0,
+                "late_minutes": 0,
+                "first_punch": None,
+                "last_punch": None,
+                "date": timezone.localdate().isoformat(),
+            })
+        status_data = services.get_today_punch_status(self.get_client_id(), employee)
+        return Response(status_data)
+
+    @action(detail=False, methods=["post"])
+    def punch(self, request):
+        """POST /hrms/attendance/punch/ -- record Punch In or Punch Out."""
+        punch_type = (
+            request.data.get("punch_type")
+            or request.data.get("punchType")
+            or request.data.get("type")
+        )
+        if not punch_type:
+            raise ValidationFailed(
+                "Punch type ('IN' or 'OUT') is required.",
+                field_errors={"punch_type": ["Required."]},
+            )
+
+        employee = self._resolve_employee(
+            request, request.data.get("employeeId") or request.data.get("employee_id")
+        )
+        if not employee:
+            raise ValidationFailed(
+                "No employee profile linked to current user account.",
+                code="NO_EMPLOYEE",
+            )
+
+        remark = request.data.get("remark") or request.data.get("notes")
+        source = request.data.get("source") or "web"
+        early_reason = (
+            request.data.get("earlyReason")
+            or request.data.get("early_reason")
+            or request.data.get("reason")
+        )
+        request_regularization = bool(
+            request.data.get("requestRegularization")
+            or request.data.get("request_regularization")
+        )
+
+        punch_obj, status_data = services.record_punch(
+            client=self.get_client_id(),
+            employee=employee,
+            punch_type=punch_type,
+            source=source,
+            remark=remark,
+            early_reason=early_reason,
+            request_regularization=request_regularization,
+            user=request.user,
+        )
+        return Response(
+            status_data,
+            status=status.HTTP_201_CREATED if punch_obj else status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["get"], url_path="punch-timeline")
+    def punch_timeline(self, request):
+        employee_id = request.query_params.get("employeeId")
+        date_str = request.query_params.get("date")
+        employee = self._resolve_employee(request, employee_id)
+        if not employee:
+            return Response([])
+        work_date = timezone.localdate()
+        if date_str:
+            try:
+                work_date = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+            except ValueError:
+                pass
+        status_data = services.get_today_punch_status(self.get_client_id(), employee, work_date=work_date)
+        return Response(status_data.get("punches", []))
+
 
 class RegularizationViewSet(TenantModelViewSet):
     queryset = AttendanceRegularization.objects.select_related("employee")
@@ -662,38 +894,88 @@ class RegularizationViewSet(TenantModelViewSet):
 
     @transaction.atomic
     def perform_update(self, serializer):
-        """``{ approved, remark }`` -- an approval rewrites the attendance row."""
+        """``{ approved, remark, status }`` -- an approval rewrites the attendance row."""
         approved = self.request.data.get("approved")
-        instance = serializer.instance
+        status_val = self.request.data.get("status")
+        if approved is True or (status_val and str(status_val).lower() == "approved"):
+            is_approved = True
+        elif approved is False or (status_val and str(status_val).lower() == "rejected"):
+            is_approved = False
+        else:
+            is_approved = None
+
         row = super().perform_update(serializer)
 
-        if approved is not None:
-            row.status = "Approved" if approved else "Rejected"
-            row.approver = self.request.user
+        if is_approved is not None:
+            row.status = "Approved" if is_approved else "Rejected"
+            row.approver = self.request.user if getattr(self.request.user, "is_authenticated", False) else None
             row.decided_at = timezone.now()
             row.remark = self.request.data.get("remark", row.remark)
             row.save(update_fields=["status", "approver", "decided_at", "remark", "updated_at"])
 
-            if approved:
+            if is_approved:
+                req_status = row.requested_status or "Present"
                 services.mark_attendance(
-                    client=self.request.user.client,
+                    client=getattr(self.request.user, "client", None) or row.client,
                     employee=row.employee,
                     work_date=row.work_date,
                     check_in=row.requested_check_in,
                     check_out=row.requested_check_out,
-                    status=row.requested_status,
-                    remark=f"Regularized: {row.reason}",
+                    status=req_status,
+                    remark=f"Regularized: {row.reason or ''}".strip(),
                     source="regularization",
-                    user=self.request.user,
+                    user=self.request.user if getattr(self.request.user, "is_authenticated", False) else None,
                 )
         return row
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def approve(self, request, pk=None):
+        row = self.get_object()
+        row.status = "Approved"
+        row.approver = request.user if getattr(request.user, "is_authenticated", False) else None
+        row.decided_at = timezone.now()
+        row.remark = request.data.get("remark", row.remark)
+        row.save(update_fields=["status", "approver", "decided_at", "remark", "updated_at"])
+
+        req_status = row.requested_status or "Present"
+        services.mark_attendance(
+            client=row.client,
+            employee=row.employee,
+            work_date=row.work_date,
+            check_in=row.requested_check_in,
+            check_out=row.requested_check_out,
+            status=req_status,
+            remark=f"Regularized: {row.reason or ''}".strip(),
+            source="regularization",
+            user=request.user if getattr(request.user, "is_authenticated", False) else None,
+        )
+        self.write_audit("approve", row, description="Attendance regularization approved")
+        return Response(self.get_serializer(row).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        row = self.get_object()
+        row.status = "Rejected"
+        row.approver = request.user if getattr(request.user, "is_authenticated", False) else None
+        row.decided_at = timezone.now()
+        row.remark = request.data.get("remark", row.remark)
+        row.save(update_fields=["status", "approver", "decided_at", "remark", "updated_at"])
+        self.write_audit("reject", row, description="Attendance regularization rejected")
+        return Response(self.get_serializer(row).data)
 
 
 class FlexibilityPolicyView(APIView):
     """``GET/PUT /hrms/attendance/flexibility/``."""
 
     permission_classes = [HasModulePermission]
-    permission_map = {"read": ["view_team_attendance"], "write": ["mark_attendance"]}
+    permission_map = {
+        "read": ["view_team_attendance"],
+        "write": ["mark_attendance"],
+        "today": [],
+        "punch": [],
+        "punch_timeline": [],
+    }
 
     def get(self, request):
         return Response(services.flexibility_policy(request.client_id))
@@ -1897,6 +2179,20 @@ class TerminationViewSet(TenantModelViewSet):
     filter_map = {"employeeId": "employee_id"}
     permission_map = {"read": ["view_staff"], "write": ["delete_staff"]}
 
+    def perform_create(self, serializer):
+        row = super().perform_create(serializer)
+        services.process_employee_separation(
+            row.employee, separation_type="Terminated", last_working_day=row.last_working_day, user=self.request.user
+        )
+        return row
+
+    def perform_update(self, serializer):
+        row = super().perform_update(serializer)
+        services.process_employee_separation(
+            row.employee, separation_type="Terminated", last_working_day=row.last_working_day, user=self.request.user
+        )
+        return row
+
 
 class ResignationViewSet(TenantModelViewSet):
     queryset = Resignation.objects.select_related("employee").prefetch_related("checklist")
@@ -1907,6 +2203,14 @@ class ResignationViewSet(TenantModelViewSet):
     ordering = ["-submitted_on"]
     filter_map = {"employeeId": "employee_id"}
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_update(self, serializer):
+        row = super().perform_update(serializer)
+        if row.status in ["Approved", "Completed", "Exited"]:
+            services.process_employee_separation(
+                row.employee, separation_type="Resigned", last_working_day=row.last_working_day, user=self.request.user
+            )
+        return row
 
 
 class ComplaintViewSet(TenantModelViewSet):
@@ -1958,3 +2262,412 @@ class HrmsSettingsView(APIView):
             defaults={"value": request.data, "updated_by": request.user},
         )
         return Response(row.value)
+
+
+# =============================================================================
+# Textile Operational HR & Commercial ViewSets (Oscar Letter Pad Scope)
+# =============================================================================
+
+class SalespersonIncentiveSchemeViewSet(TenantModelViewSet):
+    queryset = SalespersonIncentiveScheme.objects.all()
+    serializer_class = SalespersonIncentiveSchemeSerializer
+    audit_entity_type = "SalespersonIncentiveScheme"
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+
+class SalespersonIncentiveViewSet(TenantModelViewSet):
+    queryset = SalespersonIncentiveAccrual.objects.select_related("employee", "scheme")
+    serializer_class = SalespersonIncentiveAccrualSerializer
+    audit_entity_type = "SalespersonIncentiveAccrual"
+    permission_classes = [HasModulePermission]
+    permission_map = {
+        "read": ["view_staff"],
+        "write": ["edit_staff"],
+        "approve": ["approve_payroll"],
+        "calculate_quarterly": ["edit_staff"],
+        "hold_payout": ["approve_payroll"],
+        "release_payout": ["approve_payroll"],
+    }
+
+    @action(detail=False, methods=["POST"], url_path="calculate-quarterly")
+    def calculate_quarterly(self, request):
+        from apps.sales.models import SalesInvoice, SalesReturn
+        import calendar
+        quarter = int(request.data.get("quarter", (timezone.localdate().month - 1) // 3 + 1))
+        year = int(request.data.get("year", timezone.localdate().year))
+        employee_id = request.data.get("employee_id")
+
+        start_month = (quarter - 1) * 3 + 1
+        end_month = quarter * 3
+        start_date = datetime(year, start_month, 1).date()
+        last_day = calendar.monthrange(year, end_month)[1]
+        end_date = datetime(year, end_month, last_day).date()
+        period_name = f"Q{quarter} {year}"
+
+        schemes = SalespersonIncentiveScheme.objects.filter(
+            client_id=request.client_id, is_active=True
+        ).prefetch_related("applicable_salespersons")
+
+        salespersons_qs = Employee.objects.filter(client_id=request.client_id, status="Active")
+        if employee_id:
+            salespersons_qs = salespersons_qs.filter(id=employee_id)
+
+        results = []
+        for sp in salespersons_qs:
+            scheme = schemes.filter(applicable_salespersons=sp).first() or schemes.first()
+            # Sum gross sales using correct DocumentHeader doc_date and total
+            invoices = SalesInvoice.objects.filter(
+                client_id=request.client_id,
+                doc_date__range=[start_date, end_date],
+            ).filter(
+                Q(salesperson_fk=sp) | Q(salesperson__iexact=sp.name)
+            ).exclude(status__in=["Cancelled", "Draft"])
+
+            gross_sales = sum((inv.total for inv in invoices), ZERO)
+
+            # Sum sales returns using doc_date and total
+            returns = SalesReturn.objects.filter(
+                client_id=request.client_id,
+                doc_date__range=[start_date, end_date],
+            ).filter(
+                Q(salesperson_fk=sp) | Q(salesperson__iexact=sp.name)
+            ).exclude(status__in=["Cancelled", "Draft"])
+            returns_deduction = sum((ret.total for ret in returns), ZERO)
+
+            net_sales = max(ZERO, gross_sales - returns_deduction)
+
+            applicable_rate = D("0.0")
+            calculated_incentive = ZERO
+
+            if scheme:
+                if scheme.slab_type == "FLAT":
+                    applicable_rate = D(str(scheme.flat_rate_percent))
+                    calculated_incentive = round2(net_sales * (applicable_rate / D("100.0")))
+                else:
+                    slabs = scheme.slabs or []
+                    for slab in sorted(slabs, key=lambda s: float(s.get("min_amount", 0))):
+                        min_amt = D(str(slab.get("min_amount", 0)))
+                        if net_sales >= min_amt:
+                            applicable_rate = D(str(slab.get("rate_percent", 0)))
+                    calculated_incentive = round2(net_sales * (applicable_rate / D("100.0")))
+
+            # Check for bad-debt overdue invoices (>90 days past due date with balance due)
+            overdue_cutoff = timezone.localdate() - timedelta(days=90)
+            overdue_invoices = SalesInvoice.objects.filter(
+                client_id=request.client_id,
+                due_date__lte=overdue_cutoff,
+            ).filter(
+                Q(salesperson_fk=sp) | Q(salesperson__iexact=sp.name)
+            ).exclude(status__in=["Cancelled", "Draft"])
+
+            has_bad_debt = any(inv.balance_due > ZERO for inv in overdue_invoices)
+            initial_status = "HELD" if has_bad_debt else "ACCRUED"
+            hold_reason = "Commercial policy hold: overdue unpaid customer invoices (>90 days)" if has_bad_debt else ""
+
+            accrual, _ = SalespersonIncentiveAccrual.objects.update_or_create(
+                client_id=request.client_id,
+                employee=sp,
+                period_name=period_name,
+                defaults={
+                    "scheme": scheme,
+                    "period_type": "QUARTERLY",
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "gross_sales": gross_sales,
+                    "returns_deduction": returns_deduction,
+                    "net_eligible_sales": net_sales,
+                    "applicable_rate": applicable_rate,
+                    "calculated_incentive": calculated_incentive,
+                    "status": initial_status,
+                    "hold_reason": hold_reason,
+                },
+            )
+            results.append(SalespersonIncentiveAccrualSerializer(accrual).data)
+
+        return Response({"period_name": period_name, "count": len(results), "accruals": results})
+
+    @action(detail=True, methods=["POST"], url_path="hold")
+    def hold_payout(self, request, pk=None):
+        accrual = self.get_object()
+        accrual.status = "HELD"
+        accrual.hold_reason = request.data.get("reason", "Management hold")
+        accrual.save(update_fields=["status", "hold_reason", "updated_at"])
+        return Response(self.get_serializer(accrual).data)
+
+    @action(detail=True, methods=["POST"], url_path="release")
+    def release_payout(self, request, pk=None):
+        accrual = self.get_object()
+        accrual.status = "ACCRUED"
+        accrual.hold_reason = ""
+        accrual.save(update_fields=["status", "hold_reason", "updated_at"])
+        return Response(self.get_serializer(accrual).data)
+
+    @action(detail=True, methods=["POST"], url_path="approve")
+    def approve_payout(self, request, pk=None):
+        from apps.accounting.services import post_incentive_accrual
+        accrual = self.get_object()
+        accrual.status = "APPROVED"
+        accrual.approved_by = request.user
+        accrual.approved_at = timezone.now()
+        accrual.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
+        try:
+            post_incentive_accrual(accrual, user=request.user)
+        except Exception:
+            pass
+        return Response(self.get_serializer(accrual).data)
+
+    @action(detail=True, methods=["POST"], url_path="mark-paid")
+    def mark_paid(self, request, pk=None):
+        accrual = self.get_object()
+        accrual.status = "PAID"
+        accrual.paid_at = timezone.now()
+        accrual.save(update_fields=["status", "paid_at", "updated_at"])
+        return Response(self.get_serializer(accrual).data)
+
+
+class AgencyProductionMonitoringViewSet(TenantModelViewSet):
+    queryset = DailyAgencyProductionEntry.objects.select_related("employee", "agency", "job_work_order")
+    serializer_class = DailyAgencyProductionEntrySerializer
+    audit_entity_type = "DailyAgencyProductionEntry"
+    permission_classes = [HasModulePermission]
+
+    def perform_create(self, serializer):
+        entry = super().perform_create(serializer)
+        if entry.job_work_order:
+            jwo = entry.job_work_order
+            updates = []
+            if not jwo.assigned_employee_id:
+                jwo.assigned_employee = entry.employee
+                updates.append("assigned_employee")
+            if jwo.planned_qty and entry.cumulative_produced >= jwo.planned_qty:
+                if jwo.status not in ["Completed", "Closed"]:
+                    jwo.status = "QC Pending"
+                    updates.append("status")
+            elif entry.produced_quantity > ZERO and jwo.status == "Sent":
+                jwo.status = "In-Process"
+                updates.append("status")
+            if updates:
+                updates.append("updated_at")
+                jwo.save(update_fields=updates)
+        return entry
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    @action(detail=False, methods=["GET"], url_path="today-entries")
+    def today_entries(self, request):
+        today = timezone.localdate()
+        qs = self.get_queryset().filter(entry_date=today)
+        emp_id = request.query_params.get("employee")
+        if emp_id:
+            qs = qs.filter(employee_id=emp_id)
+        return Response(self.get_serializer(qs, many=True).data)
+
+    @action(detail=False, methods=["POST"], url_path="submit-daily-entry")
+    def submit_daily_entry(self, request):
+        data = request.data.copy()
+        emp = None
+        emp_id = data.get("employee") or data.get("employeeId")
+        if emp_id:
+            emp = Employee.objects.filter(client_id=request.client_id, id=emp_id).first()
+        if not emp:
+            emp = Employee.objects.filter(client_id=request.client_id, user=request.user).first()
+        if not emp:
+            emp = Employee.objects.filter(client_id=request.client_id).first()
+
+        agency_id = data.get("agency") or data.get("agencyId")
+        from apps.masters.models import Agency
+        agency = Agency.objects.filter(client_id=request.client_id, id=agency_id).first()
+        if not agency:
+            return Response({"error": "Agency not found"}, status=status.HTTP_400_BAD_REQUEST)
+
+        jwo_id = data.get("job_work_order") or data.get("jobWorkOrderId")
+        from apps.jobwork.models import JobWorkOrder
+        jwo = JobWorkOrder.objects.filter(client_id=request.client_id, id=jwo_id).first() if jwo_id else None
+
+        entry_date = data.get("entry_date") or timezone.localdate()
+        produced_qty = D(str(data.get("produced_quantity", 0)))
+        opening_qty = D(str(data.get("opening_pending_quantity", 0)))
+        good_qty = D(str(data.get("good_quantity", produced_qty)))
+        reject_qty = D(str(data.get("reject_quantity", 0)))
+        reprocess_qty = D(str(data.get("reprocess_quantity", 0)))
+
+        last_entry = DailyAgencyProductionEntry.objects.filter(
+            client_id=request.client_id,
+            agency=agency,
+            job_work_order=jwo,
+        ).order_by("-entry_date", "-entered_at").first()
+
+        cumulative = (last_entry.cumulative_produced if last_entry else ZERO) + produced_qty
+        remaining = max(ZERO, opening_qty - produced_qty)
+
+        entry = DailyAgencyProductionEntry.objects.create(
+            client_id=request.client_id,
+            employee=emp,
+            agency=agency,
+            job_work_order=jwo,
+            work_instruction_no=data.get("work_instruction_no", jwo.jwo_no if jwo else ""),
+            entry_date=entry_date,
+            opening_pending_quantity=opening_qty,
+            produced_quantity=produced_qty,
+            good_quantity=good_qty,
+            reject_quantity=reject_qty,
+            reprocess_quantity=reprocess_qty,
+            cumulative_produced=cumulative,
+            remaining_balance=remaining,
+            uom=data.get("uom", "Meter"),
+            photo_url=data.get("photo_url", ""),
+            remarks=data.get("remarks", ""),
+        )
+        return Response(self.get_serializer(entry).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["GET"], url_path="agency-summary")
+    def agency_summary(self, request):
+        from apps.masters.models import Agency
+        from django.db.models import Sum, Max
+        agencies = Agency.objects.filter(client_id=request.client_id, is_active=True)
+        summaries = []
+        for ag in agencies:
+            entries = DailyAgencyProductionEntry.objects.filter(client_id=request.client_id, agency=ag)
+            agg = entries.aggregate(
+                total_produced=Sum("produced_quantity"),
+                total_good=Sum("good_quantity"),
+                total_reject=Sum("reject_quantity"),
+                latest_date=Max("entry_date"),
+            )
+            latest_entry = entries.order_by("-entry_date", "-entered_at").first()
+            summaries.append({
+                "agency_id": str(ag.id),
+                "agency_name": ag.name,
+                "agency_code": ag.code,
+                "total_produced": float(agg["total_produced"] or 0),
+                "total_good": float(agg["total_good"] or 0),
+                "total_reject": float(agg["total_reject"] or 0),
+                "latest_entry_date": agg["latest_date"].isoformat() if agg["latest_date"] else None,
+                "remaining_balance": float(latest_entry.remaining_balance if latest_entry else 0),
+                "entry_count": entries.count(),
+            })
+        return Response(summaries)
+
+    @action(detail=False, methods=["GET", "POST"], url_path="assignments")
+    def assignments(self, request):
+        if request.method == "POST":
+            serializer = AgencyStaffAssignmentSerializer(data=request.data, context={"request": request})
+            serializer.is_valid(raise_exception=True)
+            instance = serializer.save(client_id=request.client_id)
+            return Response(AgencyStaffAssignmentSerializer(instance).data, status=status.HTTP_201_CREATED)
+        qs = AgencyStaffAssignment.objects.filter(client_id=request.client_id).select_related("employee", "agency")
+        return Response(AgencyStaffAssignmentSerializer(qs, many=True).data)
+
+
+class BrokerCommissionViewSet(TenantModelViewSet):
+    queryset = BrokerCommissionRecord.objects.select_related("broker", "invoice", "party", "salesperson")
+    serializer_class = BrokerCommissionRecordSerializer
+    audit_entity_type = "BrokerCommissionRecord"
+    permission_classes = [HasModulePermission]
+    permission_map = {
+        "read": ["view_staff"],
+        "write": ["edit_staff"],
+        "approve": ["approve_payroll"],
+        "mark_payable": ["edit_staff"],
+        "mark_paid": ["approve_payroll"],
+        "hold": ["edit_staff"],
+    }
+
+    @action(detail=True, methods=["POST"], url_path="approve")
+    def approve(self, request, pk=None):
+        item = self.get_object()
+        item.status = "Approved"
+        item.approved_by = request.user
+        item.approved_at = timezone.now()
+        item.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["POST"], url_path="mark-payable")
+    def mark_payable(self, request, pk=None):
+        item = self.get_object()
+        item.status = "Payable"
+        item.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["POST"], url_path="mark-paid")
+    def mark_paid(self, request, pk=None):
+        item = self.get_object()
+        item.status = "Paid"
+        item.paid_at = timezone.now()
+        item.paid_amount = item.commission_amount
+        item.save(update_fields=["status", "paid_at", "paid_amount", "updated_at"])
+        return Response(self.get_serializer(item).data)
+
+    @action(detail=True, methods=["POST"], url_path="hold")
+    def hold(self, request, pk=None):
+        item = self.get_object()
+        item.status = "Hold"
+        item.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(item).data)
+
+
+class CommercialLeakageViewSet(TenantModelViewSet):
+    queryset = PayrollCommercialAllocation.objects.select_related("employee")
+    serializer_class = PayrollCommercialAllocationSerializer
+    audit_entity_type = "PayrollCommercialAllocation"
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    @action(detail=False, methods=["GET"], url_path="annual-summary")
+    def annual_summary(self, request):
+        from apps.sales.models import SalesInvoice, SalesReturn
+        from apps.sales.models import BrokerCommission as SalesBrokerCommission
+        year = int(request.query_params.get("year", timezone.localdate().year))
+        start_date = datetime(year, 1, 1).date()
+        end_date = datetime(year, 12, 31).date()
+
+        invoices = SalesInvoice.objects.filter(
+            client_id=request.client_id, invoice_date__range=[start_date, end_date]
+        ).exclude(status__in=["Cancelled", "Draft"])
+        gross_sales = sum((inv.total_amount for inv in invoices), ZERO)
+
+        returns = SalesReturn.objects.filter(
+            client_id=request.client_id, return_date__range=[start_date, end_date]
+        ).exclude(status__in=["Cancelled", "Draft"])
+        sales_returns = sum((ret.total_amount for ret in returns), ZERO)
+
+        net_sales = max(ZERO, gross_sales - sales_returns)
+
+        broker_commissions = BrokerCommissionRecord.objects.filter(
+            client_id=request.client_id, invoice_date__range=[start_date, end_date]
+        ).exclude(status__in=["Cancelled"])
+        total_brokerage = sum((bc.commission_amount for bc in broker_commissions), ZERO)
+        if total_brokerage == ZERO:
+            sales_bc = SalesBrokerCommission.objects.filter(
+                client_id=request.client_id, invoice_date__range=[start_date, end_date]
+            ).exclude(status__in=["Cancelled"])
+            total_brokerage = sum((bc.commission_amount for bc in sales_bc), ZERO)
+
+        accruals = SalespersonIncentiveAccrual.objects.filter(
+            client_id=request.client_id, start_date__gte=start_date, end_date__lte=end_date
+        ).exclude(status__in=["DRAFT", "HELD"])
+        total_incentives = sum((acc.calculated_incentive for acc in accruals), ZERO)
+
+        payslips = Payslip.objects.filter(
+            client_id=request.client_id,
+            payroll_run__period_start__gte=start_date,
+            payroll_run__period_end__lte=end_date,
+        ).exclude(status__in=["Cancelled"])
+        total_salary = sum((ps.gross_pay for ps in payslips), ZERO)
+
+        total_leakage = sales_returns + total_brokerage + total_incentives + total_salary
+        net_margin = net_sales - (total_brokerage + total_incentives + total_salary)
+        leakage_percentage = round((float(total_leakage) / float(gross_sales) * 100), 2) if gross_sales > 0 else 0
+
+        return Response({
+            "year": year,
+            "gross_sales": float(gross_sales),
+            "sales_returns": float(sales_returns),
+            "net_sales": float(net_sales),
+            "total_brokerage": float(total_brokerage),
+            "total_incentives": float(total_incentives),
+            "total_salary": float(total_salary),
+            "total_commercial_leakage": float(total_leakage),
+            "net_margin": float(net_margin),
+            "leakage_percentage": leakage_percentage,
+        })

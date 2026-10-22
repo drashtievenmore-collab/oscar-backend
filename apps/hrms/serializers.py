@@ -62,6 +62,12 @@ from .models import (
     Training,
     TrainingParticipant,
     WorkingDay,
+    SalespersonIncentiveScheme,
+    SalespersonIncentiveAccrual,
+    AgencyStaffAssignment,
+    DailyAgencyProductionEntry,
+    PayrollCommercialAllocation,
+    BrokerCommissionRecord,
 )
 
 
@@ -248,7 +254,7 @@ class RegularizationSerializer(BaseModelSerializer):
             "requestedCheckOut", "requestedStatus", "reason", "status",
             "approver", "decided_at", "remark", "created_at",
         ]
-        read_only_fields = ["status", "approver", "decided_at", "created_at"]
+        read_only_fields = ["approver", "decided_at", "created_at"]
 
 
 # ---------------------------------------------------------------------------
@@ -1017,3 +1023,117 @@ class ComplaintSerializer(BaseModelSerializer):
 
     def get_againstName(self, complaint):
         return complaint.against_employee.name if complaint.against_employee_id else None
+
+
+# =============================================================================
+# Textile Operational HR & Commercial Serializers (Oscar Letter Pad Scope)
+# =============================================================================
+
+class SalespersonIncentiveSchemeSerializer(BaseModelSerializer):
+    salespersonCount = serializers.IntegerField(
+        source="applicable_salespersons.count", read_only=True
+    )
+
+    class Meta:
+        model = SalespersonIncentiveScheme
+        fields = [
+            "id", "name", "code", "basis", "frequency", "slab_type",
+            "slabs", "flat_rate_percent", "deduct_returns", "deduct_bad_debts",
+            "is_active", "description", "salespersonCount", "applicable_salespersons",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class SalespersonIncentiveAccrualSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee", required=False)
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    schemeName = serializers.CharField(source="scheme.name", read_only=True)
+
+    class Meta:
+        model = SalespersonIncentiveAccrual
+        fields = [
+            "id", "employee", "employeeId", "employeeName", "employeeCode", "scheme", "schemeName",
+            "period_type", "period_name", "start_date", "end_date",
+            "gross_sales", "returns_deduction", "net_eligible_sales",
+            "applicable_rate", "calculated_incentive", "status", "hold_reason",
+            "approved_by", "approved_at", "paid_at", "journal_entry", "notes",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class AgencyStaffAssignmentSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee", required=False)
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    agencyId = serializers.UUIDField(source="agency.id", read_only=True)
+    agencyName = serializers.CharField(source="agency.name", read_only=True)
+    agencyCode = serializers.CharField(source="agency.code", read_only=True)
+
+    class Meta:
+        model = AgencyStaffAssignment
+        fields = [
+            "id", "employee", "employeeId", "employeeName", "agency", "agencyId",
+            "agencyName", "agencyCode", "assigned_from", "assigned_to", "is_active",
+            "role_description", "active_orders", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class DailyAgencyProductionEntrySerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee", required=False)
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    agencyId = serializers.UUIDField(source="agency.id", read_only=True)
+    agencyName = serializers.CharField(source="agency.name", read_only=True)
+    jobWorkOrderNo = serializers.CharField(source="job_work_order.jwo_no", read_only=True)
+
+    class Meta:
+        model = DailyAgencyProductionEntry
+        fields = [
+            "id", "employee", "employeeId", "employeeName", "agency", "agencyId",
+            "agencyName", "job_work_order", "jobWorkOrderNo", "work_instruction_no",
+            "entry_date", "opening_pending_quantity", "produced_quantity",
+            "good_quantity", "reject_quantity", "reprocess_quantity",
+            "cumulative_produced", "remaining_balance", "uom",
+            "inspection_photo", "photo_url", "remarks", "entered_at",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["entered_at", "created_at", "updated_at"]
+
+
+class PayrollCommercialAllocationSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee", required=False)
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+
+    class Meta:
+        model = PayrollCommercialAllocation
+        fields = [
+            "id", "employee", "employeeId", "employeeName", "employeeCode",
+            "period_name", "start_date", "end_date", "role_type",
+            "salary_cost", "incentive_cost", "total_payroll_cost",
+            "allocated_lot_cost", "lot_number", "allocated_sales_amount",
+            "notes", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class BrokerCommissionRecordSerializer(BaseModelSerializer):
+    brokerName = serializers.CharField(source="broker.name", read_only=True)
+    brokerCode = serializers.CharField(source="broker.code", read_only=True)
+    partyName = serializers.CharField(source="party.name", read_only=True)
+    invoiceNumber = serializers.CharField(source="invoice.invoice_number", read_only=True)
+    salespersonName = serializers.CharField(source="salesperson.name", read_only=True)
+
+    class Meta:
+        model = BrokerCommissionRecord
+        fields = [
+            "id", "commission_number", "broker", "brokerName", "brokerCode",
+            "invoice", "invoiceNumber", "party", "partyName", "salesperson", "salespersonName",
+            "invoice_date", "invoice_amount", "commission_basis", "commission_type",
+            "rate", "commission_amount", "paid_amount", "status",
+            "approved_by", "approved_at", "paid_at", "notes",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]

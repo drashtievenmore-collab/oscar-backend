@@ -38,18 +38,24 @@ router.register(
     "payroll/advances", views.SalaryAdvanceViewSet, basename="hrms-salary-advances"
 )
 router.register("payroll", views.PayslipViewSet, basename="hrms-payroll")
+router.register("incentive-schemes", views.SalespersonIncentiveSchemeViewSet, basename="hrms-incentive-schemes")
+router.register("incentives", views.SalespersonIncentiveViewSet, basename="hrms-incentives")
+router.register("agency-monitoring", views.AgencyProductionMonitoringViewSet, basename="hrms-agency-monitoring")
+router.register("broker-commissions", views.BrokerCommissionViewSet, basename="hrms-broker-commissions")
+router.register("commercial-leakage", views.CommercialLeakageViewSet, basename="hrms-commercial-leakage")
 
-router.register("jobs", views.JobViewSet, basename="hrms-jobs")
-router.register("candidates", views.CandidateViewSet, basename="hrms-candidates")
-router.register("applications", views.ApplicationViewSet, basename="hrms-applications")
-router.register("interviews", views.InterviewViewSet, basename="hrms-interviews")
-router.register("offers", views.OfferViewSet, basename="hrms-offers")
-router.register("onboarding", views.OnboardingViewSet, basename="hrms-onboarding")
-router.register(
-    "recruitment/questions",
-    views.ScreeningQuestionViewSet,
-    basename="hrms-screening-questions",
-)
+# =============================================================================
+# COMMENTED OUT PER OSCAR LETTER PAD SCOPE (Kept for reference, do not delete):
+# =============================================================================
+# router.register("jobs", views.JobViewSet, basename="hrms-jobs")
+# router.register("candidates", views.CandidateViewSet, basename="hrms-candidates")
+# router.register("applications", views.ApplicationViewSet, basename="hrms-applications")
+# router.register("interviews", views.InterviewViewSet, basename="hrms-interviews")
+# router.register("offers", views.OfferViewSet, basename="hrms-offers")
+# router.register("onboarding", views.OnboardingViewSet, basename="hrms-onboarding")
+# router.register("recruitment/questions", views.ScreeningQuestionViewSet, basename="hrms-screening-questions")
+# router.register("meetings", views.CompanyMeetingViewSet, basename="hrms-meetings")
+# router.register("meeting-rooms", views.MeetingRoomViewSet, basename="hrms-meeting-rooms")
 
 router.register(
     "performance/cycles", views.AppraisalCycleViewSet, basename="hrms-appraisal-cycles"
@@ -100,17 +106,18 @@ urlpatterns = [
         views.FlexibilityPolicyView.as_view(),
         name="hrms-attendance-flexibility",
     ),
-    path(
-        "recruitment/funnel/",
-        views.RecruitmentFunnelView.as_view(),
-        {"section": "funnel"},
-        name="hrms-recruitment-funnel",
-    ),
-    path(
-        "recruitment/dashboard/",
-        views.RecruitmentFunnelView.as_view(),
-        name="hrms-recruitment-dashboard",
-    ),
+    # Recruitment views commented out per Oscar letter pad scope (kept for reference, do not remove):
+    # path(
+    #     "recruitment/funnel/",
+    #     views.RecruitmentFunnelView.as_view(),
+    #     {"section": "funnel"},
+    #     name="hrms-recruitment-funnel",
+    # ),
+    # path(
+    #     "recruitment/dashboard/",
+    #     views.RecruitmentFunnelView.as_view(),
+    #     name="hrms-recruitment-dashboard",
+    # ),
     path(
         "performance/dashboard/",
         views.PerformanceDashboardView.as_view(),
