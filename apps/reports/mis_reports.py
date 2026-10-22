@@ -117,6 +117,19 @@ def annual_commercial_leakage(client_id, date_from=None, date_to=None):
     deductions = party_discount + sales_incentive + brokerage + sales_returns + sampling_cost + transport_support
     net_contribution = gross_sales - deductions
 
+    # 9. Payroll salary cost (PDF §02: annual cost of salary against sales).
+    # Fixed salary from approved/paid payslips. Shown for visibility only;
+    # §15 defines net contribution without it.
+    from apps.hrms.models import Payslip
+
+    salary_cost = D(Payslip.objects.filter(
+        client_id=client_id,
+        period_month__gte=date_from.replace(day=1),
+        period_month__lte=date_to,
+        status__in=["Approved", "Paid"],
+        deleted_at__isnull=True,
+    ).aggregate(val=Coalesce(Sum("earned_salary"), Value(Decimal("0.00")), output_field=MONEY))["val"])
+
     def pct(val):
         if gross_sales > ZERO:
             return float(round2(val / gross_sales * D(100)))
@@ -131,6 +144,7 @@ def annual_commercial_leakage(client_id, date_from=None, date_to=None):
         {"key": "samplingCost", "label": "Sampling & Cut-Piece Cost", "amount": float(round2(sampling_cost)), "pct": pct(sampling_cost), "type": "leakage"},
         {"key": "transportSupport", "label": "Transport / Tempo Freight Support", "amount": float(round2(transport_support)), "pct": pct(transport_support), "type": "leakage"},
         {"key": "netContribution", "label": "Net Contribution Margin", "amount": float(round2(net_contribution)), "pct": pct(net_contribution), "type": "net"},
+        {"key": "salaryCost", "label": "Payroll Salary Cost (not in net contribution)", "amount": float(round2(salary_cost)), "pct": pct(salary_cost), "type": "cost"},
     ]
 
     return {
@@ -138,8 +152,11 @@ def annual_commercial_leakage(client_id, date_from=None, date_to=None):
         "periodTo": date_to.isoformat(),
         "grossSales": float(round2(gross_sales)),
         "totalLeakage": float(round2(deductions)),
+        "leakagePct": pct(deductions),
         "netContribution": float(round2(net_contribution)),
         "netContributionPct": pct(net_contribution),
+        "salaryCost": float(round2(salary_cost)),
+        "salaryCostPct": pct(salary_cost),
         "items": items,
     }
 

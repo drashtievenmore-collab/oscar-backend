@@ -1389,12 +1389,12 @@ def calculate_incentive(
             client=client,
             postings=[
                 ledger.debit(
-                    ledger.system_account(client_id, "general_expense"),
+                    ledger.system_account(client_id, "incentive_expense"),
                     payable_now if hold_amount > ZERO else total_incentive,
                     description=f"Incentive {calc.calc_number} - {employee.name}",
                 ),
                 ledger.credit(
-                    ledger.system_account(client_id, "salary_payable"),
+                    ledger.system_account(client_id, "incentive_payable"),
                     payable_now if hold_amount > ZERO else total_incentive,
                     description=f"Incentive payable {period_label}",
                 ),
@@ -1462,8 +1462,10 @@ def post_incentive(calc, *, user=None):
     payable_amount = calc.incentive_amount - calc.hold_amount
     if payable_amount > ZERO and calc.journal_entry is None:
         client_id = calc.client_id
-        expense_acc = ledger.system_account(client_id, "general_expense")
-        payable_acc = ledger.system_account(client_id, "salary_payable")
+        # Incentive is kept apart from salary (PDF §12, §14): its own expense
+        # and payable accounts, not Salaries and Wages / Salaries Payable.
+        expense_acc = ledger.system_account(client_id, "incentive_expense")
+        payable_acc = ledger.system_account(client_id, "incentive_payable")
         entry = ledger.post_entry(
             client=calc.client,
             postings=[
@@ -1500,6 +1502,27 @@ def post_incentive(calc, *, user=None):
     return calc
 
 
+def _incentive_payable_account(calc):
+    """The liability this incentive was accrued to, so the payout clears it.
+
+    Calcs posted before incentives had their own accounts credited Salaries
+    Payable; paying those from Incentive Payable would leave both balances
+    wrong.
+    """
+    from apps.accounting import services as ledger
+    from apps.accounting.models import JournalLine
+
+    if calc.journal_entry_id:
+        line = (
+            JournalLine.objects.filter(journal_entry_id=calc.journal_entry_id, credit__gt=0)
+            .select_related("account")
+            .first()
+        )
+        if line is not None:
+            return line.account
+    return ledger.system_account(calc.client_id, "incentive_payable")
+
+
 @transaction.atomic
 def pay_incentive(calc, *, bank_account=None, amount=None, user=None):
     """Posted → Paid (PDF §12). Posts Dr Incentive Payable / Cr Bank."""
@@ -1518,7 +1541,7 @@ def pay_incentive(calc, *, bank_account=None, amount=None, user=None):
 
     if bank_account:
         client_id = calc.client_id
-        payable_acc = ledger.system_account(client_id, "salary_payable")
+        payable_acc = _incentive_payable_account(calc)
         bank_ledger_acc = bank_account.account if hasattr(bank_account, "account") and bank_account.account else ledger.system_account(client_id, "bank")
         ledger.post_entry(
             client=calc.client,

@@ -174,8 +174,9 @@ class ReportView(APIView):
     def get(self, request, report_key):
         client_id = request.client_id
         params = request.query_params
-        date_from = params.get("date_from")
-        date_to = params.get("date_to")
+        # The web client sends camelCase (dateFrom/dateTo); accept both.
+        date_from = params.get("date_from") or params.get("dateFrom")
+        date_to = params.get("date_to") or params.get("dateTo")
         as_of = params.get("asOf") or params.get("as_of")
 
         handler = getattr(self, f"_report_{report_key.replace('-', '_')}", None)

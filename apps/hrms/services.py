@@ -548,35 +548,18 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
         )
         paid_leaves = Decimal(counts.get("On Leave", 0))
 
-        from apps.hrms.models import SalespersonIncentiveAccrual
-        incentive_accruals = list(
-            SalespersonIncentiveAccrual.objects.filter(
-                client=client,
-                employee=employee,
-                status="APPROVED",
-                paid_at__isnull=True,
-                end_date__lte=month_end,
-                deleted_at__isnull=True,
-            )
-        )
-        incentive_total = sum((round2(acc.calculated_incentive) for acc in incentive_accruals), ZERO)
-
+        # Fixed salary only (Oscar letter pad §12): salesperson incentive is
+        # calculated, posted and paid on its own through PMS
+        # IncentiveCalculation, never through the payslip.
         advance = _pending_advance_instalment(employee)
         result = compute_salary(
             standard_salary=employee.standard_salary,
             total_days=total_days,
             attended_days=attended,
             paid_leaves=paid_leaves,
-            additional_earnings=incentive_total,
             advance=advance,
         )
         split = split_structure(employee.salary_structure, result["earnedSalary"])
-        if incentive_total > ZERO:
-            split["components"].append({
-                "name": "Sales Incentive Payout",
-                "kind": "earning",
-                "amount": incentive_total,
-            })
 
         payslip, created = Payslip.objects.update_or_create(
             payroll_run=run,
@@ -593,7 +576,7 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
                 "basic": split["basic"],
                 "hra": split["hra"],
                 "allowances": split["allowances"],
-                "additional_earnings": incentive_total,
+                "additional_earnings": ZERO,
                 "deductions": ZERO,
                 "advance_recovery": advance,
                 "net_payable": result["netPayable"],

@@ -766,29 +766,6 @@ def post_salary_advance(advance, *, bank_account=None, user=None):
     )
 
 
-def post_incentive_accrual(accrual, *, user=None):
-    """Dr Sales Incentive Expense | Cr Incentive Payable"""
-    client_id = accrual.client_id
-    amount = round2(accrual.calculated_incentive)
-    if amount <= Decimal("0.00"):
-        return None
-    entry = post_entry(
-        client=accrual.client,
-        postings=[
-            debit(system_account(client_id, "incentive_expense"), amount),
-            credit(system_account(client_id, "incentive_payable"), amount),
-        ],
-        entry_date=accrual.end_date or timezone.localdate(),
-        narration=f"Sales Incentive Accrual {accrual.period_name} - {accrual.employee.name}",
-        source_document_type="SalespersonIncentiveAccrual",
-        source_document_id=accrual.id,
-        user=user,
-    )
-    accrual.journal_entry = entry
-    accrual.save(update_fields=["journal_entry", "updated_at"])
-    return entry
-
-
 # ---------------------------------------------------------------------------
 # Derived balances and ledgers
 # ---------------------------------------------------------------------------
