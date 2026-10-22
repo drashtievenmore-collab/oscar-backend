@@ -808,6 +808,7 @@ class HrDocumentSerializer(BaseModelSerializer):
     )
     fileSize = serializers.IntegerField(source="file.file_size", read_only=True)
     fileType = serializers.CharField(source="file.content_type", read_only=True)
+    fileName = serializers.CharField(source="file.file_name", read_only=True)
     expiry = serializers.DateField(source="valid_until", required=False, allow_null=True)
     #: DERIVED from ``valid_until`` at read time (api.md §11.8).
     status = serializers.SerializerMethodField()
@@ -818,7 +819,7 @@ class HrDocumentSerializer(BaseModelSerializer):
         model = HrDocument
         fields = [
             "id", "title", "category", "employee", "employeeId", "version",
-            "expiry", "status", "fileId", "fileSize", "fileType", "uploadedBy",
+            "expiry", "status", "fileId", "fileSize", "fileType", "fileName", "uploadedBy",
             "updatedOn", "tags", "description", "valid_from", "is_confidential",
             "created_at",
         ]
