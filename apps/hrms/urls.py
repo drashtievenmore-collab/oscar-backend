@@ -43,6 +43,13 @@ router.register("incentives", views.SalespersonIncentiveViewSet, basename="hrms-
 router.register("agency-monitoring", views.AgencyProductionMonitoringViewSet, basename="hrms-agency-monitoring")
 router.register("broker-commissions", views.BrokerCommissionViewSet, basename="hrms-broker-commissions")
 router.register("commercial-leakage", views.CommercialLeakageViewSet, basename="hrms-commercial-leakage")
+router.register("transfers", views.StubLifecycleViewSet, basename="hrms-transfers")
+router.register("promotions", views.StubLifecycleViewSet, basename="hrms-promotions")
+router.register("warnings", views.StubLifecycleViewSet, basename="hrms-warnings")
+router.register("awards", views.StubLifecycleViewSet, basename="hrms-awards")
+router.register("jobs", views.StubLifecycleViewSet, basename="hrms-jobs")
+router.register("candidates", views.StubLifecycleViewSet, basename="hrms-candidates")
+router.register("applications", views.StubLifecycleViewSet, basename="hrms-applications")
 
 # =============================================================================
 # COMMENTED OUT PER OSCAR LETTER PAD SCOPE (Kept for reference, do not delete):

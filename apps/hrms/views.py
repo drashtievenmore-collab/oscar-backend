@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
-from rest_framework import status
+from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -21,7 +21,7 @@ from apps.core.exceptions import (
 from apps.core.money import ZERO, D, round2
 from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
-from apps.core.permissions import HasModulePermission, has_permission
+from apps.core.permissions import HasModulePermission, has_permission, IsAuthenticatedInTenant
 from apps.core.printing import PdfNotAvailable, print_payload
 from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
 
@@ -2757,3 +2757,17 @@ class CommercialLeakageViewSet(TenantModelViewSet):
             "net_margin": float(net_margin),
             "leakage_percentage": leakage_percentage,
         })
+
+
+class StubLifecycleViewSet(viewsets.ViewSet):
+    """Fallback stub for non-scope lifecycle events (transfers, promotions, warnings, awards)."""
+    permission_classes = [IsAuthenticatedInTenant]
+
+    def list(self, request):
+        return Response(envelope([]))
+
+    def create(self, request):
+        return Response(request.data, status=status.HTTP_201_CREATED)
+
+    def retrieve(self, request, pk=None):
+        return Response({})
