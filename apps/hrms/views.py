@@ -140,9 +140,145 @@ from .serializers import (
 
 
 # ---------------------------------------------------------------------------
+
+def reporting_chain_ids(client_id, manager_id):
+    """Ids of every employee below manager_id (direct and indirect reports)."""
+    found, frontier = set(), {manager_id}
+    while frontier:
+        below = set(
+            Employee.objects.filter(
+                client_id=client_id, manager_id__in=frontier, deleted_at__isnull=True
+            ).values_list("id", flat=True)
+        ) - found - {manager_id}
+        found |= below
+        frontier = below
+    return found
+
+
+class OwnEmployeeScopeMixin:
+    """Record-level scope for self-service HR data.
+    Holders of team_scope_permissions see all tenant rows;
+    everyone else sees (and writes) only rows for their own linked employee.
+    """
+    team_scope_permissions = ()
+    manager_read_scope = False
+    delegate_read_field = None
+
+    def has_team_scope(self):
+        return has_permission(self.request.user, tuple(self.team_scope_permissions))
+
+    def _resolve_employee(self, request, employee_id=None):
+        client_id = getattr(request, "client_id", None) or getattr(request.user, "client_id", None)
+        if employee_id:
+            try:
+                emp = Employee.objects.filter(
+                    pk=employee_id, client_id=client_id, deleted_at__isnull=True
+                ).first()
+                if emp:
+                    return emp
+            except (ValueError, TypeError, Exception):
+                pass
+            return Employee.objects.filter(
+                employee_code=employee_id, client_id=client_id, deleted_at__isnull=True
+            ).first()
+
+        if getattr(request.user, "employee", None):
+            return request.user.employee
+
+        if getattr(request.user, "email", None):
+            emp = Employee.objects.filter(
+                client_id=client_id, email__iexact=request.user.email, deleted_at__isnull=True
+            ).first()
+            if emp:
+                if not getattr(request.user, "employee_id", None) and hasattr(request.user, "save"):
+                    request.user.employee = emp
+                    request.user.save(update_fields=["employee"])
+                return emp
+        return None
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.has_team_scope():
+            return queryset
+        employee_id = getattr(self.request.user, "employee_id", None)
+        if not employee_id:
+            resolved = self._resolve_employee(self.request)
+            if resolved:
+                employee_id = resolved.id
+        if not employee_id:
+            return queryset.none()
+        if self.request.method not in ("GET", "HEAD", "OPTIONS"):
+            return queryset.filter(employee_id=employee_id)
+        visible = [employee_id]
+        if self.manager_read_scope:
+            visible += reporting_chain_ids(self.request.client_id, employee_id)
+        scope = Q(employee_id__in=visible)
+        if self.delegate_read_field:
+            scope |= Q(**{self.delegate_read_field: employee_id})
+        return queryset.filter(scope)
+
+    def check_own_employee(self, employee):
+        if self.has_team_scope():
+            return
+        resolved = self._resolve_employee(self.request)
+        own = resolved.pk if resolved else getattr(self.request.user, "employee_id", None)
+        if employee is None or own is None or employee.pk != own:
+            raise PermissionDenied(
+                "You can only do this for your own employee record.",
+                code=self.team_scope_permissions[0] if self.team_scope_permissions else "PERMISSION_DENIED",
+            )
+
+
 # Organisation (api.md §11.1)
 # ---------------------------------------------------------------------------
 class EmployeeViewSet(TenantModelViewSet):
+    @action(detail=False, methods=["get"])
+    def me(self, request):
+        """GET /hrms/employees/me/ -- caller's own employee record."""
+        employee_id = getattr(request.user, "employee_id", None)
+        employee = (
+            self.get_queryset().filter(pk=employee_id).first()
+            if employee_id else None
+        )
+        if employee is None:
+            try:
+                from apps.hrms.user_link import linked_employee
+                employee = linked_employee(request.user)
+            except Exception:
+                pass
+        if employee is None and getattr(request.user, "email", None):
+            employee = Employee.objects.filter(
+                client_id=self.get_client_id(), email__iexact=request.user.email.strip(), deleted_at__isnull=True
+            ).first()
+            if employee and not request.user.employee_id:
+                request.user.employee = employee
+                request.user.save(update_fields=["employee"])
+        if employee is None:
+            raise NotFound(
+                "Your login is not linked to an employee record. Ask HR to link it.",
+                code="NO_EMPLOYEE",
+            )
+        return Response(self.get_serializer(employee).data)
+
+    @action(detail=False, methods=["get"])
+    def colleagues(self, request):
+        """GET /hrms/employees/colleagues/ -- names only, for the delegate picker."""
+        rows = (
+            Employee.objects.filter(client_id=self.get_client_id(), deleted_at__isnull=True)
+            .exclude(status__in=["Resigned", "Terminated"])
+            .select_related("department", "designation")
+            .order_by("name")
+        )
+        return Response(envelope([
+            {
+                "id": str(e.id),
+                "name": e.name,
+                "department": e.department.name if e.department_id else "",
+                "designation": e.designation.name if e.designation_id else "",
+            }
+            for e in rows
+        ]))
+
     queryset = Employee.objects.select_related(
         "designation", "department", "manager", "location", "salary_structure"
     )
@@ -161,7 +297,7 @@ class EmployeeViewSet(TenantModelViewSet):
         "managerId": "manager_id",
         "employmentType": "employment_type",
     }
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"], "create": ["create_staff"]}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"], "create": ["create_staff"], "me": [], "colleagues": []}
     def get_queryset(self):
         try:
             from apps.hrms.services import sync_all_users_and_employees
@@ -764,7 +900,18 @@ class AttendanceViewSet(TenantModelViewSet):
         return Response(status_data.get("punches", []))
 
 
-class RegularizationViewSet(TenantModelViewSet):
+class RegularizationViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
+    team_scope_permissions = ("view_team_attendance",)
+    def perform_create(self, serializer):
+        employee = serializer.validated_data.get("employee")
+        if not employee:
+            resolved = self._resolve_employee(self.request)
+            if resolved:
+                serializer.validated_data["employee"] = resolved
+                employee = resolved
+        self.check_own_employee(employee)
+        return super().perform_create(serializer)
+
     queryset = AttendanceRegularization.objects.select_related("employee")
     serializer_class = RegularizationSerializer
     audit_entity_type = "AttendanceRegularization"
@@ -772,7 +919,7 @@ class RegularizationViewSet(TenantModelViewSet):
     default_date_field = "work_date"
     ordering = ["-work_date"]
     filter_map = {"employeeId": "employee_id"}
-    permission_map = {"read": ["view_team_attendance"], "write": ["regularize_attendance"]}
+    permission_map = {"read": [], "create": [], "write": ["regularize_attendance"]}
 
     @transaction.atomic
     def perform_update(self, serializer):
@@ -888,7 +1035,10 @@ class LeaveTypeViewSet(TenantModelViewSet):
     permission_map = {"read": ["apply_leave"], "write": ["approve_leave"]}
 
 
-class LeaveRequestViewSet(TenantModelViewSet):
+class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
+    team_scope_permissions = ("approve_leave",)
+    manager_read_scope = True
+    delegate_read_field = "delegate_employee_id" 
     queryset = LeaveRequest.objects.select_related(
         "employee", "leave_type", "delegate_employee"
     )
@@ -899,7 +1049,7 @@ class LeaveRequestViewSet(TenantModelViewSet):
     ordering = ["-from_date"]
     search_fields = ["employee__name", "reason"]
     filter_map = {"employeeId": "employee_id", "type": "leave_type__name", "leaveTypeId": "leave_type_id"}
-    permission_map = {"read": ["apply_leave"], "create": ["apply_leave"], "write": ["approve_leave"]}
+    permission_map = {"read": [], "create": [], "write": ["approve_leave"], "cancel": [], "confirm_delegate": []}
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -910,6 +1060,13 @@ class LeaveRequestViewSet(TenantModelViewSet):
         )
 
     def perform_create(self, serializer):
+        employee = serializer.validated_data.get("employee")
+        if not employee:
+            resolved = self._resolve_employee(self.request)
+            if resolved:
+                serializer.validated_data["employee"] = resolved
+                employee = resolved
+        self.check_own_employee(employee)
         request_row = super().perform_create(serializer)
         services.assert_no_overlap(request_row)
         return request_row
@@ -1789,14 +1946,25 @@ class AssetCategoryViewSet(TenantModelViewSet):
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
 
 
-class AssetRequestViewSet(TenantModelViewSet):
+class AssetRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
+    team_scope_permissions = ("edit_staff", "view_staff")
     queryset = AssetRequest.objects.select_related("employee", "category", "fulfilled_asset")
     serializer_class = AssetRequestSerializer
     audit_entity_type = "AssetRequest"
     status_field = "status"
     ordering = ["-created_at"]
     filter_map = {"employeeId": "employee_id"}
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+    permission_map = {"read": [], "create": [], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        employee = serializer.validated_data.get("employee")
+        if not employee:
+            resolved = self._resolve_employee(self.request)
+            if resolved:
+                serializer.validated_data["employee"] = resolved
+                employee = resolved
+        self.check_own_employee(employee)
+        return super().perform_create(serializer)
 
 
 class HrDocumentViewSet(TenantModelViewSet):
@@ -1845,7 +2013,7 @@ class PolicyViewSet(TenantModelViewSet):
     search_fields = ["name", "summary"]
     ordering = ["name"]
     filter_map = {"categoryId": "category_id"}
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+    permission_map = {"read": [], "write": ["edit_staff"], "acknowledge": []}
 
     @transaction.atomic
     def perform_update(self, serializer):
@@ -1927,6 +2095,23 @@ class PolicyViewSet(TenantModelViewSet):
     def acknowledge(self, request, pk=None):
         policy = self.get_object()
         employee_id = getattr(request.user, "employee_id", None)
+        if not employee_id:
+            try:
+                from apps.hrms.user_link import linked_employee
+                emp = linked_employee(request.user)
+                if emp:
+                    employee_id = emp.id
+            except Exception:
+                pass
+        if not employee_id and getattr(request.user, "email", None):
+            emp = Employee.objects.filter(
+                client_id=request.client_id, email__iexact=request.user.email.strip(), deleted_at__isnull=True
+            ).first()
+            if emp:
+                employee_id = emp.id
+                if not getattr(request.user, "employee_id", None):
+                    request.user.employee = emp
+                    request.user.save(update_fields=["employee"])
         if employee_id is None:
             raise BusinessRuleViolation(
                 "Your account is not linked to an employee record.",
@@ -2076,7 +2261,8 @@ class TerminationViewSet(TenantModelViewSet):
         return row
 
 
-class ResignationViewSet(TenantModelViewSet):
+class ResignationViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
+    team_scope_permissions = ("edit_staff", "view_staff")
     queryset = Resignation.objects.select_related("employee").prefetch_related("checklist")
     serializer_class = ResignationSerializer
     audit_entity_type = "Resignation"
@@ -2084,7 +2270,25 @@ class ResignationViewSet(TenantModelViewSet):
     default_date_field = "submitted_on"
     ordering = ["-submitted_on"]
     filter_map = {"employeeId": "employee_id"}
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+    permission_map = {"read": [], "create": [], "cancel": [], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        employee = serializer.validated_data.get("employee")
+        if not employee:
+            resolved = self._resolve_employee(self.request)
+            if resolved:
+                serializer.validated_data["employee"] = resolved
+                employee = resolved
+        self.check_own_employee(employee)
+        return super().perform_create(serializer)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        instance = self.get_object()
+        self.check_own_employee(instance.employee)
+        instance.status = "Cancelled"
+        instance.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(instance).data)
 
     def perform_update(self, serializer):
         row = super().perform_update(serializer)
