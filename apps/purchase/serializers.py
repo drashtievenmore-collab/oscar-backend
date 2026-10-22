@@ -125,6 +125,23 @@ class PurchaseOrderSerializer(DocumentSerializer):
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["po_number", "auto_generated"]
 
+    #: Statuses a PO may be created in. Everything after that (submit, approve,
+    #: reject, cancel, receipt) is a server transition with its own permission
+    #: and separation-of-duties checks, so a plain create/edit can't skip them.
+    CREATE_STATUSES = ("Draft", "Issued")
+
+    def validate_status(self, value):
+        if self.instance is None:
+            if value not in self.CREATE_STATUSES:
+                raise serializers.ValidationError(
+                    "A new PO starts as Draft; use Submit / Approve to move it on."
+                )
+        elif value != self.instance.status:
+            raise serializers.ValidationError(
+                "Status changes go through the PO actions (submit, approve, reject, cancel)."
+            )
+        return value
+
     def validate(self, attrs):
         attrs = super().validate(attrs)
         instance = self.instance
@@ -182,12 +199,18 @@ class PurchaseBillSerializer(DocumentSerializer):
     )
     goodsReceived = serializers.BooleanField(source="goods_received", read_only=True)
     qcStatus = serializers.CharField(source="qc_status", read_only=True)
+    purchaseOrderId = TenantPrimaryKeyRelatedField(
+        source="purchase_order", model="purchase.PurchaseOrder",
+        required=False, allow_null=True
+    )
+    purchaseOrder = serializers.CharField(source="purchase_order_id", read_only=True)
+    poNumber = serializers.CharField(source="purchase_order.po_number", read_only=True, allow_null=True)
 
     class Meta:
         model = PurchaseBill
         fields = HEADER_FIELDS + [
             "bill_number", "vendorBillNumber", "status", "due_date",
-            "purchase_order", "location", "goodsReceived", "received_date",
+            "purchase_order", "purchaseOrderId", "purchaseOrder", "poNumber", "location", "goodsReceived", "received_date",
             "qcStatus", "qc_note", "vendorId", "vendorName",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + [
@@ -409,6 +432,7 @@ class VendorBillSerializer(BaseModelSerializer):
         source="purchase_order", model="purchase.PurchaseOrder",
         required=False, allow_null=True,
     )
+    poNumber = serializers.CharField(source="purchase_order.po_number", read_only=True, allow_null=True)
     grnId = TenantPrimaryKeyRelatedField(
         source="goods_receipt", model="purchase.GoodsReceipt",
         required=False, allow_null=True,
@@ -444,14 +468,16 @@ class VendorBillSerializer(BaseModelSerializer):
         model = VendorBill
         fields = [
             "id", "vendorBillNumber", "billDate", "vendorId", "vendorName",
-            "purchaseOrderId", "grnId", "attachmentFileId", "billFileName",
+            "purchaseOrderId", "poNumber", "grnId", "attachmentFileId", "billFileName",
             "purchaseBillId", "purchaseBillNumber", "gstPct", "subtotal",
             "gstAmount", "total", "remarks", "status", "matchStatus",
             "approvalRemarks", "approvedAt", "approvedByName",
             "approvalHistory", "matchResult",
             "lineItems", "created_at", "updated_at",
         ]
+        # `status` moves only through approve / reject / matching actions.
         read_only_fields = [
+            "status",
             "subtotal", "gstAmount", "total", "matchStatus",
             "approvalRemarks", "approvedAt", "approvedByName",
             "approvalHistory", "matchResult",

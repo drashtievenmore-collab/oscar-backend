@@ -26,7 +26,7 @@ def _sum(field, **kwargs):
 def _live_lines(client_id, date_from=None, date_to=None):
     queryset = JournalLine.objects.filter(
         client_id=client_id, deleted_at__isnull=True
-    ).exclude(journal_entry__status="Reversed")
+    ).exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False)
     if date_from:
         queryset = queryset.filter(journal_entry__entry_date__gte=date_from)
     if date_to:
@@ -432,7 +432,7 @@ def day_book(client_id, as_of_date=None):
         account__subtype="Bank",
         journal_entry__entry_date__lte=as_of,
         deleted_at__isnull=True,
-    ).exclude(journal_entry__status="Reversed")
+    ).exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False)
     cash_bank_balance = round2(
         bank_lines.aggregate(val=Coalesce(Sum("debit") - Sum("credit"), Value(Decimal("0.00")), output_field=MONEY))["val"]
     )
@@ -443,7 +443,7 @@ def day_book(client_id, as_of_date=None):
         account__system_key="debtors",
         journal_entry__entry_date__lte=as_of,
         deleted_at__isnull=True,
-    ).exclude(journal_entry__status="Reversed")
+    ).exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False)
     total_receivable = round2(
         debtors_lines.aggregate(val=Coalesce(Sum("debit") - Sum("credit"), Value(Decimal("0.00")), output_field=MONEY))["val"]
     )
@@ -453,7 +453,7 @@ def day_book(client_id, as_of_date=None):
         account__system_key="creditors",
         journal_entry__entry_date__lte=as_of,
         deleted_at__isnull=True,
-    ).exclude(journal_entry__status="Reversed")
+    ).exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False)
     total_payable = round2(
         creditors_lines.aggregate(val=Coalesce(Sum("credit") - Sum("debit"), Value(Decimal("0.00")), output_field=MONEY))["val"]
     )

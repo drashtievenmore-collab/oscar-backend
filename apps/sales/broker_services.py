@@ -100,6 +100,49 @@ def calculate_broker_commission(invoice, *, user=None, rate_override=None, commi
     return commission
 
 
+ACCRUAL_SOURCE = "BrokerCommissionAccrual"
+
+
+def _accrued_amount(commission):
+    """Net brokerage payable booked for this commission (credits − debits)."""
+    from apps.accounting.models import JournalLine
+
+    rows = JournalLine.objects.filter(
+        client_id=commission.client_id,
+        journal_entry__source_document_type=ACCRUAL_SOURCE,
+        journal_entry__source_document_id=commission.id,
+        account__system_key="brokerage_payable",
+        deleted_at__isnull=True,
+    ).exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False)
+    totals = rows.aggregate(d=Sum("debit"), c=Sum("credit"))
+    return round2(D(totals["c"] or ZERO) - D(totals["d"] or ZERO))
+
+
+def _sync_accrual(commission, *, user=None, note="Brokerage accrual"):
+    """Bring the booked accrual in line with ``commission_amount``:
+    Dr Brokerage Expense / Cr Brokerage Payable (or the reverse to reduce)."""
+    target = ZERO if commission.status == "Cancelled" else round2(D(commission.commission_amount))
+    delta = round2(target - _accrued_amount(commission))
+    if delta == ZERO:
+        return None
+    expense = ledger.system_account(commission.client_id, "brokerage_expense")
+    payable = ledger.system_account(commission.client_id, "brokerage_payable")
+    amount = abs(delta)
+    postings = (
+        [ledger.debit(expense, amount, description=note), ledger.credit(payable, amount, description=note)]
+        if delta > ZERO else
+        [ledger.debit(payable, amount, description=note), ledger.credit(expense, amount, description=note)]
+    )
+    return ledger.post_entry(
+        client=commission.client_id,
+        postings=postings,
+        narration=f"{note}: {commission.commission_number or commission.id}",
+        source_document_type=ACCRUAL_SOURCE,
+        source_document_id=commission.id,
+        user=user,
+    )
+
+
 @transaction.atomic
 def approve_broker_commission(commission, *, user=None):
     """Transition commission: Accrued -> Approved -> Payable."""
@@ -111,6 +154,8 @@ def approve_broker_commission(commission, *, user=None):
     commission.approved_by = user if getattr(user, "is_authenticated", False) else None
     commission.approved_at = timezone.now()
     commission.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
+    # The expense is recognised once approved, so the payout has a payable to clear.
+    _sync_accrual(commission, user=user)
     return commission
 
 
@@ -130,40 +175,52 @@ def make_broker_payable(commission, *, user=None):
 def pay_broker_commission(commission, amount=None, *, payment_ref=None, payment_method=None, bank_account=None, user=None, remarks=None):
     """Record broker payment and post Dr Brokerage Payable / Cr Bank."""
     commission = BrokerCommission.objects.select_for_update().get(pk=commission.pk)
+    if commission.status not in ("Approved", "Payable", "Partially Paid"):
+        raise Conflict(
+            f"Commission is {commission.status}; only an approved / payable commission can be paid."
+        )
     outstanding = round2(D(commission.commission_amount) - D(commission.paid_amount))
 
     pay_amount = round2(D(amount)) if amount is not None else outstanding
-    if pay_amount <= ZERO:
+    if not pay_amount.is_finite() or pay_amount <= ZERO:
         raise ValidationFailed("Payment amount must be greater than zero.")
     if pay_amount > outstanding:
         raise ValidationFailed(
             f"Payment amount (₹ {pay_amount:,.2f}) cannot exceed outstanding balance (₹ {outstanding:,.2f})."
         )
 
-    # Post accounting entry
-    try:
-        entry = ledger.post_entry(
-            client=commission.client_id,
-            postings=[
-                ledger.debit(
-                    ledger.system_account(commission.client_id, "brokerage_payable"),
-                    pay_amount,
-                    description=f"Brokerage payout to {commission.broker.name} ({payment_method or 'Bank Transfer'})",
-                ),
-                ledger.credit(
-                    ledger.system_account(commission.client_id, "bank"),
-                    pay_amount,
-                    description=f"Brokerage payout for invoice {commission.invoice.invoice_number}",
-                ),
-            ],
-            narration=f"Broker payment {commission.commission_number or commission.id}: {remarks or ''}",
-            source_document_type="BrokerCommission",
-            source_document_id=commission.id,
-            user=user,
-        )
-        commission.journal_entry = entry
-    except Exception:
-        pass
+    # Commissions approved before accruals were posted get theirs now.
+    _sync_accrual(commission, user=user)
+
+    # Post the payout; a failure rolls the whole payment back rather than
+    # marking it Paid with nothing in the books.
+    if bank_account is not None and not hasattr(bank_account, "account_id"):
+        from apps.accounting.models import BankAccount
+        bank_account = BankAccount.objects.filter(pk=bank_account, client_id=commission.client_id).first()
+    credit_account = (
+        bank_account.account if bank_account is not None and getattr(bank_account, "account_id", None)
+        else ledger.system_account(commission.client_id, "bank")
+    )
+    entry = ledger.post_entry(
+        client=commission.client_id,
+        postings=[
+            ledger.debit(
+                ledger.system_account(commission.client_id, "brokerage_payable"),
+                pay_amount,
+                description=f"Brokerage payout to {commission.broker.name} ({payment_method or 'Bank Transfer'})",
+            ),
+            ledger.credit(
+                credit_account,
+                pay_amount,
+                description=f"Brokerage payout for invoice {commission.invoice.invoice_number}",
+            ),
+        ],
+        narration=f"Broker payment {commission.commission_number or commission.id}: {remarks or ''}",
+        source_document_type="BrokerCommission",
+        source_document_id=commission.id,
+        user=user,
+    )
+    commission.journal_entry = entry
 
     new_total_paid = round2(D(commission.paid_amount) + pay_amount)
     commission.paid_amount = new_total_paid
@@ -198,6 +255,8 @@ def reverse_broker_commission_for_invoice(invoice, *, user=None, return_val=None
                 comm.status = "Cancelled"
                 comm.notes = (comm.notes or "") + f" [Auto-cancelled on return: {reason or 'Sales Return'}]"
                 comm.save(update_fields=["status", "notes", "updated_at"])
+            # Keep the booked expense/payable equal to what is still owed.
+            _sync_accrual(comm, user=user, note="Brokerage adjustment on return")
         elif comm.status == "Paid":
             if comm.journal_entry_id:
                 try:

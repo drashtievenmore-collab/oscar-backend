@@ -980,6 +980,14 @@ def record_payment_in(
 @transaction.atomic
 def allocate_payment_in(payment, allocations, *, user=None):
     """Apply a payment against invoices, enforcing the api.md §5.8 table."""
+    # Lock the receipt so two allocate calls can't both spend the same money,
+    # and never apply a cancelled receipt (its ledger entry is already reversed).
+    payment = PaymentIn.objects.select_for_update().get(pk=payment.pk)
+    if payment.status == "Cancelled":
+        raise BusinessRuleViolation(
+            "This receipt has been cancelled; it can't be allocated.",
+            code=Codes.ALREADY_CANCELLED,
+        )
     allocated = ZERO
     for row in allocations or []:
         invoice_id = row.get("invoiceId") or row.get("invoice_id") or row.get("documentId")
@@ -994,6 +1002,11 @@ def allocate_payment_in(payment, allocations, *, user=None):
         )
         if invoice is None:
             raise NotFound("That invoice no longer exists.")
+        if invoice.party_id and payment.party_id and invoice.party_id != payment.party_id:
+            raise ValidationFailed(
+                "That invoice belongs to a different customer than this receipt.",
+                field_errors={"invoiceId": ["Customer mismatch."]},
+            )
 
         if invoice.status == "Cancelled":
             raise BusinessRuleViolation(

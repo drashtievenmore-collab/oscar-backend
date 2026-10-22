@@ -264,7 +264,7 @@ class BudgetViewSet(TenantModelViewSet):
                 deleted_at__isnull=True,
                 journal_entry__entry_date__gte=budget.period_start,
                 journal_entry__entry_date__lte=budget.period_end,
-            ).exclude(journal_entry__status="Reversed").aggregate(
+            ).exclude(journal_entry__status="Reversed").exclude(journal_entry__reversal_of__isnull=False).aggregate(
                 debit=Coalesce(Sum("debit"), Value(Decimal("0.00")), output_field=MONEY),
                 credit=Coalesce(Sum("credit"), Value(Decimal("0.00")), output_field=MONEY),
             )

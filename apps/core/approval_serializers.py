@@ -52,3 +52,7 @@ class ApprovalRequestSerializer(serializers.ModelSerializer):
             "decided_at",
             "comments",
         ]
+        # Decisions go through approve / reject / return-for-correction only.
+        read_only_fields = [
+            "requested_by", "requested_at", "status", "decided_by", "decided_at", "comments",
+        ]
