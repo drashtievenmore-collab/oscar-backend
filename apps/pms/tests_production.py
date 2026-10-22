@@ -282,6 +282,63 @@ class PayrollSeparationTests(ProductionTestBase):
             ).exists()
         )
 
+    def test_incentive_uses_its_own_accounts_and_payout_clears_them(self):
+        from types import SimpleNamespace
+
+        from apps.accounting.models import JournalLine
+
+        employee = self.make_employee()
+        self._make_invoice()
+        scheme = self.make_scheme(rate="10")
+        calc = services.calculate_incentive(
+            client=self.client_obj,
+            scheme=scheme,
+            employee=employee,
+            period_label="2026-Q3A",
+            period_start=date(2026, 7, 1),
+            period_end=date(2026, 9, 30),
+            user=self.user,
+        )
+        lines = JournalLine.objects.filter(journal_entry_id=calc.journal_entry_id)
+        debit_keys = {l.account.system_key for l in lines if l.debit > 0}
+        credit_keys = {l.account.system_key for l in lines if l.credit > 0}
+        # PDF §12/§14: incentive stays out of salary accounts.
+        self.assertEqual(debit_keys, {"incentive_expense"})
+        self.assertEqual(credit_keys, {"incentive_payable"})
+
+        services.pay_incentive(calc, bank_account=SimpleNamespace(account=None), user=self.user)
+        calc.refresh_from_db()
+        self.assertEqual(calc.status, "Paid")
+        payable = ledger.system_account(self.client_obj.id, "incentive_payable")
+        balance = sum(
+            (l.credit - l.debit)
+            for l in JournalLine.objects.filter(account=payable, journal_entry__client=self.client_obj)
+        )
+        self.assertEqual(balance, Decimal("0"))
+
+    def test_leakage_report_shows_payroll_salary_cost(self):
+        from apps.reports.mis_reports import annual_commercial_leakage
+
+        self.make_employee()
+        result = hrms_services.process_payroll(
+            client=self.client_obj, period_month=date(2026, 9, 1), user=self.user
+        )
+        for payslip in result["payslips"]:
+            payslip.status = "Approved"
+            payslip.save(update_fields=["status"])
+        expected = sum((p.earned_salary for p in result["payslips"]), Decimal("0"))
+
+        report = annual_commercial_leakage(
+            self.client_obj.id, date_from=date(2026, 9, 1), date_to=date(2026, 9, 30)
+        )
+        self.assertEqual(Decimal(str(report["salaryCost"])), expected)
+        salary_item = next(i for i in report["items"] if i["key"] == "salaryCost")
+        self.assertEqual(salary_item["type"], "cost")
+        # Salary is shown for visibility; §15 net contribution excludes it.
+        self.assertAlmostEqual(
+            report["netContribution"], report["grossSales"] - report["totalLeakage"], places=2
+        )
+
 
 class ProductionReportTests(ProductionTestBase):
     def test_employee_dashboard_meters_match_today_entries(self):
