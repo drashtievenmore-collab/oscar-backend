@@ -111,6 +111,10 @@ class SalesDocumentViewSet(TenantModelViewSet):
             .prefetch_related("line_items__item")
         )
 
+    def after_create(self, instance):
+        super().after_create(instance)
+        services.fill_salesperson(instance)
+
     def get_aggregates(self, queryset):
         rows = queryset.aggregate(
             count=Count("id"),
@@ -223,6 +227,7 @@ def _clone_document(source, target_model, overrides, *, number_field, series,
     target = target_model(**payload)
     setattr(target, number_field, allocate_number(source.client, series, target.doc_date))
     target.save()
+    services.fill_salesperson(target)
 
     module = importlib.import_module(target_model.__module__)
     line_model = getattr(module, line_model_name)
@@ -504,6 +509,9 @@ class QuotationViewSet(SalesDocumentViewSet):
             quotation.party = party
             quotation.freeze_party_snapshot(party)
             quotation.save()
+        # The deal owner is who earns the incentive on this sale; carry them
+        # onto the quotation so the order and invoice inherit it.
+        services.fill_salesperson(quotation)
         # An approval wins the linked deal: same transaction, so a failed
         # deal move rolls the approval back too.
         crm_services.advance_deal_for_quotation(

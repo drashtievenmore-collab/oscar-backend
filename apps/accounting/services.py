@@ -670,17 +670,11 @@ def post_stock_adjustment(movement, *, user=None, value=None):
     )
 
 
-def post_payroll(payslip, *, user=None):
-    """Itemized payroll posting (api.md §11.4).
-    Debits Salary Expense (Gross), Credits Bank (Net), Credits PF/ESI/PT/TDS/Advances.
-    """
+def _payroll_deduction_credits(payslip, net_amount):
+    """PF/ESI/PT/TDS and advance-recovery credits for a payslip, and the gross
+    they add up to with ``net_amount``. Shared by every payroll posting so
+    the one-shot and the accrual books carry identical figures."""
     client_id = payslip.client_id
-    account = (
-        payslip.bank_account.account
-        if payslip.bank_account_id
-        else system_account(client_id, "cash")
-    )
-    net_amount = round2(payslip.paid_amount or payslip.net_payable)
     advance_amount = round2(payslip.advance_recovery or Decimal("0.00"))
 
     components = list(payslip.components.all())
@@ -722,7 +716,26 @@ def post_payroll(payslip, *, user=None):
         )
         total_statutory += advance_amount
 
-    gross_salary = net_amount + total_statutory
+    return statutory_credits, net_amount + total_statutory
+
+
+def _payroll_funding(payslip):
+    return (
+        payslip.bank_account.account
+        if payslip.bank_account_id
+        else system_account(payslip.client_id, "cash")
+    )
+
+
+def post_payroll(payslip, *, user=None):
+    """One-shot payroll posting at payment (api.md §11.4) -- the fallback for
+    a payslip approved before approval started accruing (no accrual entry).
+    Debits Salary Expense (Gross), Credits Bank (Net), Credits PF/ESI/PT/TDS/Advances.
+    """
+    client_id = payslip.client_id
+    account = _payroll_funding(payslip)
+    net_amount = round2(payslip.paid_amount or payslip.net_payable)
+    statutory_credits, gross_salary = _payroll_deduction_credits(payslip, net_amount)
 
     if statutory_credits:
         postings = [
@@ -746,8 +759,59 @@ def post_payroll(payslip, *, user=None):
     )
 
 
+def post_payroll_accrual(payslip, *, user=None):
+    """Approval (accrual basis): Dr Salaries and Wages (gross) | Cr Salaries
+    Payable (net), Cr PF/ESI/PT/TDS payables, Cr Employee Advances.
+
+    Dated the last day of the payroll month, so the cost and the liability
+    land in the month the salary was earned, not the month it was paid.
+    """
+    import calendar
+
+    client_id = payslip.client_id
+    net_amount = round2(payslip.net_payable)
+    statutory_credits, gross_salary = _payroll_deduction_credits(payslip, net_amount)
+    period = payslip.period_month
+    month_end = period.replace(day=calendar.monthrange(period.year, period.month)[1])
+    return post_entry(
+        client=payslip.client,
+        postings=[
+            debit(system_account(client_id, "salary_expense"), gross_salary),
+            credit(system_account(client_id, "salary_payable"), net_amount,
+                   description="Net salary payable"),
+        ] + statutory_credits,
+        entry_date=month_end,
+        narration=f"Salary accrual {period:%b %Y} - {payslip.employee.name}",
+        source_document_type="Payslip",
+        source_document_id=payslip.id,
+        user=user,
+    )
+
+
+def post_payroll_payment(payslip, *, user=None):
+    """Mark paid after an accrual: Dr Salaries Payable | Cr Bank/Cash (net)."""
+    amount = round2(payslip.paid_amount or payslip.net_payable)
+    return post_entry(
+        client=payslip.client,
+        postings=[
+            debit(system_account(payslip.client_id, "salary_payable"), amount,
+                  description="Net salary paid"),
+            credit(_payroll_funding(payslip), amount),
+        ],
+        entry_date=payslip.payment_date or timezone.localdate(),
+        narration=f"Salary paid {payslip.period_month:%b %Y} - {payslip.employee.name}",
+        source_document_type="Payslip",
+        source_document_id=payslip.id,
+        user=user,
+    )
+
+
 def post_salary_advance(advance, *, bank_account=None, user=None):
-    """Dr Employee Advances | Cr Bank/Cash"""
+    """Dr Employee Advances | Cr Bank/Cash -- the advance handed over.
+
+    Payroll later credits Employee Advances as it recovers the advance
+    (post_payroll), so this is the debit that recovery clears.
+    """
     client_id = advance.client_id
     account = (
         bank_account.account
@@ -761,8 +825,29 @@ def post_salary_advance(advance, *, bank_account=None, user=None):
             debit(system_account(client_id, "employee_advances"), amount),
             credit(account, amount),
         ],
-        entry_date=advance.request_date or timezone.localdate(),
-        narration=f"Salary Advance Disbursed - {advance.employee.name} (Ref: {advance.advance_code or advance.id})",
+        entry_date=advance.issued_on or timezone.localdate(),
+        narration=f"Salary advance disbursed - {advance.employee.name}",
+        source_document_type="SalaryAdvance",
+        source_document_id=advance.id,
+        user=user,
+    )
+
+
+def post_salary_advance_writeoff(advance, *, user=None):
+    """Dr Salaries and Wages | Cr Employee Advances -- the part never recovered."""
+    client_id = advance.client_id
+    amount = round2(D(advance.amount) - D(advance.recovered_amount or 0))
+    if amount <= ZERO:
+        return None
+    return post_entry(
+        client=advance.client,
+        postings=[
+            debit(system_account(client_id, "salary_expense"), amount,
+                  description="Advance written off"),
+            credit(system_account(client_id, "employee_advances"), amount),
+        ],
+        entry_date=timezone.localdate(),
+        narration=f"Salary advance written off - {advance.employee.name}",
         source_document_type="SalaryAdvance",
         source_document_id=advance.id,
         user=user,

@@ -1251,6 +1251,7 @@ def sales_totals_for_period(
         payment_side="in",
         document_type="SalesInvoice",
         document_id__in=invoice_ids,
+        deleted_at__isnull=True,
     )
     collection_total = allocations.aggregate(val=Coalesce(Sum("amount"), Value(Decimal("0.00")), output_field=DecimalField()))["val"] or ZERO
 
@@ -1435,6 +1436,7 @@ def calculate_incentive(
 def approve_incentive(calc, *, user=None):
     """Calculated → Approved (PDF §12)."""
     calc = calc.__class__.objects.select_for_update().get(pk=calc.pk)
+    _ensure_not_held(calc)
     if calc.status != "Calculated":
         raise ValidationFailed(
             f"Only Calculated incentives can be approved (currently {calc.status}).",
@@ -1462,6 +1464,7 @@ def post_incentive(calc, *, user=None):
     """Approved → Posted (PDF §12). Posts to ledger."""
     from apps.accounting import services as ledger
     calc = calc.__class__.objects.select_for_update().get(pk=calc.pk)
+    _ensure_not_held(calc)
     if calc.status not in ("Approved", "Calculated"):
         raise ValidationFailed(
             f"Only Approved incentives can be posted (currently {calc.status}).",
@@ -1532,11 +1535,80 @@ def _incentive_payable_account(calc):
     return ledger.system_account(calc.client_id, "incentive_payable")
 
 
+def incentive_payout_schedule(calc, as_of=None):
+    """How much of ``calc`` may be paid out by ``as_of`` (PDF §12).
+
+    Incentive is paid only after the customer's payment is
+    ``scheme.payout_after_days`` old. Each payment matures on its own -- from
+    its payment date, or from when it was set against the invoice if that was
+    later -- and releases its share of the incentive: matured receipts over
+    the invoiced value (over money collected, for COLLECTION basis).
+
+    Returns ``eligible`` (total payable to date, capped at incentive - hold),
+    ``nextDate`` (when more matures, if anything is pending) and ``days``.
+    """
+    from datetime import timedelta
+
+    from django.db.models.functions import Coalesce
+    from django.db.models import DecimalField, Value
+    from apps.sales.models import PaymentAllocation, PaymentIn, SalesInvoice
+
+    as_of = as_of or timezone.localdate()
+    days = calc.scheme.payout_after_days if calc.scheme.payout_after_days is not None else 90
+    payable = max(ZERO, D(calc.incentive_amount) - D(calc.hold_amount))
+    invoice_ids = (calc.detail or {}).get("invoiceIds") or []
+    if not invoice_ids:
+        # Built before invoices were tracked on the calc: nothing to time.
+        return {"eligible": payable, "nextDate": None, "days": days}
+
+    allocations = list(
+        PaymentAllocation.objects.filter(
+            client_id=calc.client_id,
+            payment_side="in",
+            document_type="SalesInvoice",
+            document_id__in=invoice_ids,
+            deleted_at__isnull=True,
+        )
+    )
+    paid_on = dict(
+        PaymentIn.objects.filter(pk__in={a.payment_id for a in allocations}).values_list(
+            "id", "payment_date"
+        )
+    )
+    matured, collected, next_date = ZERO, ZERO, None
+    for allocation in allocations:
+        start = paid_on.get(allocation.payment_id) or timezone.localdate(allocation.allocated_at)
+        start = max(start, timezone.localdate(allocation.allocated_at))
+        due = start + timedelta(days=days)
+        collected += D(allocation.amount)
+        if due <= as_of:
+            matured += D(allocation.amount)
+        elif next_date is None or due < next_date:
+            next_date = due
+
+    if (calc.basis or calc.scheme.basis) == "COLLECTION":
+        base = collected
+    else:
+        base = SalesInvoice.objects.filter(
+            client_id=calc.client_id, pk__in=invoice_ids, deleted_at__isnull=True
+        ).exclude(status="Cancelled").aggregate(
+            val=Coalesce(Sum("total"), Value(D("0.00")), output_field=DecimalField())
+        )["val"] or ZERO
+    share = min(D(1), matured / D(base)) if D(base) > ZERO else ZERO
+    eligible = min(payable, round2(D(calc.incentive_amount) * share))
+    return {"eligible": eligible, "nextDate": next_date, "days": days}
+
+
 @transaction.atomic
-def pay_incentive(calc, *, bank_account=None, amount=None, user=None):
-    """Posted → Paid (PDF §12). Posts Dr Incentive Payable / Cr Bank."""
+def pay_incentive(calc, *, bank_account=None, amount=None, user=None, as_of=None):
+    """Posted → Paid (PDF §12). Posts Dr Incentive Payable / Cr Bank.
+
+    Pays only what has matured under the scheme's payout_after_days rule; the
+    rest stays Posted and is paid once its customer payment is old enough.
+    """
     from apps.accounting import services as ledger
-    calc = calc.__class__.objects.select_for_update().get(pk=calc.pk)
+    calc = calc.__class__.objects.select_for_update().select_related("scheme").get(pk=calc.pk)
+    _ensure_not_held(calc)
     if calc.status not in ("Posted", "Approved"):
         raise ValidationFailed(
             f"Incentive must be Posted before payment (currently {calc.status}).",
@@ -1544,9 +1616,26 @@ def pay_incentive(calc, *, bank_account=None, amount=None, user=None):
         )
 
     payable_amount = calc.incentive_amount - calc.hold_amount
-    pay_amount = D(amount) if amount is not None else (payable_amount - D(calc.paid_amount))
+    schedule = incentive_payout_schedule(calc, as_of=as_of)
+    payable_now = round2(min(D(payable_amount), schedule["eligible"]) - D(calc.paid_amount))
+    if payable_now <= ZERO:
+        when = (
+            f" The next part becomes payable on {schedule['nextDate']:%d %b %Y}."
+            if schedule["nextDate"] else " No customer payment has been received on its invoices yet."
+        )
+        raise BusinessRuleViolation(
+            f"Nothing is payable yet: incentive is paid {schedule['days']} days after the "
+            f"customer's payment.{when}",
+            code="INCENTIVE_NOT_DUE",
+        )
+    pay_amount = D(amount) if amount is not None else payable_now
     if pay_amount <= ZERO:
         raise ValidationFailed("Payment amount must be greater than zero.")
+    if pay_amount > payable_now:
+        raise ValidationFailed(
+            f"Only {payable_now} is payable now ({schedule['days']}-day rule after customer payment).",
+            field_errors={"amount": [f"Maximum {payable_now}."]},
+        )
 
     if bank_account:
         client_id = calc.client_id
@@ -1593,13 +1682,12 @@ def reverse_incentive(calc, *, user=None, reason=None):
     if calc.status == "Reversed":
         raise Conflict("This incentive is already reversed.", code=Codes.ALREADY_DONE)
 
-    if calc.journal_entry_id is not None:
-        ledger.reverse_document_entries(
-            client_id=calc.client_id,
-            source_document_type="IncentiveCalc",
-            source_document_id=calc.id,
-            user=user,
-        )
+    ledger.reverse_document_entries(
+        client_id=calc.client_id,
+        source_document_type="IncentiveCalc",
+        source_document_id=calc.id,
+        user=user,
+    )
     before = {"status": calc.status}
     calc.status = "Reversed"
     calc.reversed_at = timezone.now()
@@ -1620,6 +1708,218 @@ def reverse_incentive(calc, *, user=None, reason=None):
         comments=reason,
     )
     return calc
+
+
+def _ensure_not_held(calc):
+    hold = (calc.detail or {}).get("managementHold")
+    if hold:
+        raise BusinessRuleViolation(
+            f"Incentive {calc.calc_number} is on hold: {hold.get('reason') or 'management hold'}. "
+            "Release the hold first.",
+            code="INCENTIVE_ON_HOLD",
+        )
+
+
+@transaction.atomic
+def hold_incentive(calc, *, reason=None, user=None):
+    """Management hold (bad debt, dispute): blocks approve, post and pay."""
+    from .models import IncentiveCalculation
+
+    calc = IncentiveCalculation.objects.select_for_update().get(pk=calc.pk)
+    if calc.status in ("Paid", "Reversed"):
+        raise ValidationFailed(
+            f"A {calc.status} incentive can't be put on hold.",
+            field_errors={"status": [f"Currently {calc.status}."]},
+        )
+    detail = dict(calc.detail or {})
+    detail["managementHold"] = {
+        "reason": reason or "Management hold",
+        "at": timezone.now().isoformat(),
+        "by": str(user.id) if getattr(user, "is_authenticated", False) else None,
+    }
+    calc.detail = detail
+    calc.save(update_fields=["detail", "updated_at"])
+    record_audit(
+        client=calc.client_id,
+        actor=user,
+        action="incentive_hold",
+        entity_type="IncentiveCalculation",
+        entity_id=calc.id,
+        entity_label=calc.calc_number,
+        description=reason or "Incentive put on hold.",
+        comments=reason,
+    )
+    return calc
+
+
+@transaction.atomic
+def release_incentive_hold(calc, *, user=None):
+    from .models import IncentiveCalculation
+
+    calc = IncentiveCalculation.objects.select_for_update().get(pk=calc.pk)
+    detail = dict(calc.detail or {})
+    if detail.pop("managementHold", None) is None:
+        return calc
+    calc.detail = detail
+    calc.save(update_fields=["detail", "updated_at"])
+    record_audit(
+        client=calc.client_id,
+        actor=user,
+        action="incentive_release",
+        entity_type="IncentiveCalculation",
+        entity_id=calc.id,
+        entity_label=calc.calc_number,
+        description="Incentive hold released.",
+    )
+    return calc
+
+
+def _calc_invoice_payments(calc):
+    """Invoiced / paid / collected on the invoices this calc was built from."""
+    from django.db.models.functions import Coalesce
+    from django.db.models import DecimalField, Value
+    from apps.sales.models import PaymentAllocation, SalesInvoice
+
+    invoice_ids = (calc.detail or {}).get("invoiceIds") or []
+    invoices = SalesInvoice.objects.filter(
+        client_id=calc.client_id, pk__in=invoice_ids, deleted_at__isnull=True
+    ).exclude(status="Cancelled")
+    collection = PaymentAllocation.objects.filter(
+        client_id=calc.client_id,
+        payment_side="in",
+        document_type="SalesInvoice",
+        document_id__in=invoice_ids,
+        deleted_at__isnull=True,
+    ).aggregate(
+        val=Coalesce(Sum("amount"), Value(D("0.00")), output_field=DecimalField())
+    )["val"] or ZERO
+    return {
+        "total_invoiced": round2(sum((D(inv.total) for inv in invoices), ZERO)),
+        "total_paid": round2(sum((D(inv.amount_paid) for inv in invoices), ZERO)),
+        "collection": round2(D(collection)),
+    }
+
+
+@transaction.atomic
+def sync_incentive_with_payments(calc, *, user=None):
+    """Re-price a calc after money on its invoices moves (PDF §12).
+
+    Two schemes depend on payments: COLLECTION basis (incentive is a share of
+    money received) and ``hold_unpaid_invoices`` (the unpaid share is held
+    back). Receiving money releases hold / grows the incentive; a cancelled
+    receipt does the reverse. Once posted, the difference is booked under the
+    same IncentiveCalc source so a later reversal sweeps it too.
+    """
+    from apps.accounting import services as ledger
+
+    from .models import IncentiveCalculation
+
+    calc = (
+        IncentiveCalculation.objects.select_for_update()
+        .select_related("scheme", "employee")
+        .get(pk=calc.pk)
+    )
+    scheme = calc.scheme
+    basis = calc.basis or scheme.basis
+    if calc.status == "Reversed" or (basis != "COLLECTION" and not scheme.hold_unpaid_invoices):
+        return calc
+
+    money = _calc_invoice_payments(calc)
+    incentive = D(calc.incentive_amount)
+    if basis == "COLLECTION":
+        incentive = compute_scheme_incentive(scheme, money["collection"])
+    hold = ZERO
+    if scheme.hold_unpaid_invoices and money["total_invoiced"] > ZERO:
+        unpaid = max(ZERO, money["total_invoiced"] - money["total_paid"])
+        hold = round2(incentive * unpaid / money["total_invoiced"])
+
+    old_payable = D(calc.incentive_amount) - D(calc.hold_amount)
+    new_payable = incentive - hold
+    delta = round2(new_payable - old_payable)
+    if incentive == D(calc.incentive_amount) and hold == D(calc.hold_amount):
+        return calc
+
+    before = {
+        "incentive": str(calc.incentive_amount),
+        "hold": str(calc.hold_amount),
+        "status": calc.status,
+    }
+    detail = dict(calc.detail or {})
+    detail.update({
+        "collection": str(money["collection"]),
+        "totalInvoiced": str(money["total_invoiced"]),
+        "totalPaid": str(money["total_paid"]),
+        "holdAmount": str(hold),
+        "payableAmount": str(new_payable),
+    })
+    if basis == "COLLECTION":
+        detail["baseAmount"] = str(money["collection"])
+    calc.incentive_amount = incentive
+    calc.hold_amount = hold
+    calc.detail = detail
+    fields = ["incentive_amount", "hold_amount", "detail", "updated_at"]
+
+    # Calculated / Approved calcs aren't on the ledger yet: post_incentive
+    # books incentive - hold when it runs, so only the figures change.
+    if delta != ZERO and calc.status in ("Posted", "Paid"):
+        expense_acc = ledger.system_account(calc.client_id, "incentive_expense")
+        payable_acc = _incentive_payable_account(calc)
+        amount = abs(delta)
+        label = f"Incentive {calc.calc_number} - {calc.employee.name}"
+        postings = (
+            [ledger.debit(expense_acc, amount, description=label),
+             ledger.credit(payable_acc, amount, description="Held incentive released")]
+            if delta > ZERO
+            else [ledger.debit(payable_acc, amount, description="Incentive put back on hold"),
+                  ledger.credit(expense_acc, amount, description=label)]
+        )
+        entry = ledger.post_entry(
+            client=calc.client,
+            postings=postings,
+            narration=f"Incentive {calc.calc_number} payment true-up ({calc.period_label})",
+            source_document_type="IncentiveCalc",
+            source_document_id=calc.id,
+            user=user,
+        )
+        if calc.journal_entry_id is None and entry is not None:
+            calc.journal_entry = entry
+            fields.append("journal_entry")
+        paid = D(calc.paid_amount or 0)
+        new_status = "Paid" if new_payable > ZERO and paid >= new_payable else "Posted"
+        if new_status != calc.status:
+            calc.status = new_status
+            fields.append("status")
+
+    calc.save(update_fields=fields)
+    record_audit(
+        client=calc.client_id,
+        actor=user,
+        action="incentive_payment_sync",
+        entity_type="IncentiveCalculation",
+        entity_id=calc.id,
+        entity_label=calc.calc_number,
+        description=f"Incentive re-priced after payment: payable {old_payable} -> {new_payable}.",
+        before=before,
+        after={"incentive": str(incentive), "hold": str(hold), "status": calc.status},
+    )
+    return calc
+
+
+def sync_incentives_for_invoice(invoice, *, user=None):
+    """Re-price every live calc built on ``invoice`` after a payment change."""
+    from .models import IncentiveCalculation
+
+    synced = []
+    calcs = IncentiveCalculation.objects.filter(
+        Q(basis="COLLECTION") | Q(scheme__hold_unpaid_invoices=True),
+        client_id=invoice.client_id,
+        deleted_at__isnull=True,
+    ).exclude(status="Reversed")
+    for calc in calcs:
+        invoice_ids = (calc.detail or {}).get("invoiceIds") or []
+        if str(invoice.id) in {str(pk) for pk in invoice_ids}:
+            synced.append(sync_incentive_with_payments(calc, user=user))
+    return synced
 
 
 def reverse_incentives_for_invoice(invoice, *, user=None, reason=None):

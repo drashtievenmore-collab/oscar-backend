@@ -693,6 +693,9 @@ class IncentiveScheme(TenantModel):
     slabs = models.JSONField(default=list, blank=True)
     hold_unpaid_invoices = models.BooleanField(default=False)
     exclude_gst = models.BooleanField(default=False)
+    #: Incentive is paid out only once the customer's payment is this many
+    #: days old (PDF §12). Per payment, so part-paid invoices release in parts.
+    payout_after_days = models.PositiveIntegerField(default=90)
     applies_from = models.DateField(null=True, blank=True)
     applies_to = models.DateField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
