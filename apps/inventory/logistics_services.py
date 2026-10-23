@@ -105,6 +105,15 @@ def create_trip(
             lot_taka = None
             if taka_id:
                 lot_taka = LotTaka.objects.filter(client_id=client_id, pk=taka_id).first()
+            elif line_data.get("lotNumber"):
+                # Typed lot/taka from the trip form: resolve the roll so the
+                # line carries its item (LR description) and lot linkage.
+                taka_qs = LotTaka.objects.filter(client_id=client_id, lot_number=line_data["lotNumber"])
+                if line_data.get("takaNumber"):
+                    taka_qs = taka_qs.filter(taka_number=line_data["takaNumber"])
+                lot_taka = taka_qs.first()
+            qty = line_data.get("quantity") or line_data.get("qty") or line_data.get("meters") or 0
+            weight = line_data.get("rollWeight") or line_data.get("roll_weight") or line_data.get("weightKg")
 
             TripMaterialLine.objects.create(
                 client_id=client_id,
@@ -113,8 +122,8 @@ def create_trip(
                 lot_number=line_data.get("lotNumber") or (lot_taka.lot_number if lot_taka else ""),
                 taka_number=line_data.get("takaNumber") or (lot_taka.taka_number if lot_taka else ""),
                 item_id=line_data.get("itemId") or (lot_taka.item_id if lot_taka else None),
-                quantity=D(line_data.get("quantity") or line_data.get("qty") or 0),
-                roll_weight=D(line_data.get("rollWeight") or line_data.get("roll_weight") or 0) if line_data.get("rollWeight") or line_data.get("roll_weight") else None,
+                quantity=D(qty),
+                roll_weight=D(weight) if weight else None,
                 document_reference_type=line_data.get("documentReferenceType") or line_data.get("document_reference_type"),
                 document_reference_id=line_data.get("documentReferenceId") or line_data.get("document_reference_id"),
                 document_reference_number=line_data.get("documentReferenceNumber") or line_data.get("document_reference_number"),
@@ -139,8 +148,13 @@ def allocate_trip_freight(trip, *, user=None):
         return trip
 
     lines = list(trip.materials.all())
-    if not lines:
-        raise ValidationFailed("Cannot allocate cost: trip has no material lines.")
+    if not lines and trip.cost_allocation_target != "EXPENSE":
+        # Spreading cost to lots / sales orders needs lines to spread across;
+        # a plain freight expense only needs the GL entry below.
+        raise ValidationFailed(
+            f"Cannot allocate cost to {trip.cost_allocation_target}: this trip has no material lines. "
+            "Add lot/taka lines to the trip, or record it with Cost Allocation Target = EXPENSE."
+        )
 
     total_meters = sum([D(line.quantity) for line in lines])
     total_weight = sum([D(line.roll_weight or 0) for line in lines])

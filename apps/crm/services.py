@@ -29,8 +29,9 @@ from .models import AUTOMATION_SOURCE, Lead, Stage, StageTask, Task
 #: explicit mark-lost) moves it to Lost. Won/Lost are terminal — neither
 #: overwrites the other, and every move is idempotent.
 QUOTATION_DEAL_TRANSITIONS = {
-    "Sent": ("Draft", "Open"),
-    "Open": ("Draft", "Sent", "Revised", "Declined", "Lost"),
+    "Draft": ("Draft", "Open", "Sent", "Revised", "Declined", "Won", "Lost"),
+    "Sent": ("Draft", "Open", "Revised", "Declined", "Lost"),
+    "Open": ("Draft", "Sent", "Revised", "Declined", "Won", "Lost"),
     "Won": ("Draft", "Sent", "Open", "Revised", "Declined"),
     "Lost": ("Draft", "Sent", "Open", "Revised", "Declined"),
 }
@@ -114,6 +115,28 @@ def advance_deal_for_quotation(quotation, stage, *, actor=None, description=None
         if stage in ("Won", "Lost") and deal.closed_at is None:
             deal.closed_at = timezone.now()
         deal.save(update_fields=["stage", "closed_at", "updated_at"])
+        # Also synchronize linked lead stage to mirror quotation lifecycle
+        if deal.lead_id:
+            lead = deal.lead
+            target_lead_stage = None
+            if stage == "Won":
+                target_lead_stage = Stage.objects.filter(client_id=deal.client_id, is_won=True, deleted_at__isnull=True).first()
+                if not target_lead_stage:
+                    target_lead_stage = Stage.objects.filter(client_id=deal.client_id, name__iexact="Won", deleted_at__isnull=True).first()
+            elif stage == "Lost":
+                target_lead_stage = Stage.objects.filter(client_id=deal.client_id, is_lost=True, deleted_at__isnull=True).first()
+                if not target_lead_stage:
+                    target_lead_stage = Stage.objects.filter(client_id=deal.client_id, name__iexact="Lost", deleted_at__isnull=True).first()
+            elif stage == "Sent":
+                target_lead_stage = Stage.objects.filter(client_id=deal.client_id, name__in=["Quotation Shared", "Sent", "Quotation Sent"], deleted_at__isnull=True).first()
+            elif stage == "Open":
+                target_lead_stage = Stage.objects.filter(client_id=deal.client_id, name__in=["Negotiation", "Open", "In Review"], deleted_at__isnull=True).first()
+            elif stage == "Draft":
+                target_lead_stage = Stage.objects.filter(client_id=deal.client_id, name__in=["New Lead", "Draft"], deleted_at__isnull=True).first()
+            if target_lead_stage and lead.stage_id != target_lead_stage.id:
+                lead.stage = target_lead_stage
+                lead.save(update_fields=["stage", "updated_at"])
+
         DealActivity.objects.create(
             deal=deal,
             type="stage_change",

@@ -988,6 +988,8 @@ class Trip(TenantModel, LegacyIdMixin):
         "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     remarks = models.TextField(null=True, blank=True)
+    # LR e-signatures keyed by signatory: consignor / driver / consignee.
+    signatures = models.JSONField(default=dict, blank=True)
 
     class Meta:
         db_table = "transport_trips"
