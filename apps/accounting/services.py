@@ -80,6 +80,68 @@ def seed_chart_of_accounts(client):
     return created
 
 
+#: Starter "Category" choices for Purchase -> Expenses, with the system
+#: ledger each posts to. Seeded once per tenant; edit them on Accounts ->
+#: Expense Categories.
+DEFAULT_EXPENSE_CATEGORIES = [
+    ("Freight / Transport", "freight"),
+    ("Loading / Unloading", "freight"),
+    ("Electricity", "general_expense"),
+    ("Rent", "general_expense"),
+    ("Repairs & Maintenance", "general_expense"),
+    ("Packing Material", "general_expense"),
+    ("Diesel / Fuel", "general_expense"),
+    ("Office Expenses", "general_expense"),
+    ("Telephone & Internet", "general_expense"),
+    ("Travelling & Conveyance", "general_expense"),
+    ("Brokerage & Commission", "brokerage_expense"),
+    ("Sample Expense", "sample_expense"),
+]
+
+
+EXPENSE_CATEGORIES_SEEDED = "expense_categories_seeded"
+
+
+def seed_expense_categories(client_id):
+    """Create the starter expense categories, once per tenant.
+
+    A ``Setting`` marker records that it ran, so categories the user later
+    renames or deletes never come back. Names that already exist (any case,
+    deleted rows included) are skipped.
+    """
+    from django.db import IntegrityError, transaction
+
+    from apps.core.models import Setting
+
+    from .models import ExpenseCategory
+
+    if client_id is None:
+        return []
+    client_id = getattr(client_id, "id", client_id)
+    if Setting.objects.filter(client_id=client_id, key=EXPENSE_CATEGORIES_SEEDED).exists():
+        return []
+    existing = {
+        n.strip().lower()
+        for n in ExpenseCategory.objects.filter(client_id=client_id).values_list("name", flat=True)
+    }
+    created = []
+    try:
+        with transaction.atomic():
+            Setting.objects.create(client_id=client_id, key=EXPENSE_CATEGORIES_SEEDED, value={"done": True})
+            for name, system_key in DEFAULT_EXPENSE_CATEGORIES:
+                if name.lower() in existing:
+                    continue
+                created.append(
+                    ExpenseCategory.objects.create(
+                        client_id=client_id, name=name, account=system_account(client_id, system_key)
+                    )
+                )
+    except IntegrityError:
+        # A concurrent request seeded them first.
+        return []
+    return created
+
+
 def system_account(client_id, system_key):
     account = Account.objects.filter(
         client_id=client_id, system_key=system_key, deleted_at__isnull=True

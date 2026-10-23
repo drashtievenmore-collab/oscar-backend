@@ -759,6 +759,36 @@ class JobWorkOrderViewSet(TenantModelViewSet):
         row = save_order_row(request, order, kind, serializer, instance=row)
         return Response(row_serializer(row, context=context).data)
 
+    @action(detail=True, methods=["post"], url_path="validate-stock")
+    def validate_stock(self, request, pk=None):
+        """Pre-flight validation for Stage 12 outward dispatch."""
+        order = self.get_object()
+        from .services import validate_outward_stock
+        takas_data = request.data.get("takas")
+        qty = request.data.get("qty") or request.data.get("quantity")
+        result = validate_outward_stock(order, takas_data=takas_data, qty=qty)
+        return Response(result)
+
+    @action(
+        detail=True, methods=["post"],
+        url_path=r"outwards/(?P<outward_id>[^/.]+)/confirm",
+        url_name="confirm-outward",
+    )
+    @transaction.atomic
+    def confirm_outward(self, request, pk=None, outward_id=None):
+        """Confirm a draft outward challan and execute stock relocation to External WIP."""
+        order = self.get_object()
+        outward = order.outwards.filter(pk=_uuid_or_404(outward_id), deleted_at__isnull=True).first()
+        if outward is None:
+            raise NotFound()
+        outward.status = "Sent"
+        outward.save(update_fields=["status", "updated_at"])
+        context = self.get_serializer_context()
+        serializer = JWOOutwardSerializer(outward, data={}, partial=True, context=context)
+        serializer.is_valid(raise_exception=True)
+        save_order_row(request, order, "outwards", serializer, instance=outward)
+        return Response(JWOOutwardSerializer(outward, context=context).data)
+
     @action(detail=True, methods=["post"], url_path="sign")
     @transaction.atomic
     def sign(self, request, pk=None):
