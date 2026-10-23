@@ -192,7 +192,7 @@ class Migration(migrations.Migration):
         ("hrms", "0006_employeeaward_employeepromotion_employeetransfer_and_more"),
         # The copy writes fields these migrations add (approved_at,
         # hold_unpaid_invoices, balance_meter, commission_number, ...).
-        ("pms", "0009_alter_incentivescheme_exclude_gst_and_more"),
+        ("pms", "0009_alter_incentivescheme_exclude_gst_and_more"), 
         ("sales", "0009_deliverychallan_broker_fk_and_more"),
     ]
 
