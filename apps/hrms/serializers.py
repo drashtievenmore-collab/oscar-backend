@@ -8,6 +8,10 @@ from apps.core.serializers import (
     TenantPrimaryKeyRelatedField,
 )
 
+from apps.core.money import ZERO, D, round2
+from apps.pms.production_serializers import (
+    IncentiveCalculationSerializer as _PMSIncentiveCalculationSerializer,
+)
 from . import services
 from apps.sales.models import BrokerCommission as SalesBrokerCommission
 from .models import (
@@ -1234,3 +1238,83 @@ class EmployeeAwardSerializer(BaseModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+
+
+class HrmsIncentiveSerializer(_PMSIncentiveCalculationSerializer):
+    """A canonical pms.IncentiveCalculation in the shape the HRMS Incentives
+    page reads (the old SalespersonIncentiveAccrual fields and statuses)."""
+
+    #: Ledger status -> the page's workflow status.
+    STATUS_MAP = {
+        "Calculated": "ACCRUED",
+        "Approved": "APPROVED",
+        "Posted": "APPROVED",
+        "Paid": "PAID",
+        "Reversed": "REVERSED",
+    }
+
+    status = serializers.SerializerMethodField()
+    ledger_status = serializers.CharField(source="status", read_only=True)
+    period_name = serializers.CharField(source="period_label", read_only=True)
+    start_date = serializers.DateField(source="period_start", read_only=True)
+    end_date = serializers.DateField(source="period_end", read_only=True)
+    gross_sales = serializers.SerializerMethodField()
+    returns_deduction = serializers.SerializerMethodField()
+    net_eligible_sales = serializers.SerializerMethodField()
+    applicable_rate = serializers.SerializerMethodField()
+    calculated_incentive = serializers.SerializerMethodField()
+    payable_amount = serializers.SerializerMethodField()
+    hold_reason = serializers.SerializerMethodField()
+    scheme_name = serializers.CharField(source="scheme.name", read_only=True)
+
+    class Meta(_PMSIncentiveCalculationSerializer.Meta):
+        fields = _PMSIncentiveCalculationSerializer.Meta.fields + [
+            "ledger_status", "period_name", "start_date", "end_date",
+            "gross_sales", "returns_deduction", "net_eligible_sales",
+            "applicable_rate", "calculated_incentive", "payable_amount",
+            "hold_reason", "scheme_name",
+        ]
+
+    @staticmethod
+    def _money(value):
+        return float(round2(D(value or 0)))
+
+    def _base(self, obj):
+        base = (obj.detail or {}).get("baseAmount")
+        return D(base) if base not in (None, "") else D(obj.net_sales or 0)
+
+    def get_status(self, obj):
+        if (obj.detail or {}).get("managementHold") and obj.status not in ("Paid", "Reversed"):
+            return "HELD"
+        return self.STATUS_MAP.get(obj.status, (obj.status or "").upper())
+
+    def get_gross_sales(self, obj):
+        return self._money(D(obj.net_sales or 0) + D(obj.returns_total or 0))
+
+    def get_returns_deduction(self, obj):
+        return self._money(obj.returns_total)
+
+    def get_net_eligible_sales(self, obj):
+        return self._money(self._base(obj))
+
+    def get_applicable_rate(self, obj):
+        # Effective rate, so tiered slabs show what was actually earned.
+        base = self._base(obj)
+        if base > ZERO:
+            return float(round2(D(obj.incentive_amount or 0) * D(100) / base))
+        return float(round2(D(obj.scheme.rate_pct or 0)))
+
+    def get_calculated_incentive(self, obj):
+        return self._money(obj.incentive_amount)
+
+    def get_payable_amount(self, obj):
+        return self._money(D(obj.incentive_amount or 0) - D(obj.hold_amount or 0))
+
+    def get_hold_reason(self, obj):
+        hold = (obj.detail or {}).get("managementHold")
+        if hold:
+            return hold.get("reason") or "Management hold"
+        if D(obj.hold_amount or 0) > ZERO:
+            return f"Rs. {round2(D(obj.hold_amount))} held until the customer pays"
+        return ""
+

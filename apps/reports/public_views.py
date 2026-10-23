@@ -154,6 +154,10 @@ class PublicQuotationDecisionView(PublicWriteView):
             from apps.crm import services as crm_services
 
             if self.decision == "accept":
+                from apps.sales.services import fill_salesperson
+
+                # The deal owner earns the incentive on this sale.
+                fill_salesperson(quotation)
                 crm_services.advance_deal_for_quotation(
                     quotation, "Won",
                     description=(

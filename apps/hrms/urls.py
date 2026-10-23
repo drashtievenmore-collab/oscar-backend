@@ -101,10 +101,16 @@ router.register(
 router.register("terminations", views.TerminationViewSet, basename="hrms-terminations")
 router.register("resignations", views.ResignationViewSet, basename="hrms-resignations")
 router.register("complaints", views.ComplaintViewSet, basename="hrms-complaints")
-router.register("transfers", views.EmployeeTransferViewSet, basename="hrms-transfers")
-router.register("promotions", views.EmployeePromotionViewSet, basename="hrms-promotions")
-router.register("warnings", views.EmployeeWarningViewSet, basename="hrms-warnings")
-router.register("awards", views.EmployeeAwardViewSet, basename="hrms-awards")
+# =============================================================================
+# COMMENTED OUT PER OSCAR LETTER PAD SCOPE (Kept for reference, do not delete):
+# Employee career lifecycle -- transfers, promotions, warnings, awards.
+# Re-enable together with CAREER_MILESTONES_ENABLED in
+# Evenmore-oscar/app/src/features/portal/EmployeePortal.jsx.
+# =============================================================================
+# router.register("transfers", views.EmployeeTransferViewSet, basename="hrms-transfers")
+# router.register("promotions", views.EmployeePromotionViewSet, basename="hrms-promotions")
+# router.register("warnings", views.EmployeeWarningViewSet, basename="hrms-warnings")
+# router.register("awards", views.EmployeeAwardViewSet, basename="hrms-awards")
 
 
 urlpatterns = [

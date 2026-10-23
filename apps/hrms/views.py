@@ -135,6 +135,7 @@ from .serializers import (
     WorkingDaySerializer,
     SalespersonIncentiveSchemeSerializer,
     SalespersonIncentiveAccrualSerializer,
+    HrmsIncentiveSerializer,
     BrokerCommissionRecordSerializer,
 )
 
@@ -2354,175 +2355,6 @@ class HrmsSettingsView(APIView):
 # Textile Operational HR & Commercial ViewSets (Oscar Letter Pad Scope)
 # =============================================================================
 
-class SalespersonIncentiveSchemeViewSet(TenantModelViewSet):
-    queryset = SalespersonIncentiveScheme.objects.all()
-    serializer_class = SalespersonIncentiveSchemeSerializer
-    audit_entity_type = "SalespersonIncentiveScheme"
-    permission_classes = [HasModulePermission]
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
-
-
-class SalespersonIncentiveViewSet(TenantModelViewSet):
-    queryset = SalespersonIncentiveAccrual.objects.select_related("employee", "scheme")
-    serializer_class = SalespersonIncentiveAccrualSerializer
-    audit_entity_type = "SalespersonIncentiveAccrual"
-    permission_classes = [HasModulePermission]
-    permission_map = {
-        "read": ["view_staff"],
-        "write": ["edit_staff"],
-        "approve": ["approve_payroll"],
-        "calculate_quarterly": ["edit_staff"],
-        "hold_payout": ["approve_payroll"],
-        "release_payout": ["approve_payroll"],
-    }
-
-    @action(detail=False, methods=["POST"], url_path="calculate-quarterly")
-    def calculate_quarterly(self, request):
-        from apps.sales.models import SalesInvoice, SalesReturn
-        import calendar
-        quarter = int(request.data.get("quarter", (timezone.localdate().month - 1) // 3 + 1))
-        year = int(request.data.get("year", timezone.localdate().year))
-        employee_id = request.data.get("employee_id")
-
-        start_month = (quarter - 1) * 3 + 1
-        end_month = quarter * 3
-        start_date = datetime(year, start_month, 1).date()
-        last_day = calendar.monthrange(year, end_month)[1]
-        end_date = datetime(year, end_month, last_day).date()
-        period_name = f"Q{quarter} {year}"
-
-        schemes = SalespersonIncentiveScheme.objects.filter(
-            client_id=request.client_id, is_active=True
-        ).prefetch_related("applicable_salespersons")
-
-        salespersons_qs = Employee.objects.filter(client_id=request.client_id, status="Active")
-        if employee_id:
-            salespersons_qs = salespersons_qs.filter(id=employee_id)
-
-        results = []
-        for sp in salespersons_qs:
-            scheme = schemes.filter(applicable_salespersons=sp).first() or schemes.first()
-            # Sum gross sales using correct DocumentHeader doc_date and total
-            invoices = SalesInvoice.objects.filter(
-                client_id=request.client_id,
-                doc_date__range=[start_date, end_date],
-            ).filter(
-                Q(salesperson_fk=sp) | Q(salesperson__iexact=sp.name)
-            ).exclude(status__in=["Cancelled", "Draft"])
-
-            gross_sales = sum((inv.total for inv in invoices), ZERO)
-
-            # Sum sales returns using doc_date and total
-            returns = SalesReturn.objects.filter(
-                client_id=request.client_id,
-                doc_date__range=[start_date, end_date],
-            ).filter(
-                Q(salesperson_fk=sp) | Q(salesperson__iexact=sp.name)
-            ).exclude(status__in=["Cancelled", "Draft"])
-            returns_deduction = sum((ret.total for ret in returns), ZERO)
-
-            net_sales = max(ZERO, gross_sales - returns_deduction)
-
-            applicable_rate = D("0.0")
-            calculated_incentive = ZERO
-
-            if scheme:
-                if scheme.slab_type == "FLAT":
-                    applicable_rate = D(str(scheme.flat_rate_percent))
-                    calculated_incentive = round2(net_sales * (applicable_rate / D("100.0")))
-                else:
-                    slabs = scheme.slabs or []
-                    for slab in sorted(slabs, key=lambda s: float(s.get("min_amount", 0))):
-                        min_amt = D(str(slab.get("min_amount", 0)))
-                        if net_sales >= min_amt:
-                            applicable_rate = D(str(slab.get("rate_percent", 0)))
-                    calculated_incentive = round2(net_sales * (applicable_rate / D("100.0")))
-
-            # Check for bad-debt overdue invoices (>90 days past due date with balance due)
-            overdue_cutoff = timezone.localdate() - timedelta(days=90)
-            overdue_invoices = SalesInvoice.objects.filter(
-                client_id=request.client_id,
-                due_date__lte=overdue_cutoff,
-            ).filter(
-                Q(salesperson_fk=sp) | Q(salesperson__iexact=sp.name)
-            ).exclude(status__in=["Cancelled", "Draft"])
-
-            has_bad_debt = any(inv.balance_due > ZERO for inv in overdue_invoices)
-            initial_status = "HELD" if has_bad_debt else "ACCRUED"
-            hold_reason = "Commercial policy hold: overdue unpaid customer invoices (>90 days)" if has_bad_debt else ""
-
-            accrual, _ = SalespersonIncentiveAccrual.objects.update_or_create(
-                client_id=request.client_id,
-                employee=sp,
-                period_name=period_name,
-                defaults={
-                    "scheme": scheme,
-                    "period_type": "QUARTERLY",
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "gross_sales": gross_sales,
-                    "returns_deduction": returns_deduction,
-                    "net_eligible_sales": net_sales,
-                    "applicable_rate": applicable_rate,
-                    "calculated_incentive": calculated_incentive,
-                    "status": initial_status,
-                    "hold_reason": hold_reason,
-                },
-            )
-            results.append(SalespersonIncentiveAccrualSerializer(accrual).data)
-
-        return Response({"period_name": period_name, "count": len(results), "accruals": results})
-
-    @action(detail=True, methods=["POST"], url_path="hold")
-    def hold_payout(self, request, pk=None):
-        accrual = self.get_object()
-        accrual.status = "HELD"
-        accrual.hold_reason = request.data.get("reason", "Management hold")
-        accrual.save(update_fields=["status", "hold_reason", "updated_at"])
-        return Response(self.get_serializer(accrual).data)
-
-    @action(detail=True, methods=["POST"], url_path="release")
-    def release_payout(self, request, pk=None):
-        accrual = self.get_object()
-        accrual.status = "ACCRUED"
-        accrual.hold_reason = ""
-        accrual.save(update_fields=["status", "hold_reason", "updated_at"])
-        return Response(self.get_serializer(accrual).data)
-
-    @action(detail=True, methods=["POST"], url_path="approve")
-    def approve_payout(self, request, pk=None):
-        from apps.accounting.services import post_incentive_accrual
-        accrual = self.get_object()
-        accrual.status = "APPROVED"
-        accrual.approved_by = request.user
-        accrual.approved_at = timezone.now()
-        accrual.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
-        try:
-            post_incentive_accrual(accrual, user=request.user)
-        except Exception:
-            pass
-        return Response(self.get_serializer(accrual).data)
-
-    @action(detail=True, methods=["POST"], url_path="mark-paid")
-    def mark_paid(self, request, pk=None):
-        """Pays the incentive outside payroll (letter pad §12) and clears the
-        Incentive Payable that approval accrued."""
-        from apps.accounting.services import post_incentive_payout
-        accrual = self.get_object()
-        if accrual.status == "PAID":
-            return Response(self.get_serializer(accrual).data)
-        if accrual.status != "APPROVED":
-            raise ValidationFailed(
-                "Approve the incentive before marking it paid.",
-                field_errors={"status": ["Must be Approved."]},
-            )
-        post_incentive_payout(accrual, user=request.user)
-        accrual.status = "PAID"
-        accrual.paid_at = timezone.now()
-        accrual.save(update_fields=["status", "paid_at", "updated_at"])
-        return Response(self.get_serializer(accrual).data)
-
-
 class BrokerCommissionViewSet(TenantModelViewSet):
     """Canonical BrokerCommission ViewSet for HRMS (P12 single source of truth)."""
     queryset = SalesBrokerCommission.objects.select_related("broker", "invoice", "party", "salesperson")
@@ -2579,14 +2411,191 @@ class SalespersonIncentiveSchemeViewSet(PMSIncentiveSchemeViewSet):
 class SalespersonIncentiveViewSet(TenantModelViewSet):
     """Thin proxy for HRMS pointing to canonical pms.IncentiveCalculation (P12)."""
     queryset = IncentiveCalculation.objects.select_related("scheme", "employee", "salesperson")
-    serializer_class = IncentiveCalculationSerializer
+    serializer_class = HrmsIncentiveSerializer
     audit_entity_type = "IncentiveCalculation"
     permission_classes = [HasModulePermission]
     permission_map = {
         "read": ["view_staff"],
         "write": ["edit_staff"],
         "approve": ["approve_payroll"],
+        "calculate_quarterly": ["edit_staff"],
+        "hold_payout": ["approve_payroll"],
+        "release_payout": ["approve_payroll"],
+        "mark_paid": ["approve_payroll"],
     }
+
+    def _calc(self):
+        item = self.get_object()
+        if not isinstance(item, IncentiveCalculation):
+            raise ValidationFailed(
+                "This is a legacy incentive record; recalculate the quarter to manage it.",
+                field_errors={"id": ["Legacy record."]},
+            )
+        return item
+
+    @action(detail=False, methods=["POST"], url_path="calculate-quarterly")
+    def calculate_quarterly(self, request):
+        """Calculate a quarter for every salesperson tagged on its invoices.
+
+        Quarters are Indian financial-year quarters: ``year`` is the FY start,
+        Q1 = Apr-Jun, Q2 = Jul-Sep, Q3 = Oct-Dec, Q4 = Jan-Mar of year + 1.
+        Runs each active Quarterly scheme through the canonical engine
+        (pms.calculate_incentive) without posting, so the result waits for
+        Approve. A Calculated row for the same quarter is recalculated;
+        anything already approved, posted, paid or reversed is left alone.
+        """
+        import calendar
+
+        from apps.pms import production_services
+        from apps.sales.models import SalesInvoice
+
+        today = timezone.localdate()
+        fy_start = today.year if today.month >= 4 else today.year - 1
+        quarter = int(request.data.get("quarter") or ((today.month - 4) % 12) // 3 + 1)
+        year = int(request.data.get("year") or fy_start)
+        if quarter not in (1, 2, 3, 4):
+            raise ValidationFailed("Quarter must be 1-4.", field_errors={"quarter": ["Must be 1-4."]})
+        employee_id = request.data.get("employee_id") or request.data.get("employeeId")
+
+        start_month = 4 + (quarter - 1) * 3  # 4, 7, 10, 13 (= Jan next year)
+        cal_year = year + (start_month - 1) // 12
+        start_month = (start_month - 1) % 12 + 1
+        end_month = start_month + 2
+        start_date = datetime(cal_year, start_month, 1).date()
+        end_date = datetime(cal_year, end_month, calendar.monthrange(cal_year, end_month)[1]).date()
+        period_label = f"Q{quarter} FY{year}-{(year + 1) % 100:02d}"
+
+        schemes = list(
+            IncentiveScheme.objects.filter(
+                client_id=request.client_id, is_active=True, period_type="Quarterly"
+            )
+            .filter(Q(applies_from__isnull=True) | Q(applies_from__lte=end_date))
+            .filter(Q(applies_to__isnull=True) | Q(applies_to__gte=start_date))
+        )
+        if not schemes:
+            raise ValidationFailed(
+                "No active Quarterly incentive scheme covers this quarter.",
+                field_errors={"scheme": ["Create or activate a Quarterly scheme."]},
+            )
+
+        # Only people actually credited on an invoice: an untagged workspace
+        # would otherwise hand every employee the whole company's sales.
+        invoices = SalesInvoice.objects.filter(
+            client_id=request.client_id,
+            doc_date__range=[start_date, end_date],
+            deleted_at__isnull=True,
+        ).exclude(status__in=["Draft", "Cancelled"])
+        tagged_ids = set(
+            invoices.filter(salesperson_fk__isnull=False).values_list("salesperson_fk_id", flat=True)
+        )
+        tagged_names = {
+            name.strip().lower()
+            for name in invoices.exclude(salesperson__isnull=True).values_list("salesperson", flat=True)
+            if name and name.strip()
+        }
+        employees = Employee.objects.filter(client_id=request.client_id, status="Active")
+        if employee_id:
+            employees = employees.filter(id=employee_id)
+        employees = [
+            emp for emp in employees
+            if emp.id in tagged_ids
+            or (emp.name or "").strip().lower() in tagged_names
+            or (emp.employee_code or "").strip().lower() in tagged_names
+        ]
+
+        results, skipped = [], []
+        with transaction.atomic():
+            for scheme in schemes:
+                for emp in employees:
+                    existing = IncentiveCalculation.objects.filter(
+                        client_id=request.client_id, scheme=scheme, employee=emp,
+                        period_label=period_label, deleted_at__isnull=True,
+                    ).first()
+                    if existing is not None:
+                        if existing.status != "Calculated" or existing.journal_entry_id:
+                            skipped.append({
+                                "employeeName": emp.name,
+                                "scheme": scheme.name,
+                                "status": existing.status,
+                            })
+                            continue
+                        existing.soft_delete(user=request.user)
+                    calc = production_services.calculate_incentive(
+                        client=request.user.client,
+                        scheme=scheme,
+                        employee=emp,
+                        period_label=period_label,
+                        period_start=start_date,
+                        period_end=end_date,
+                        user=request.user,
+                        auto_post=False,
+                    )
+                    results.append(self.get_serializer(calc).data)
+
+        return Response({
+            "period_name": period_label,
+            "count": len(results),
+            "accruals": results,
+            "skipped": skipped,
+        })
+
+    @action(detail=True, methods=["POST"], url_path="hold")
+    def hold_payout(self, request, pk=None):
+        from apps.pms import production_services
+
+        calc = production_services.hold_incentive(
+            self._calc(), reason=request.data.get("reason"), user=request.user
+        )
+        return Response(self.get_serializer(calc).data)
+
+    @action(detail=True, methods=["POST"], url_path="release")
+    def release_payout(self, request, pk=None):
+        from apps.pms import production_services
+
+        calc = production_services.release_incentive_hold(self._calc(), user=request.user)
+        return Response(self.get_serializer(calc).data)
+
+    @action(detail=True, methods=["POST"], url_path="mark-paid")
+    @transaction.atomic
+    def mark_paid(self, request, pk=None):
+        """Pay outside payroll (letter pad §12): post the accrual if needed,
+        then Dr Incentive Payable / Cr Bank (or Cash when no bank is given)."""
+        from types import SimpleNamespace
+
+        from apps.accounting import services as ledger
+        from apps.accounting.models import BankAccount
+        from apps.pms import production_services
+
+        calc = self._calc()
+        if calc.status == "Paid":
+            return Response(self.get_serializer(calc).data)
+        if calc.status == "Calculated":
+            raise ValidationFailed(
+                "Approve the incentive before marking it paid.",
+                field_errors={"status": ["Must be Approved."]},
+            )
+        if calc.status == "Approved":
+            calc = production_services.post_incentive(calc, user=request.user)
+
+        bank_account = None
+        bank_account_id = request.data.get("bankAccountId")
+        if bank_account_id:
+            bank_account = BankAccount.objects.filter(
+                id=bank_account_id, client_id=request.client_id, deleted_at__isnull=True
+            ).first()
+        if bank_account is None:
+            bank_account = SimpleNamespace(
+                account=ledger.system_account(calc.client_id, "cash")
+            )
+        if D(calc.incentive_amount) - D(calc.hold_amount) - D(calc.paid_amount) <= ZERO:
+            raise ValidationFailed(
+                "Nothing is payable yet: the incentive is held until the customer pays.",
+                field_errors={"holdAmount": ["Fully held."]},
+            )
+        calc = production_services.pay_incentive(
+            calc, bank_account=bank_account, user=request.user
+        )
+        return Response(self.get_serializer(calc).data)
 
     def get_object(self):
         lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
@@ -2646,7 +2655,7 @@ class SalespersonIncentiveViewSet(TenantModelViewSet):
         if isinstance(item, IncentiveCalculation):
             from apps.pms import production_services
             calc = production_services.approve_incentive(item, user=request.user)
-            return Response(IncentiveCalculationSerializer(calc).data)
+            return Response(self.get_serializer(calc).data)
         item.status = "APPROVED"
         item.approved_by = request.user
         item.approved_at = timezone.now()
