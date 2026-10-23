@@ -1205,12 +1205,8 @@ class PayslipViewSet(TenantModelViewSet):
 
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
-        payslip = self.get_object()
-        if payslip.status == "Paid":
-            raise Conflict("This payslip is already paid.", code=Codes.ALREADY_DONE)
-        payslip.status = "Approved"
-        payslip.save(update_fields=["status", "updated_at"])
-        self.write_audit("approve", payslip, description="Payslip approved")
+        payslip = services.approve_payslip(self.get_object(), user=request.user)
+        self.write_audit("approve", payslip, description="Payslip approved and accrued")
         return Response(self.get_serializer(payslip).data)
 
     @action(detail=True, methods=["post"], url_path="mark-paid")
@@ -1296,6 +1292,46 @@ class SalaryAdvanceViewSet(TenantModelViewSet):
     ordering = ["-issued_on"]
     filter_map = {"employeeId": "employee_id"}
     permission_map = {"read": ["view_own_payslip"], "write": ["generate_payroll"]}
+
+    #: Fields whose change alters what the ledger should hold.
+    LEDGER_FIELDS = ("amount", "issued_on", "employee_id")
+
+    def _bank_account(self):
+        from apps.accounting.models import BankAccount
+
+        bank_account_id = self.request.data.get("bankAccountId")
+        if not bank_account_id:
+            return None
+        return BankAccount.objects.filter(
+            pk=bank_account_id, client_id=self.get_client_id(), deleted_at__isnull=True
+        ).first()
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        advance = super().perform_create(serializer)
+        services.sync_salary_advance_ledger(
+            advance, bank_account=self._bank_account(), user=self.request.user
+        )
+        return advance
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        before = {field: getattr(instance, field) for field in self.LEDGER_FIELDS}
+        was_written_off = instance.status == "Written Off"
+        advance = super().perform_update(serializer)
+        changed = any(getattr(advance, f) != v for f, v in before.items())
+        if changed or was_written_off != (advance.status == "Written Off"):
+            services.sync_salary_advance_ledger(
+                advance, bank_account=self._bank_account(), user=self.request.user
+            )
+        return advance
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        super().perform_destroy(instance)
+        instance.refresh_from_db()
+        services.sync_salary_advance_ledger(instance, user=self.request.user)
 
 
 # ---------------------------------------------------------------------------

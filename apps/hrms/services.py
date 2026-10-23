@@ -561,6 +561,15 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
         )
         split = split_structure(employee.salary_structure, result["earnedSalary"])
 
+        # Re-running the month never resets an approved or paid payslip: its
+        # figures are frozen and already on the ledger (accrual / payment).
+        settled = Payslip.objects.filter(
+            payroll_run=run, employee=employee, status__in=["Approved", "Paid"]
+        ).first()
+        if settled is not None:
+            payslips.append(settled)
+            continue
+
         payslip, created = Payslip.objects.update_or_create(
             payroll_run=run,
             employee=employee,
@@ -664,10 +673,40 @@ def recompute_payslip(payslip, *, earned_salary_override=None, user=None):
     return payslip
 
 
+def _has_accrual(payslip):
+    """Approval posted the accrual: payslip.journal_entry is that entry."""
+    entry = payslip.journal_entry if payslip.journal_entry_id else None
+    return entry is not None and entry.status != "Reversed" and entry.reversal_of_id is None
+
+
+@transaction.atomic
+def approve_payslip(payslip, *, user=None):
+    """Approve and accrue (accrual basis, db.md §11.4): the salary cost and
+    Salaries Payable are booked in the payroll month, not when paid."""
+    from apps.accounting import services as ledger
+
+    payslip = Payslip.objects.select_for_update().get(pk=payslip.pk)
+    if payslip.status == "Paid":
+        raise Conflict("This payslip is already paid.", code=Codes.ALREADY_DONE)
+    payslip.status = "Approved"
+    fields = ["status", "updated_at"]
+    if not _has_accrual(payslip):
+        entry = ledger.post_payroll_accrual(payslip, user=user)
+        if entry is not None:
+            payslip.journal_entry = entry
+            fields.append("journal_entry")
+    payslip.save(update_fields=fields)
+    return payslip
+
+
 @transaction.atomic
 def mark_payslip_paid(payslip, *, payment_date=None, bank_account=None, user=None):
-    """Posts the salary journal entry -- payroll is the one HRMS table that
-    touches accounts (db.md §11.4)."""
+    """Posts the salary payment -- payroll is the one HRMS table that
+    touches accounts (db.md §11.4).
+
+    An accrued payslip only clears Salaries Payable against the bank. One
+    approved before approval accrued gets the original one-shot entry.
+    """
     from apps.accounting import services as ledger
 
     if payslip.status == "Paid":
@@ -685,13 +724,65 @@ def mark_payslip_paid(payslip, *, payment_date=None, bank_account=None, user=Non
         update_fields=["status", "paid_amount", "payment_date", "bank_account", "updated_at"]
     )
 
-    entry = ledger.post_payroll(payslip, user=user)
-    if entry is not None:
-        payslip.journal_entry = entry
-        payslip.save(update_fields=["journal_entry", "updated_at"])
+    if _has_accrual(payslip):
+        ledger.post_payroll_payment(payslip, user=user)
+    else:
+        entry = ledger.post_payroll(payslip, user=user)
+        if entry is not None:
+            payslip.journal_entry = entry
+            payslip.save(update_fields=["journal_entry", "updated_at"])
 
     _recover_advance(payslip)
     return payslip
+
+
+def _advance_funding(advance):
+    """The bank/cash account the advance was originally paid from, if posted."""
+    from types import SimpleNamespace
+
+    from apps.accounting.models import JournalLine
+
+    line = (
+        JournalLine.objects.filter(
+            journal_entry__client_id=advance.client_id,
+            journal_entry__source_document_type="SalaryAdvance",
+            journal_entry__source_document_id=advance.id,
+            journal_entry__reversal_of__isnull=True,
+            credit__gt=0,
+        )
+        .exclude(account__system_key="employee_advances")
+        .select_related("account")
+        .order_by("journal_entry__created_at")
+        .first()
+    )
+    return SimpleNamespace(account=line.account) if line is not None else None
+
+
+@transaction.atomic
+def sync_salary_advance_ledger(advance, *, bank_account=None, user=None):
+    """Make the ledger match the advance (db.md §11.4).
+
+    The disbursement is Dr Employee Advances / Cr Bank; payroll recovery
+    already credits Employee Advances, so without this the account runs
+    negative. A written-off balance moves to Salaries and Wages. Any change
+    reverses what was posted and posts the current picture; a deleted
+    advance is just reversed.
+    """
+    from apps.accounting import services as ledger
+
+    funding = bank_account or _advance_funding(advance)
+    ledger.reverse_document_entries(
+        client_id=advance.client_id,
+        source_document_type="SalaryAdvance",
+        source_document_id=advance.id,
+        user=user,
+    )
+    if advance.deleted_at is not None:
+        return None
+    entry = ledger.post_salary_advance(advance, bank_account=funding, user=user)
+    if advance.status == "Written Off":
+        ledger.post_salary_advance_writeoff(advance, user=user)
+    return entry
 
 
 def _recover_advance(payslip):

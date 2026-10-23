@@ -125,6 +125,60 @@ class BalancesView(APIView):
         )
 
 
+class AccountingLogView(APIView):
+    """``GET /accounts/accounting-log/`` -- admin view of every ledger entry
+    raised by payroll, incentive, brokerage, expenses and payments in/out.
+
+    Query: ``module`` (payroll | incentive | broker | expense | payment_in |
+    payment_out), ``dateFrom``, ``dateTo``, ``search``, ``page``, ``pageSize``.
+    """
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_audit_logs"]
+
+    def get(self, request):
+        from datetime import date
+
+        from . import activity_log
+
+        params = request.query_params
+
+        def parse(name, alias):
+            value = params.get(name) or params.get(alias)
+            if not value:
+                return None
+            try:
+                return date.fromisoformat(value[:10])
+            except ValueError:
+                raise ValidationFailed(
+                    "Dates must be YYYY-MM-DD.", field_errors={name: ["Expected YYYY-MM-DD."]}
+                )
+
+        try:
+            page = max(1, int(params.get("page") or 1))
+            page_size = min(200, max(1, int(params.get("pageSize") or params.get("page_size") or 50)))
+        except ValueError:
+            raise ValidationFailed("page and pageSize must be numbers.")
+
+        filters = {
+            "date_from": parse("dateFrom", "date_from"),
+            "date_to": parse("dateTo", "date_to"),
+            "search": (params.get("search") or "").strip() or None,
+        }
+        rows, total = activity_log.accounting_log(
+            request.client_id, module=params.get("module"), page=page, page_size=page_size, **filters
+        )
+        return Response(
+            envelope(
+                rows,
+                count=total,
+                page=page,
+                page_size=page_size,
+                aggregates={"modules": activity_log.module_summary(request.client_id, **filters)},
+            )
+        )
+
+
 class BankTransferViewSet(TenantModelViewSet):
     queryset = BankTransfer.objects.select_related("from_account", "to_account")
     serializer_class = BankTransferSerializer

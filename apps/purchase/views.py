@@ -1654,6 +1654,19 @@ class ExpenseViewSet(TenantModelViewSet):
         expense.save(update_fields=["journal_entry", "updated_at"])
         return expense
 
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        from apps.accounting import services as ledger
+
+        super().perform_destroy(instance)
+        # A deleted expense leaves the books too (reversed, never erased).
+        ledger.reverse_document_entries(
+            client_id=instance.client_id,
+            source_document_type="Expense",
+            source_document_id=instance.id,
+            user=self.request.user,
+        )
+
 
 class VendorBillViewSet(TenantModelViewSet):
     """Manual vendor-bill entry, matched later to a real ``PurchaseBill``.
