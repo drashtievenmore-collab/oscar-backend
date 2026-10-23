@@ -84,6 +84,7 @@ class ProductionInstructionViewSet(TenantModelViewSet):
             rate_uom=data.get("rate_uom") or "Meter",
             special_terms=data.get("special_terms"),
             expected_start_date=data.get("expected_start_date"),
+            expected_completion_date=data.get("expected_completion_date"),
             supervisor=data.get("supervisor"),
             notes=data.get("notes"),
             pi_date=data.get("pi_date"),

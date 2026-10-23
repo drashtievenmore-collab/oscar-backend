@@ -299,3 +299,19 @@ class AgencyBillMatchTests(TestCase):
         resp = exec_client.post(f"/api/v1/purchase/vendor-bills/{bill.id}/approve/", {"remarks": "Approve mine"})
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
         self.assertIn("Separation of duties", str(resp.data))
+
+    def test_agency_match_approve_action_creates_payable(self):
+        """Agency match endpoint with action='approve' approves bill and generates payable without 500."""
+        resp = self.api.post("/api/v1/purchase/vendor-bills/agency-match/", {
+            "purchaseOrderId": str(self.orig_po.id),
+            "vendorBillNumber": "INV-AGENCY-APPROVE-ENDPOINT",
+            "billDate": "2026-10-16",
+            "qty": 24640,
+            "rate": 5.5,
+            "gstPct": 5.0,
+            "remarks": "Approved through agency match endpoint",
+            "action": "approve",
+        })
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data["status"], "Approved")
+        self.assertIsNotNone(resp.data.get("purchaseBillId") or resp.data.get("purchaseBillNumber"))

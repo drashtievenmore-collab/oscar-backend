@@ -881,6 +881,15 @@ class ProjectViewSet(TenantModelViewSet):
 
         return po, vendor, fabric_item
 
+    @action(detail=True, methods=["get"], url_path="production-lifecycle")
+    def production_lifecycle(self, request, pk=None):
+        """Each production run of this project: Purchase Order (Vendor A
+        Production), then the requirement PDF section 05 stages."""
+        from apps.pms.lifecycle_services import project_flow_lifecycles
+
+        project = self.get_object()
+        return Response({"projectId": str(project.id), "lifecycles": project_flow_lifecycles(project)})
+
     @action(detail=True, methods=["get", "post"], url_path="purchase-orders")
     @transaction.atomic
     def purchase_orders(self, request, pk=None):
@@ -925,6 +934,10 @@ class ProjectViewSet(TenantModelViewSet):
             Q(reference_number=project.code) |
             Q(id__in=linked_ids) |
             Q(notes__icontains=project.code)
+        ).exclude(
+            # Final Job Work POs carry the project for the production lifecycle;
+            # the purchase-branch stage workspaces read this list and never had them.
+            purchase_type="Final Job Work"
         ).select_related("party").prefetch_related("line_items__item").order_by("-created_at")
 
         data = []
@@ -1029,6 +1042,7 @@ class ProjectViewSet(TenantModelViewSet):
                         project=project,
                         lot_taka_id=lot_id,
                         target_qty=row.get("allocateQty") or 0,
+                        allocation_type=row.get("allocationType") or "Customer Project",
                         user=request.user,
                         remarks=row.get("remarks"),
                     )
@@ -1068,6 +1082,8 @@ class ProjectViewSet(TenantModelViewSet):
         )
 
         total_allocated = float(sum(mine_by_lot.values(), Decimal("0")))
+        customer_allocated = float(sum((a.quantity for a in active if getattr(a, "allocation_type", "Customer Project") == "Customer Project"), Decimal("0")))
+        own_allocated = float(sum((a.quantity for a in active if getattr(a, "allocation_type", None) == "Own Project"), Decimal("0")))
         shortage = max(0.0, req_qty - total_allocated)
         alloc_pct = round((total_allocated / req_qty) * 100) if req_qty > 0 else 0
         shortage_pct = round((shortage / req_qty) * 100) if req_qty > 0 else 0
@@ -1156,6 +1172,8 @@ class ProjectViewSet(TenantModelViewSet):
             "expectedCompletionDate": _fmt(stage1.expected_completion_datetime if stage1 and stage1.expected_completion_datetime else project.expected_completion_date),
             "requiredMeters": req_qty,
             "allocatedMeters": total_allocated,
+            "customerAllocatedMeters": customer_allocated,
+            "ownAllocatedMeters": own_allocated,
             "shortageMeters": shortage,
             "allocatedPct": alloc_pct,
             "shortagePct": shortage_pct,
