@@ -213,6 +213,10 @@ class JWOOutward(TenantModel):
     warehouse = models.TextField(null=True, blank=True)
     vehicle_no = models.TextField(null=True, blank=True)
     driver = models.TextField(null=True, blank=True)
+    expected_return_date = models.DateField(null=True, blank=True)
+    authorized_by = models.ForeignKey(
+        "hrms.Employee", null=True, blank=True, on_delete=models.SET_NULL, related_name="authorized_jwo_outwards"
+    )
     remarks = models.TextField(null=True, blank=True)
     status = models.TextField(default="Sent")
 

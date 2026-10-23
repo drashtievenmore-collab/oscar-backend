@@ -402,23 +402,17 @@ def sync_project_pipeline_stages(project):
         if all_inwards:
             jwo_received = sum((Decimal(str(getattr(i, "qty", 0) or getattr(i, "meter", 0) or 0)) for i in all_inwards), Decimal("0"))
 
-    # Authoritative QC inspection lookup: match project's JWO inward receipts first, then project's PO or notes.
+    # Authoritative QC inspection lookup for Finished Goods (Stage 15):
+    # Must strictly match project's JWO inward receipts from external processor
     qc = None
     qc_qs = QCInspection.objects.filter(client_id=client_id, deleted_at__isnull=True)
     inward_ids = [i.id for i in all_inwards]
     inward_nos = [i.no for i in all_inwards if getattr(i, "no", None)]
     if inward_ids or inward_nos:
         qc = qc_qs.filter(
-            Q(source_document_type="JWO_INWARD", source_document_id__in=inward_ids)
-            | Q(source_document_type="JWO_INWARD", source_document_number__in=inward_nos)
-            | Q(notes__icontains=project.code)
+            Q(source_document_type__in=["JWO_INWARD", "JobWorkInward"], source_document_id__in=inward_ids)
+            | Q(source_document_type__in=["JWO_INWARD", "JobWorkInward"], source_document_number__in=inward_nos)
         ).order_by("-inspection_date", "-created_at").first()
-    if not qc and po:
-        qc = qc_qs.filter(
-            Q(purchase_order=po) | Q(source_document_id=po.id) | Q(notes__icontains=project.code)
-        ).order_by("-inspection_date", "-created_at").first()
-    if not qc:
-        qc = qc_qs.filter(notes__icontains=project.code).order_by("-inspection_date", "-created_at").first()
 
     dispatched_qty = Decimal("0")
     dc_doc = None
@@ -968,32 +962,51 @@ def sync_project_pipeline_stages(project):
                 remarks = "Inward pending"
 
         elif name == "Quality Check & Stock Allocation":
-            if qc and qc.status in ("Approved", "Completed", "Passed"):
+            if jwo_received <= Decimal("0") and not all_inwards:
+                status = "Pending"
+                pct = 0
+                remarks = "Awaiting Job Work Inward receipt"
+                document = {
+                    "type": "QCInspection",
+                    "number": "Pending Inward",
+                    "url": "/inventory/qc",
+                    "label": "QC: Awaiting Inward",
+                }
+            elif qc and qc.status in ("Approved", "Completed", "Passed"):
                 status = "Completed"
                 pct = 100
                 quantities["accepted"] = float(qc.passed_qty or jwo_received or req_qty)
-            elif qc:
-                status = "In Progress"
-                pct = 50
-                quantities["accepted"] = float(qc.passed_qty or 0)
-            elif jwo_received > Decimal("0"):
-                status = "In Progress"
-                pct = 20
-            else:
-                status = "Pending"
-                pct = 0
-            if qc:
+                remarks = f"QC Passed {int(qc.passed_qty or jwo_received):,} m"
                 document = {
                     "type": "QCInspection",
                     "number": qc.inspection_number,
                     "url": f"/inventory/qc/register?id={qc.id}",
                     "label": f"QC: {qc.inspection_number}",
                 }
-            if qc and qc.status in ("Approved", "Completed", "Passed"):
-                remarks = f"QC Passed {int(qc.passed_qty or jwo_received):,} m"
             elif qc:
+                status = "In Progress"
+                pct = 50
+                quantities["accepted"] = float(qc.passed_qty or 0)
                 remarks = "QC inspection in progress"
+                document = {
+                    "type": "QCInspection",
+                    "number": qc.inspection_number,
+                    "url": f"/inventory/qc/register?id={qc.id}",
+                    "label": f"QC: {qc.inspection_number}",
+                }
+            elif jwo_received > Decimal("0"):
+                status = "In Progress"
+                pct = 20
+                remarks = "Dock receipt pending QC inspection"
+                document = {
+                    "type": "QCInspection",
+                    "number": "QC Pending",
+                    "url": "/inventory/qc",
+                    "label": "Pending Inspection",
+                }
             else:
+                status = "Pending"
+                pct = 0
                 remarks = "QC pending"
 
         elif name == "Customer Dispatch":

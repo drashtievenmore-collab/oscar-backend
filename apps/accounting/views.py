@@ -2,7 +2,7 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, DecimalField, Q, Sum, Value
+from django.db.models import Count, DecimalField, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import status
@@ -46,6 +46,30 @@ class AccountViewSet(TenantModelViewSet):
     filter_map = {"type": "type", "subtype": "subtype", "isActive": "is_active"}
     search_fields = ["name", "code"]
     ordering = ["code"]
+
+    def get_queryset(self):
+        # Current balance = opening + debit - credit (same as the ledger view),
+        # skipping reversed entries and their reversals.
+        lines = JournalLine.objects.filter(
+            account_id=OuterRef("pk"), deleted_at__isnull=True
+        ).exclude(journal_entry__status="Reversed").exclude(
+            journal_entry__reversal_of__isnull=False
+        )
+        money = DecimalField(max_digits=18, decimal_places=2)
+
+        def total(column):
+            return Coalesce(
+                Subquery(
+                    lines.values("account_id").annotate(t=Sum(column)).values("t")[:1],
+                    output_field=money,
+                ),
+                Value(Decimal("0.00")),
+                output_field=money,
+            )
+
+        return super().get_queryset().annotate(
+            total_debit=total("debit"), total_credit=total("credit")
+        )
 
     def perform_destroy(self, instance):
         if instance.is_system:
@@ -334,6 +358,10 @@ class ExpenseCategoryViewSet(TenantModelViewSet):
     required_permissions = ["view_purchase"]
     status_field = None
     ordering = ["name"]
+
+    def list(self, request, *args, **kwargs):
+        services.seed_expense_categories(self.get_client_id())
+        return super().list(request, *args, **kwargs)
 
 
 class StandaloneNoteViewSet(TenantModelViewSet):

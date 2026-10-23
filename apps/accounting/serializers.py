@@ -1,6 +1,8 @@
 """Accounts serializers (api.md §8)."""
 from rest_framework import serializers
 
+from apps.core.money import D, round2
+
 from apps.core.serializers import (
     BaseModelSerializer,
     BaseSerializer,
@@ -15,13 +17,24 @@ from .models import (
 
 
 class AccountSerializer(BaseModelSerializer):
+    #: opening + debit - credit; positive = Dr, negative = Cr. Only present
+    #: when the queryset annotates the totals (AccountViewSet does).
+    balance = serializers.SerializerMethodField()
+
     class Meta:
         model = Account
         fields = [
             "id", "code", "name", "type", "subtype", "parent", "is_system",
-            "system_key", "is_active", "opening_balance", "created_at", "updated_at",
+            "system_key", "is_active", "opening_balance", "balance", "created_at", "updated_at",
         ]
         read_only_fields = ["is_system", "system_key", "created_at", "updated_at"]
+
+    def get_balance(self, account):
+        debit = getattr(account, "total_debit", None)
+        credit = getattr(account, "total_credit", None)
+        if debit is None or credit is None:
+            return None
+        return round2(D(account.opening_balance) + D(debit) - D(credit))
 
 
 class BankAccountSerializer(BaseModelSerializer):
