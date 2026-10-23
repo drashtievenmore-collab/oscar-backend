@@ -1526,11 +1526,79 @@ def _incentive_payable_account(calc):
     return ledger.system_account(calc.client_id, "incentive_payable")
 
 
+def incentive_payout_schedule(calc, as_of=None):
+    """How much of ``calc`` may be paid out by ``as_of`` (PDF §12).
+
+    Incentive is paid only after the customer's payment is
+    ``scheme.payout_after_days`` old. Each payment matures on its own -- from
+    its payment date, or from when it was set against the invoice if that was
+    later -- and releases its share of the incentive: matured receipts over
+    the invoiced value (over money collected, for COLLECTION basis).
+
+    Returns ``eligible`` (total payable to date, capped at incentive - hold),
+    ``nextDate`` (when more matures, if anything is pending) and ``days``.
+    """
+    from datetime import timedelta
+
+    from django.db.models.functions import Coalesce
+    from django.db.models import DecimalField, Value
+    from apps.sales.models import PaymentAllocation, PaymentIn, SalesInvoice
+
+    as_of = as_of or timezone.localdate()
+    days = calc.scheme.payout_after_days if calc.scheme.payout_after_days is not None else 90
+    payable = max(ZERO, D(calc.incentive_amount) - D(calc.hold_amount))
+    invoice_ids = (calc.detail or {}).get("invoiceIds") or []
+    if not invoice_ids:
+        # Built before invoices were tracked on the calc: nothing to time.
+        return {"eligible": payable, "nextDate": None, "days": days}
+
+    allocations = list(
+        PaymentAllocation.objects.filter(
+            client_id=calc.client_id,
+            payment_side="in",
+            document_type="SalesInvoice",
+            document_id__in=invoice_ids,
+            deleted_at__isnull=True,
+        )
+    )
+    paid_on = dict(
+        PaymentIn.objects.filter(pk__in={a.payment_id for a in allocations}).values_list(
+            "id", "payment_date"
+        )
+    )
+    matured, collected, next_date = ZERO, ZERO, None
+    for allocation in allocations:
+        start = paid_on.get(allocation.payment_id) or timezone.localdate(allocation.allocated_at)
+        start = max(start, timezone.localdate(allocation.allocated_at))
+        due = start + timedelta(days=days)
+        collected += D(allocation.amount)
+        if due <= as_of:
+            matured += D(allocation.amount)
+        elif next_date is None or due < next_date:
+            next_date = due
+
+    if (calc.basis or calc.scheme.basis) == "COLLECTION":
+        base = collected
+    else:
+        base = SalesInvoice.objects.filter(
+            client_id=calc.client_id, pk__in=invoice_ids, deleted_at__isnull=True
+        ).exclude(status="Cancelled").aggregate(
+            val=Coalesce(Sum("total"), Value(D("0.00")), output_field=DecimalField())
+        )["val"] or ZERO
+    share = min(D(1), matured / D(base)) if D(base) > ZERO else ZERO
+    eligible = min(payable, round2(D(calc.incentive_amount) * share))
+    return {"eligible": eligible, "nextDate": next_date, "days": days}
+
+
 @transaction.atomic
-def pay_incentive(calc, *, bank_account=None, amount=None, user=None):
-    """Posted → Paid (PDF §12). Posts Dr Incentive Payable / Cr Bank."""
+def pay_incentive(calc, *, bank_account=None, amount=None, user=None, as_of=None):
+    """Posted → Paid (PDF §12). Posts Dr Incentive Payable / Cr Bank.
+
+    Pays only what has matured under the scheme's payout_after_days rule; the
+    rest stays Posted and is paid once its customer payment is old enough.
+    """
     from apps.accounting import services as ledger
-    calc = calc.__class__.objects.select_for_update().get(pk=calc.pk)
+    calc = calc.__class__.objects.select_for_update().select_related("scheme").get(pk=calc.pk)
     _ensure_not_held(calc)
     if calc.status not in ("Posted", "Approved"):
         raise ValidationFailed(
@@ -1539,9 +1607,26 @@ def pay_incentive(calc, *, bank_account=None, amount=None, user=None):
         )
 
     payable_amount = calc.incentive_amount - calc.hold_amount
-    pay_amount = D(amount) if amount is not None else (payable_amount - D(calc.paid_amount))
+    schedule = incentive_payout_schedule(calc, as_of=as_of)
+    payable_now = round2(min(D(payable_amount), schedule["eligible"]) - D(calc.paid_amount))
+    if payable_now <= ZERO:
+        when = (
+            f" The next part becomes payable on {schedule['nextDate']:%d %b %Y}."
+            if schedule["nextDate"] else " No customer payment has been received on its invoices yet."
+        )
+        raise BusinessRuleViolation(
+            f"Nothing is payable yet: incentive is paid {schedule['days']} days after the "
+            f"customer's payment.{when}",
+            code="INCENTIVE_NOT_DUE",
+        )
+    pay_amount = D(amount) if amount is not None else payable_now
     if pay_amount <= ZERO:
         raise ValidationFailed("Payment amount must be greater than zero.")
+    if pay_amount > payable_now:
+        raise ValidationFailed(
+            f"Only {payable_now} is payable now ({schedule['days']}-day rule after customer payment).",
+            field_errors={"amount": [f"Maximum {payable_now}."]},
+        )
 
     if bank_account:
         client_id = calc.client_id

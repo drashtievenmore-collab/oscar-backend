@@ -62,6 +62,18 @@ class IncentiveEventTestBase(ProductionTestBase):
         )
         return payment
 
+    def age_payments(self, days):
+        """Move every receipt ``days`` into the past (payment and allocation)."""
+        from datetime import timedelta
+
+        from apps.sales.models import PaymentAllocation, PaymentIn
+
+        before = timezone.localdate() - timedelta(days=days)
+        PaymentIn.objects.filter(client=self.client_obj).update(payment_date=before)
+        PaymentAllocation.objects.filter(client=self.client_obj).update(
+            allocated_at=timezone.now() - timedelta(days=days)
+        )
+
     def scheme(self, **kwargs):
         params = {
             "client": self.client_obj,
@@ -166,6 +178,83 @@ class PaymentDrivenIncentiveTests(IncentiveEventTestBase):
         self.assertEqual(calc.status, "Approved")
 
 
+def SalesInvoiceModel():
+    from apps.sales.models import SalesInvoice
+
+    return SalesInvoice
+
+
+class PayoutAfterDaysTests(IncentiveEventTestBase):
+    """Incentive is paid N days (default 90) after the customer's payment."""
+
+    def setUp(self):
+        super().setUp()
+        from types import SimpleNamespace
+
+        self.bank = SimpleNamespace(account=None)
+
+    def test_default_is_90_days(self):
+        self.assertEqual(self.scheme().payout_after_days, 90)
+
+    def test_not_payable_until_payment_is_90_days_old(self):
+        from datetime import timedelta
+
+        from apps.core.exceptions import BusinessRuleViolation
+
+        employee = self.make_employee()
+        invoice = self.make_invoice(employee, total="1000")
+        calc = self.calculate(self.scheme(), employee)  # posted: 100 payable
+
+        with self.assertRaises(BusinessRuleViolation):  # customer hasn't paid
+            services.pay_incentive(calc, bank_account=self.bank, user=self.user)
+
+        self.receive(invoice, "1000")
+        schedule = services.incentive_payout_schedule(calc)
+        self.assertEqual(schedule["eligible"], Decimal("0"))
+        self.assertEqual(schedule["nextDate"], timezone.localdate() + timedelta(days=90))
+        with self.assertRaises(BusinessRuleViolation):  # paid, but not 90 days ago
+            services.pay_incentive(calc, bank_account=self.bank, user=self.user)
+
+        self.age_payments(90)
+        calc = services.pay_incentive(calc, bank_account=self.bank, user=self.user)
+        self.assertEqual(calc.status, "Paid")
+        self.assertEqual(calc.paid_amount, Decimal("100.00"))
+
+    def test_each_payment_releases_its_own_share(self):
+        employee = self.make_employee()
+        invoice = self.make_invoice(employee, total="1000")
+        calc = self.calculate(self.scheme(), employee)
+        self.receive(invoice, "400")
+        self.age_payments(95)
+        self.receive(invoice, "600")  # today: matures in 90 days
+
+        calc = services.pay_incentive(calc, bank_account=self.bank, user=self.user)
+        self.assertEqual(calc.paid_amount, Decimal("40.00"))  # 40% matured
+        self.assertEqual(calc.status, "Posted")
+
+    def test_days_are_changeable_per_scheme(self):
+        employee = self.make_employee()
+        invoice = self.make_invoice(employee, total="1000")
+        calc = self.calculate(self.scheme(payout_after_days=30), employee)
+        self.receive(invoice, "1000")
+        self.age_payments(31)
+        calc = services.pay_incentive(calc, bank_account=self.bank, user=self.user)
+        self.assertEqual(calc.status, "Paid")
+
+    def test_hrms_row_shows_when_it_becomes_payable(self):
+        from apps.hrms.serializers import HrmsIncentiveSerializer
+
+        employee = self.make_employee()
+        invoice = self.make_invoice(employee, total="1000")
+        calc = self.calculate(self.scheme(), employee)
+        self.receive(invoice, "1000")
+        data = HrmsIncentiveSerializer(IncentiveCalculation.objects.get(pk=calc.pk)).data
+        self.assertEqual(data["payableNow"], 0.0)
+        self.assertEqual(data["payoutAfterDays"], 90)
+        self.assertIsNotNone(data["nextPayoutDate"])
+        self.assertTrue(data["holdReason"].startswith("Payable from"))
+
+
 class SalespersonFromDealTests(IncentiveEventTestBase):
     def test_quotation_takes_deal_owner(self):
         from apps.crm.models import Deal
@@ -257,6 +346,13 @@ class HrmsIncentiveRouteTests(IncentiveEventTestBase):
         pk = row["id"]
         response = self.call("approve", "post", "/", pk=pk)
         self.assertEqual(response.data["status"], "APPROVED")
+
+        # Not payable until the customer has paid and 90 days have passed.
+        invoice = SalesInvoiceModel().objects.get(client=self.client_obj)
+        self.receive(invoice, "2000")
+        response = self.call("mark_paid", "post", "/", pk=pk)
+        self.assertEqual(response.status_code, 422, response.data)
+        self.age_payments(91)
 
         response = self.call("mark_paid", "post", "/", pk=pk)
         self.assertEqual(response.status_code, 200, response.data)

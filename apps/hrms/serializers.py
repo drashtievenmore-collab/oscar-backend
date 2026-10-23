@@ -1266,13 +1266,17 @@ class HrmsIncentiveSerializer(_PMSIncentiveCalculationSerializer):
     payable_amount = serializers.SerializerMethodField()
     hold_reason = serializers.SerializerMethodField()
     scheme_name = serializers.CharField(source="scheme.name", read_only=True)
+    payable_now = serializers.SerializerMethodField()
+    next_payout_date = serializers.SerializerMethodField()
+    payout_after_days = serializers.IntegerField(source="scheme.payout_after_days", read_only=True)
 
     class Meta(_PMSIncentiveCalculationSerializer.Meta):
         fields = _PMSIncentiveCalculationSerializer.Meta.fields + [
             "ledger_status", "period_name", "start_date", "end_date",
             "gross_sales", "returns_deduction", "net_eligible_sales",
             "applicable_rate", "calculated_incentive", "payable_amount",
-            "hold_reason", "scheme_name",
+            "hold_reason", "scheme_name", "payable_now", "next_payout_date",
+            "payout_after_days",
         ]
 
     @staticmethod
@@ -1310,11 +1314,37 @@ class HrmsIncentiveSerializer(_PMSIncentiveCalculationSerializer):
     def get_payable_amount(self, obj):
         return self._money(D(obj.incentive_amount or 0) - D(obj.hold_amount or 0))
 
+    def _schedule(self, obj):
+        # One payout schedule per row, shared by the fields that read it.
+        if not hasattr(obj, "_payout_schedule"):
+            from apps.pms.production_services import incentive_payout_schedule
+
+            obj._payout_schedule = incentive_payout_schedule(obj)
+        return obj._payout_schedule
+
+    def get_payable_now(self, obj):
+        if obj.status in ("Paid", "Reversed"):
+            return 0.0
+        payable = D(obj.incentive_amount or 0) - D(obj.hold_amount or 0)
+        now = min(payable, self._schedule(obj)["eligible"]) - D(obj.paid_amount or 0)
+        return self._money(max(ZERO, now))
+
+    def get_next_payout_date(self, obj):
+        if obj.status in ("Paid", "Reversed"):
+            return None
+        next_date = self._schedule(obj)["nextDate"]
+        return next_date.isoformat() if next_date else None
+
     def get_hold_reason(self, obj):
         hold = (obj.detail or {}).get("managementHold")
         if hold:
             return hold.get("reason") or "Management hold"
         if D(obj.hold_amount or 0) > ZERO:
             return f"Rs. {round2(D(obj.hold_amount))} held until the customer pays"
+        if obj.status in ("Approved", "Posted") and self.get_payable_now(obj) <= 0:
+            schedule = self._schedule(obj)
+            if schedule["nextDate"]:
+                return f"Payable from {schedule['nextDate']:%d %b %Y} ({schedule['days']} days after payment)"
+            return f"Awaiting customer payment ({schedule['days']}-day rule)"
         return ""
 
