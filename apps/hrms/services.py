@@ -781,14 +781,18 @@ def calendar_time_label(event):
 
 def org_chart(client_id):
     """``GET /hrms/org-chart/`` -- a recursive walk over ``manager_id``."""
+    # Current staff only: people who have left are not part of the structure.
     employees = list(
         Employee.objects.filter(client_id=client_id, deleted_at__isnull=True)
-        .select_related("designation", "department")
+        .exclude(status__in=["Resigned", "Terminated"])
+        .select_related("designation", "department", "location")
         .only(
-            "id", "name", "employee_code", "manager_id", "avatar_url",
-            "designation__name", "department__name",
+            "id", "name", "employee_code", "manager_id", "avatar_url", "email",
+            "phone", "status", "designation__name", "department__name", "location__name",
         )
+        .order_by("name")
     )
+    names = {employee.id: employee.name for employee in employees}
     nodes = {
         employee.id: {
             "id": str(employee.id),
@@ -797,6 +801,11 @@ def org_chart(client_id):
             "designation": employee.designation.name if employee.designation_id else None,
             "department": employee.department.name if employee.department_id else None,
             "avatar": employee.avatar_url,
+            "email": employee.email,
+            "phone": employee.phone,
+            "status": employee.status,
+            "location": employee.location.name if employee.location_id else None,
+            "manager": names.get(employee.manager_id),
             "reports": [],
         }
         for employee in employees
