@@ -189,9 +189,14 @@ class Command(BaseCommand):
 
     def _seed_accounts(self, client):
         from apps.accounting.models import BankAccount
-        from apps.accounting.services import seed_chart_of_accounts, system_account
+        from apps.accounting.services import (
+            seed_chart_of_accounts,
+            seed_expense_categories,
+            system_account,
+        )
 
         seed_chart_of_accounts(client)
+        seed_expense_categories(client.id)
         bank, _ = BankAccount.objects.get_or_create(
             client=client,
             legacy_id="bank-1",

@@ -172,20 +172,31 @@ class JWOLossEntrySerializer(BaseModelSerializer):
 
 
 class JWOOutwardSerializer(BaseModelSerializer):
+    challanNo = serializers.CharField(
+        source="challan_no", required=False, allow_blank=True, allow_null=True
+    )
     lrNo = serializers.CharField(source="lr_no", required=False, allow_blank=True, allow_null=True)
     vehicleNo = serializers.CharField(
         source="vehicle_no", required=False, allow_blank=True, allow_null=True
     )
+    expectedReturnDate = serializers.DateField(
+        source="expected_return_date", required=False, allow_null=True
+    )
+    authorizedById = TenantPrimaryKeyRelatedField(
+        source="authorized_by", model="hrms.Employee", required=False, allow_null=True
+    )
+    authorizedByName = serializers.ReadOnlyField(source="authorized_by.name")
     takas = JWOOutwardTakaSerializer(many=True, required=False)
 
     class Meta(_RowMeta):
         model = JWOOutward
         fields = [
-            "id", "no", "date", "qty", "lrNo", "transporter", "warehouse",
-            "vehicleNo", "driver", "status", "remarks", "takas",
+            "id", "no", "date", "qty", "challanNo", "lrNo", "transporter", "warehouse",
+            "vehicleNo", "driver", "expectedReturnDate", "authorizedById", "authorizedByName",
+            "status", "remarks", "takas",
         ]
         #: The server allocates challan numbers (JWOUT series).
-        read_only_fields = ["id", "no"]
+        read_only_fields = ["id", "no", "authorizedByName"]
 
 
 class JWOInwardSerializer(BaseModelSerializer):

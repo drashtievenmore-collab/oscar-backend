@@ -267,6 +267,71 @@ def _touch(header, user):
     header.save(update_fields=fields)
 
 
+
+
+def validate_outward_stock(order, takas_data=None, qty=None):
+    """Pre-flight validation for Stage 12 Job Work Outward dispatch."""
+    from apps.inventory.models import LotTaka
+
+    if order.status in JobWorkOrder.LOCKED_STATUSES:
+        raise ValidationFailed(f"Job Work Order {order.jwo_no} is locked ({order.status}).")
+
+    total_qty = D(str(qty or 0))
+    dispatched_so_far = _sum([o for o in live(order.outwards) if o.status in ("Sent", "Confirmed")])
+    remaining_planned = max(D(order.planned_qty or 0) - dispatched_so_far, ZERO)
+
+    taka_errors = []
+    validated_takas = []
+    calculated_qty = ZERO
+
+    if takas_data:
+        for item in takas_data:
+            taka_id = item.get("lot_taka_id") or item.get("lotTakaId") or item.get("lot_taka")
+            if isinstance(taka_id, LotTaka):
+                lot_taka = taka_id
+            else:
+                lot_taka = LotTaka.objects.filter(client_id=order.client_id, id=taka_id).first()
+
+            if not lot_taka:
+                taka_errors.append(f"Taka {taka_id} not found.")
+                continue
+
+            if lot_taka.status == "External WIP":
+                taka_errors.append(f"Roll {lot_taka.taka_number or lot_taka.taka_id} is already at external processor WIP.")
+            elif lot_taka.status in ("Dispatched", "QC Hold", "Scrapped", "Consumed"):
+                taka_errors.append(f"Roll {lot_taka.taka_number or lot_taka.taka_id} has status '{lot_taka.status}' and cannot be dispatched.")
+
+            taka_meters = D(str(item.get("meters") or lot_taka.available_quantity or 0))
+            if taka_meters <= ZERO:
+                taka_errors.append(f"Roll {lot_taka.taka_number or lot_taka.taka_id} has 0 available metres.")
+            elif taka_meters > D(str(lot_taka.available_quantity or 0)):
+                taka_errors.append(f"Roll {lot_taka.taka_number or lot_taka.taka_id}: requested {taka_meters}M exceeds available {lot_taka.available_quantity}M.")
+
+            calculated_qty += taka_meters
+            validated_takas.append({
+                "id": str(lot_taka.id),
+                "takaNumber": lot_taka.taka_number,
+                "lotNumber": lot_taka.lot_number,
+                "meters": float(taka_meters),
+                "availableQuantity": float(lot_taka.available_quantity or 0),
+            })
+
+    if total_qty <= ZERO and calculated_qty > ZERO:
+        total_qty = calculated_qty
+
+    if taka_errors:
+        raise ValidationFailed("; ".join(taka_errors), field_errors={"takas": taka_errors})
+
+    return {
+        "valid": True,
+        "totalQty": float(total_qty),
+        "remainingPlanned": float(remaining_planned),
+        "dispatchedSoFar": float(dispatched_so_far),
+        "validatedTakasCount": len(validated_takas),
+        "validatedTakas": validated_takas,
+    }
+
+
 def save_order_row(request, order, kind, serializer, instance=None):
     """Create (instance=None) or update one child row of a JWO."""
     model, _ser, series, label = ORDER_ROW_KINDS[kind]
@@ -310,38 +375,70 @@ def save_order_row(request, order, kind, serializer, instance=None):
         )
 
     # Post real stock movements and create roll-by-roll taka lines (Phase 2.5)
-    if kind == "outwards" and takas_data:
+    if kind == "outwards":
         from apps.inventory import services as stock_services
-        vendor_party = order.vendor
-        wip_loc = stock_services.wip_location_for_party(order.client_id, vendor_party or order.vendor_name)
-        for t_entry in takas_data:
-            lot_taka = t_entry.get("lot_taka")
-            if not lot_taka:
-                continue
-            meters = D(t_entry.get("meters") or lot_taka.available_quantity or 0)
-            weight_kg = t_entry.get("weight_kg")
-            JWOOutwardTaka.objects.create(
+        from apps.inventory.models import StockMovement, LotTaka
+
+        # Save or update individual taka lines
+        if takas_data:
+            for t_entry in takas_data:
+                lot_taka = t_entry.get("lot_taka")
+                if not lot_taka:
+                    t_id = t_entry.get("lot_taka_id") or t_entry.get("lotTakaId")
+                    if t_id:
+                        lot_taka = LotTaka.objects.filter(client_id=order.client_id, id=t_id).first()
+                if not lot_taka:
+                    continue
+                meters = D(t_entry.get("meters") or lot_taka.available_quantity or 0)
+                weight_kg = t_entry.get("weight_kg")
+                outward_taka, created = JWOOutwardTaka.objects.get_or_create(
+                    client_id=order.client_id,
+                    outward=row,
+                    lot_taka=lot_taka,
+                    defaults={"meters": meters, "weight_kg": weight_kg},
+                )
+                if not created and (meters != outward_taka.meters or weight_kg != outward_taka.weight_kg):
+                    outward_taka.meters = meters
+                    outward_taka.weight_kg = weight_kg
+                    outward_taka.save(update_fields=["meters", "weight_kg", "updated_at"])
+
+        # Stock deduction only on confirmed outward, with strict idempotency guard
+        is_confirmed = str(getattr(row, "status", "")).strip() in ("Sent", "Confirmed")
+        if is_confirmed:
+            vendor_party = order.vendor
+            wip_loc = stock_services.wip_location_for_party(order.client_id, vendor_party or order.vendor_name)
+
+            already_moved = StockMovement.objects.filter(
                 client_id=order.client_id,
-                outward=row,
-                lot_taka=lot_taka,
-                meters=meters,
-                weight_kg=weight_kg,
-            )
-            # Relocate taka to virtual processor WIP
-            stock_services.relocate_lot(
-                client_id=order.client_id,
-                lot=lot_taka,
-                quantity=meters,
-                to_location_id=wip_loc.id,
-                out_type="JOBWORK_OUTWARD",
-                in_type="JOBWORK_OUTWARD",
                 reference_type="JobWorkOrder",
                 reference_id=order.id,
                 reference_number=row.no or order.jwo_no,
-                user=user,
-            )
-            lot_taka.status = "External WIP"
-            lot_taka.save(update_fields=["status", "updated_at"])
+                type="JOBWORK_OUTWARD",
+            ).exists()
+
+            if not already_moved:
+                for ot in row.takas.select_related("lot_taka").all():
+                    lot_taka = ot.lot_taka
+                    if lot_taka and lot_taka.status != "External WIP":
+                        meters = ot.meters or lot_taka.available_quantity or 0
+                        stock_services.relocate_lot(
+                            client_id=order.client_id,
+                            lot=lot_taka,
+                            quantity=meters,
+                            to_location_id=wip_loc.id,
+                            out_type="JOBWORK_OUTWARD",
+                            in_type="JOBWORK_OUTWARD",
+                            reference_type="JobWorkOrder",
+                            reference_id=order.id,
+                            reference_number=row.no or order.jwo_no,
+                            user=user,
+                        )
+                        lot_taka.status = "External WIP"
+                        lot_taka.save(update_fields=["status", "updated_at"])
+
+            if order.status in ("Draft", "Sent"):
+                order.status = "In-Process"
+                order.save(update_fields=["status", "updated_at"])
 
     elif kind == "inwards" and takas_data:
         from apps.inventory import services as stock_services
