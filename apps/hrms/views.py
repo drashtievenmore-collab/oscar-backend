@@ -80,6 +80,8 @@ from .models import (
     Training,
     TrainingParticipant,
     WorkingDay,
+    SalespersonIncentiveScheme,
+    SalespersonIncentiveAccrual,
     BrokerCommissionRecord,
 )
 from .serializers import (
@@ -131,6 +133,9 @@ from .serializers import (
     TrainingParticipantSerializer,
     TrainingSerializer,
     WorkingDaySerializer,
+    SalespersonIncentiveSchemeSerializer,
+    SalespersonIncentiveAccrualSerializer,
+    HrmsIncentiveSerializer,
     BrokerCommissionRecordSerializer,
 )
 
@@ -1200,12 +1205,8 @@ class PayslipViewSet(TenantModelViewSet):
 
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
-        payslip = self.get_object()
-        if payslip.status == "Paid":
-            raise Conflict("This payslip is already paid.", code=Codes.ALREADY_DONE)
-        payslip.status = "Approved"
-        payslip.save(update_fields=["status", "updated_at"])
-        self.write_audit("approve", payslip, description="Payslip approved")
+        payslip = services.approve_payslip(self.get_object(), user=request.user)
+        self.write_audit("approve", payslip, description="Payslip approved and accrued")
         return Response(self.get_serializer(payslip).data)
 
     @action(detail=True, methods=["post"], url_path="mark-paid")
@@ -1291,6 +1292,46 @@ class SalaryAdvanceViewSet(TenantModelViewSet):
     ordering = ["-issued_on"]
     filter_map = {"employeeId": "employee_id"}
     permission_map = {"read": ["view_own_payslip"], "write": ["generate_payroll"]}
+
+    #: Fields whose change alters what the ledger should hold.
+    LEDGER_FIELDS = ("amount", "issued_on", "employee_id")
+
+    def _bank_account(self):
+        from apps.accounting.models import BankAccount
+
+        bank_account_id = self.request.data.get("bankAccountId")
+        if not bank_account_id:
+            return None
+        return BankAccount.objects.filter(
+            pk=bank_account_id, client_id=self.get_client_id(), deleted_at__isnull=True
+        ).first()
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        advance = super().perform_create(serializer)
+        services.sync_salary_advance_ledger(
+            advance, bank_account=self._bank_account(), user=self.request.user
+        )
+        return advance
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        before = {field: getattr(instance, field) for field in self.LEDGER_FIELDS}
+        was_written_off = instance.status == "Written Off"
+        advance = super().perform_update(serializer)
+        changed = any(getattr(advance, f) != v for f, v in before.items())
+        if changed or was_written_off != (advance.status == "Written Off"):
+            services.sync_salary_advance_ledger(
+                advance, bank_account=self._bank_account(), user=self.request.user
+            )
+        return advance
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        super().perform_destroy(instance)
+        instance.refresh_from_db()
+        services.sync_salary_advance_ledger(instance, user=self.request.user)
 
 
 # ---------------------------------------------------------------------------
@@ -2406,14 +2447,191 @@ class SalespersonIncentiveSchemeViewSet(PMSIncentiveSchemeViewSet):
 class SalespersonIncentiveViewSet(TenantModelViewSet):
     """Thin proxy for HRMS pointing to canonical pms.IncentiveCalculation (P12)."""
     queryset = IncentiveCalculation.objects.select_related("scheme", "employee", "salesperson")
-    serializer_class = IncentiveCalculationSerializer
+    serializer_class = HrmsIncentiveSerializer
     audit_entity_type = "IncentiveCalculation"
     permission_classes = [HasModulePermission]
     permission_map = {
         "read": ["view_staff"],
         "write": ["edit_staff"],
         "approve": ["approve_payroll"],
+        "calculate_quarterly": ["edit_staff"],
+        "hold_payout": ["approve_payroll"],
+        "release_payout": ["approve_payroll"],
+        "mark_paid": ["approve_payroll"],
     }
+
+    def _calc(self):
+        item = self.get_object()
+        if not isinstance(item, IncentiveCalculation):
+            raise ValidationFailed(
+                "This is a legacy incentive record; recalculate the quarter to manage it.",
+                field_errors={"id": ["Legacy record."]},
+            )
+        return item
+
+    @action(detail=False, methods=["POST"], url_path="calculate-quarterly")
+    def calculate_quarterly(self, request):
+        """Calculate a quarter for every salesperson tagged on its invoices.
+
+        Quarters are Indian financial-year quarters: ``year`` is the FY start,
+        Q1 = Apr-Jun, Q2 = Jul-Sep, Q3 = Oct-Dec, Q4 = Jan-Mar of year + 1.
+        Runs each active Quarterly scheme through the canonical engine
+        (pms.calculate_incentive) without posting, so the result waits for
+        Approve. A Calculated row for the same quarter is recalculated;
+        anything already approved, posted, paid or reversed is left alone.
+        """
+        import calendar
+
+        from apps.pms import production_services
+        from apps.sales.models import SalesInvoice
+
+        today = timezone.localdate()
+        fy_start = today.year if today.month >= 4 else today.year - 1
+        quarter = int(request.data.get("quarter") or ((today.month - 4) % 12) // 3 + 1)
+        year = int(request.data.get("year") or fy_start)
+        if quarter not in (1, 2, 3, 4):
+            raise ValidationFailed("Quarter must be 1-4.", field_errors={"quarter": ["Must be 1-4."]})
+        employee_id = request.data.get("employee_id") or request.data.get("employeeId")
+
+        start_month = 4 + (quarter - 1) * 3  # 4, 7, 10, 13 (= Jan next year)
+        cal_year = year + (start_month - 1) // 12
+        start_month = (start_month - 1) % 12 + 1
+        end_month = start_month + 2
+        start_date = datetime(cal_year, start_month, 1).date()
+        end_date = datetime(cal_year, end_month, calendar.monthrange(cal_year, end_month)[1]).date()
+        period_label = f"Q{quarter} FY{year}-{(year + 1) % 100:02d}"
+
+        schemes = list(
+            IncentiveScheme.objects.filter(
+                client_id=request.client_id, is_active=True, period_type="Quarterly"
+            )
+            .filter(Q(applies_from__isnull=True) | Q(applies_from__lte=end_date))
+            .filter(Q(applies_to__isnull=True) | Q(applies_to__gte=start_date))
+        )
+        if not schemes:
+            raise ValidationFailed(
+                "No active Quarterly incentive scheme covers this quarter.",
+                field_errors={"scheme": ["Create or activate a Quarterly scheme."]},
+            )
+
+        # Only people actually credited on an invoice: an untagged workspace
+        # would otherwise hand every employee the whole company's sales.
+        invoices = SalesInvoice.objects.filter(
+            client_id=request.client_id,
+            doc_date__range=[start_date, end_date],
+            deleted_at__isnull=True,
+        ).exclude(status__in=["Draft", "Cancelled"])
+        tagged_ids = set(
+            invoices.filter(salesperson_fk__isnull=False).values_list("salesperson_fk_id", flat=True)
+        )
+        tagged_names = {
+            name.strip().lower()
+            for name in invoices.exclude(salesperson__isnull=True).values_list("salesperson", flat=True)
+            if name and name.strip()
+        }
+        employees = Employee.objects.filter(client_id=request.client_id, status="Active")
+        if employee_id:
+            employees = employees.filter(id=employee_id)
+        employees = [
+            emp for emp in employees
+            if emp.id in tagged_ids
+            or (emp.name or "").strip().lower() in tagged_names
+            or (emp.employee_code or "").strip().lower() in tagged_names
+        ]
+
+        results, skipped = [], []
+        with transaction.atomic():
+            for scheme in schemes:
+                for emp in employees:
+                    existing = IncentiveCalculation.objects.filter(
+                        client_id=request.client_id, scheme=scheme, employee=emp,
+                        period_label=period_label, deleted_at__isnull=True,
+                    ).first()
+                    if existing is not None:
+                        if existing.status != "Calculated" or existing.journal_entry_id:
+                            skipped.append({
+                                "employeeName": emp.name,
+                                "scheme": scheme.name,
+                                "status": existing.status,
+                            })
+                            continue
+                        existing.soft_delete(user=request.user)
+                    calc = production_services.calculate_incentive(
+                        client=request.user.client,
+                        scheme=scheme,
+                        employee=emp,
+                        period_label=period_label,
+                        period_start=start_date,
+                        period_end=end_date,
+                        user=request.user,
+                        auto_post=False,
+                    )
+                    results.append(self.get_serializer(calc).data)
+
+        return Response({
+            "period_name": period_label,
+            "count": len(results),
+            "accruals": results,
+            "skipped": skipped,
+        })
+
+    @action(detail=True, methods=["POST"], url_path="hold")
+    def hold_payout(self, request, pk=None):
+        from apps.pms import production_services
+
+        calc = production_services.hold_incentive(
+            self._calc(), reason=request.data.get("reason"), user=request.user
+        )
+        return Response(self.get_serializer(calc).data)
+
+    @action(detail=True, methods=["POST"], url_path="release")
+    def release_payout(self, request, pk=None):
+        from apps.pms import production_services
+
+        calc = production_services.release_incentive_hold(self._calc(), user=request.user)
+        return Response(self.get_serializer(calc).data)
+
+    @action(detail=True, methods=["POST"], url_path="mark-paid")
+    @transaction.atomic
+    def mark_paid(self, request, pk=None):
+        """Pay outside payroll (letter pad §12): post the accrual if needed,
+        then Dr Incentive Payable / Cr Bank (or Cash when no bank is given)."""
+        from types import SimpleNamespace
+
+        from apps.accounting import services as ledger
+        from apps.accounting.models import BankAccount
+        from apps.pms import production_services
+
+        calc = self._calc()
+        if calc.status == "Paid":
+            return Response(self.get_serializer(calc).data)
+        if calc.status == "Calculated":
+            raise ValidationFailed(
+                "Approve the incentive before marking it paid.",
+                field_errors={"status": ["Must be Approved."]},
+            )
+        if calc.status == "Approved":
+            calc = production_services.post_incentive(calc, user=request.user)
+
+        bank_account = None
+        bank_account_id = request.data.get("bankAccountId")
+        if bank_account_id:
+            bank_account = BankAccount.objects.filter(
+                id=bank_account_id, client_id=request.client_id, deleted_at__isnull=True
+            ).first()
+        if bank_account is None:
+            bank_account = SimpleNamespace(
+                account=ledger.system_account(calc.client_id, "cash")
+            )
+        if D(calc.incentive_amount) - D(calc.hold_amount) - D(calc.paid_amount) <= ZERO:
+            raise ValidationFailed(
+                "Nothing is payable yet: the incentive is held until the customer pays.",
+                field_errors={"holdAmount": ["Fully held."]},
+            )
+        calc = production_services.pay_incentive(
+            calc, bank_account=bank_account, user=request.user
+        )
+        return Response(self.get_serializer(calc).data)
 
     def get_object(self):
         lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
@@ -2473,7 +2691,7 @@ class SalespersonIncentiveViewSet(TenantModelViewSet):
         if isinstance(item, IncentiveCalculation):
             from apps.pms import production_services
             calc = production_services.approve_incentive(item, user=request.user)
-            return Response(IncentiveCalculationSerializer(calc).data)
+            return Response(self.get_serializer(calc).data)
         item.status = "APPROVED"
         item.approved_by = request.user
         item.approved_at = timezone.now()

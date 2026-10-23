@@ -287,9 +287,28 @@ class PayrollSeparationTests(ProductionTestBase):
 
         from apps.accounting.models import JournalLine
 
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from apps.sales.models import PaymentAllocation, PaymentIn
+
         employee = self.make_employee()
-        self._make_invoice()
+        invoice = self._make_invoice()
         scheme = self.make_scheme(rate="10")
+        # Incentive is paid 90 days after the customer pays (PDF §12).
+        paid_on = timezone.localdate() - timedelta(days=100)
+        payment = PaymentIn.objects.create(
+            client=self.client_obj, party=invoice.party, payment_number=unique("PAY"),
+            payment_date=paid_on, amount=invoice.total, status="Active",
+        )
+        allocation = PaymentAllocation.objects.create(
+            client=self.client_obj, payment_id=payment.id, payment_side="in",
+            document_type="SalesInvoice", document_id=invoice.id, amount=invoice.total,
+        )
+        PaymentAllocation.objects.filter(pk=allocation.pk).update(
+            allocated_at=timezone.now() - timedelta(days=100)
+        )
         calc = services.calculate_incentive(
             client=self.client_obj,
             scheme=scheme,

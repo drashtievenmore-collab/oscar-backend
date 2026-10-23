@@ -8,6 +8,10 @@ from apps.core.serializers import (
     TenantPrimaryKeyRelatedField,
 )
 
+from apps.core.money import ZERO, D, round2
+from apps.pms.production_serializers import (
+    IncentiveCalculationSerializer as _PMSIncentiveCalculationSerializer,
+)
 from . import services
 from apps.sales.models import BrokerCommission as SalesBrokerCommission
 from .models import (
@@ -64,6 +68,8 @@ from .models import (
     Training,
     TrainingParticipant,
     WorkingDay,
+    SalespersonIncentiveScheme,
+    SalespersonIncentiveAccrual,
     BrokerCommissionRecord,
 )
 
@@ -810,6 +816,7 @@ class HrDocumentSerializer(BaseModelSerializer):
     )
     fileSize = serializers.IntegerField(source="file.file_size", read_only=True)
     fileType = serializers.CharField(source="file.content_type", read_only=True)
+    fileName = serializers.CharField(source="file.file_name", read_only=True)
     expiry = serializers.DateField(source="valid_until", required=False, allow_null=True)
     #: DERIVED from ``valid_until`` at read time (api.md §11.8).
     status = serializers.SerializerMethodField()
@@ -820,7 +827,7 @@ class HrDocumentSerializer(BaseModelSerializer):
         model = HrDocument
         fields = [
             "id", "title", "category", "employee", "employeeId", "version",
-            "expiry", "status", "fileId", "fileSize", "fileType", "uploadedBy",
+            "expiry", "status", "fileId", "fileSize", "fileType", "fileName", "uploadedBy",
             "updatedOn", "tags", "description", "valid_from", "is_confidential",
             "created_at",
         ]
@@ -1055,6 +1062,41 @@ class ComplaintSerializer(BaseModelSerializer):
 # Textile Operational HR & Commercial Serializers (Oscar Letter Pad Scope)
 # =============================================================================
 
+class SalespersonIncentiveSchemeSerializer(BaseModelSerializer):
+    salespersonCount = serializers.IntegerField(
+        source="applicable_salespersons.count", read_only=True
+    )
+
+    class Meta:
+        model = SalespersonIncentiveScheme
+        fields = [
+            "id", "name", "code", "basis", "frequency", "slab_type",
+            "slabs", "flat_rate_percent", "deduct_returns", "deduct_bad_debts",
+            "is_active", "description", "salespersonCount", "applicable_salespersons",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class SalespersonIncentiveAccrualSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee", required=False)
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    schemeName = serializers.CharField(source="scheme.name", read_only=True)
+
+    class Meta:
+        model = SalespersonIncentiveAccrual
+        fields = [
+            "id", "employee", "employeeId", "employeeName", "employeeCode", "scheme", "schemeName",
+            "period_type", "period_name", "start_date", "end_date",
+            "gross_sales", "returns_deduction", "net_eligible_sales",
+            "applicable_rate", "calculated_incentive", "status", "hold_reason",
+            "approved_by", "approved_at", "paid_at", "journal_entry", "notes",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
 class BrokerCommissionRecordSerializer(BaseModelSerializer):
     brokerName = serializers.CharField(source="broker.name", read_only=True)
     brokerCode = serializers.CharField(source="broker.code", read_only=True)
@@ -1196,3 +1238,113 @@ class EmployeeAwardSerializer(BaseModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+
+
+class HrmsIncentiveSerializer(_PMSIncentiveCalculationSerializer):
+    """A canonical pms.IncentiveCalculation in the shape the HRMS Incentives
+    page reads (the old SalespersonIncentiveAccrual fields and statuses)."""
+
+    #: Ledger status -> the page's workflow status.
+    STATUS_MAP = {
+        "Calculated": "ACCRUED",
+        "Approved": "APPROVED",
+        "Posted": "APPROVED",
+        "Paid": "PAID",
+        "Reversed": "REVERSED",
+    }
+
+    status = serializers.SerializerMethodField()
+    ledger_status = serializers.CharField(source="status", read_only=True)
+    period_name = serializers.CharField(source="period_label", read_only=True)
+    start_date = serializers.DateField(source="period_start", read_only=True)
+    end_date = serializers.DateField(source="period_end", read_only=True)
+    gross_sales = serializers.SerializerMethodField()
+    returns_deduction = serializers.SerializerMethodField()
+    net_eligible_sales = serializers.SerializerMethodField()
+    applicable_rate = serializers.SerializerMethodField()
+    calculated_incentive = serializers.SerializerMethodField()
+    payable_amount = serializers.SerializerMethodField()
+    hold_reason = serializers.SerializerMethodField()
+    scheme_name = serializers.CharField(source="scheme.name", read_only=True)
+    payable_now = serializers.SerializerMethodField()
+    next_payout_date = serializers.SerializerMethodField()
+    payout_after_days = serializers.IntegerField(source="scheme.payout_after_days", read_only=True)
+
+    class Meta(_PMSIncentiveCalculationSerializer.Meta):
+        fields = _PMSIncentiveCalculationSerializer.Meta.fields + [
+            "ledger_status", "period_name", "start_date", "end_date",
+            "gross_sales", "returns_deduction", "net_eligible_sales",
+            "applicable_rate", "calculated_incentive", "payable_amount",
+            "hold_reason", "scheme_name", "payable_now", "next_payout_date",
+            "payout_after_days",
+        ]
+
+    @staticmethod
+    def _money(value):
+        return float(round2(D(value or 0)))
+
+    def _base(self, obj):
+        base = (obj.detail or {}).get("baseAmount")
+        return D(base) if base not in (None, "") else D(obj.net_sales or 0)
+
+    def get_status(self, obj):
+        if (obj.detail or {}).get("managementHold") and obj.status not in ("Paid", "Reversed"):
+            return "HELD"
+        return self.STATUS_MAP.get(obj.status, (obj.status or "").upper())
+
+    def get_gross_sales(self, obj):
+        return self._money(D(obj.net_sales or 0) + D(obj.returns_total or 0))
+
+    def get_returns_deduction(self, obj):
+        return self._money(obj.returns_total)
+
+    def get_net_eligible_sales(self, obj):
+        return self._money(self._base(obj))
+
+    def get_applicable_rate(self, obj):
+        # Effective rate, so tiered slabs show what was actually earned.
+        base = self._base(obj)
+        if base > ZERO:
+            return float(round2(D(obj.incentive_amount or 0) * D(100) / base))
+        return float(round2(D(obj.scheme.rate_pct or 0)))
+
+    def get_calculated_incentive(self, obj):
+        return self._money(obj.incentive_amount)
+
+    def get_payable_amount(self, obj):
+        return self._money(D(obj.incentive_amount or 0) - D(obj.hold_amount or 0))
+
+    def _schedule(self, obj):
+        # One payout schedule per row, shared by the fields that read it.
+        if not hasattr(obj, "_payout_schedule"):
+            from apps.pms.production_services import incentive_payout_schedule
+
+            obj._payout_schedule = incentive_payout_schedule(obj)
+        return obj._payout_schedule
+
+    def get_payable_now(self, obj):
+        if obj.status in ("Paid", "Reversed"):
+            return 0.0
+        payable = D(obj.incentive_amount or 0) - D(obj.hold_amount or 0)
+        now = min(payable, self._schedule(obj)["eligible"]) - D(obj.paid_amount or 0)
+        return self._money(max(ZERO, now))
+
+    def get_next_payout_date(self, obj):
+        if obj.status in ("Paid", "Reversed"):
+            return None
+        next_date = self._schedule(obj)["nextDate"]
+        return next_date.isoformat() if next_date else None
+
+    def get_hold_reason(self, obj):
+        hold = (obj.detail or {}).get("managementHold")
+        if hold:
+            return hold.get("reason") or "Management hold"
+        if D(obj.hold_amount or 0) > ZERO:
+            return f"Rs. {round2(D(obj.hold_amount))} held until the customer pays"
+        if obj.status in ("Approved", "Posted") and self.get_payable_now(obj) <= 0:
+            schedule = self._schedule(obj)
+            if schedule["nextDate"]:
+                return f"Payable from {schedule['nextDate']:%d %b %Y} ({schedule['days']} days after payment)"
+            return f"Awaiting customer payment ({schedule['days']}-day rule)"
+        return ""
+

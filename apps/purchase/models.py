@@ -493,8 +493,11 @@ class Expense(TenantModel, LegacyIdMixin):
 # ---------------------------------------------------------------------------
 # Vendor bills -- manual entry, matched later to a real PurchaseBill
 # ---------------------------------------------------------------------------
-VENDOR_BILL_STATUSES = ["Pending", "Approved", "Rejected"]
-VENDOR_BILL_MATCH_STATUSES = ["Pending Matching", "Matched"]
+#: Draft / Pending Approval are written by the agency bill match flow
+#: (save draft / submit for approval); approve and reject accept both pending states.
+VENDOR_BILL_STATUSES = ["Draft", "Pending", "Pending Approval", "Approved", "Rejected"]
+VENDOR_BILL_PENDING_STATUSES = ("Pending", "Pending Approval")
+VENDOR_BILL_MATCH_STATUSES = ["Pending Matching", "Matched", "Mismatch"]
 
 
 class VendorBill(TenantModel, LegacyIdMixin):

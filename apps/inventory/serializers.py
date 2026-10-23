@@ -560,6 +560,7 @@ class TripSerializer(BaseModelSerializer):
     costAllocationTarget = serializers.CharField(source="cost_allocation_target", required=False, default="LOT")
     isCostAllocated = serializers.BooleanField(source="is_cost_allocated", read_only=True)
     materials = TripMaterialLineSerializer(many=True, required=False)
+    signatures = serializers.JSONField(read_only=True)
 
     class Meta:
         model = Trip
@@ -570,7 +571,7 @@ class TripSerializer(BaseModelSerializer):
             "tripType", "status", "freightAmount", "loadingCharges", "unloadingCharges",
             "otherCharges", "totalCharges", "paidBy", "costAllocationTarget",
             "isCostAllocated", "dispatch_time", "delivery_time", "remarks",
-            "materials", "created_at", "updated_at",
+            "materials", "signatures", "created_at", "updated_at",
         ]
         read_only_fields = ["id", "tripNumber", "totalCharges", "isCostAllocated", "created_at", "updated_at"]
 

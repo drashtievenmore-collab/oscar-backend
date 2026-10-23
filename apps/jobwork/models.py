@@ -15,6 +15,11 @@ class ProcessPlan(TenantModel, LegacyIdMixin):
     ]
 
     plan_no = models.TextField(db_index=True)
+    project = models.ForeignKey(
+        "pms.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="process_plans"
+    )
+    project_destination = models.TextField(default="Customer Project")
+    priority = models.TextField(default="Normal")
     date = models.DateField()
     process = models.TextField()
     process_category = models.TextField(null=True, blank=True)
@@ -28,6 +33,10 @@ class ProcessPlan(TenantModel, LegacyIdMixin):
     fabric_quality = models.TextField(default="")
     taka_roll_no = models.TextField(null=True, blank=True)
     shade = models.TextField(null=True, blank=True)
+    target_shade_fk = models.ForeignKey(
+        "masters.Shade", null=True, blank=True, on_delete=models.SET_NULL, related_name="target_process_plans"
+    )
+    selected_takas = models.JSONField(default=list, blank=True)
     expected_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     expected_loss = models.DecimalField(max_digits=7, decimal_places=4, default=0)
     expected_return_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
@@ -55,6 +64,7 @@ class ProcessPlan(TenantModel, LegacyIdMixin):
     )
     status = models.TextField(choices=STATUSES, default="Active")
     remarks = models.TextField(null=True, blank=True)
+    signatures = models.JSONField(default=dict, blank=True)
 
     class Meta:
         db_table = "jobwork_process_plans"
@@ -111,6 +121,10 @@ class JobWorkOrder(TenantModel, LegacyIdMixin):
     LOCKED_STATUSES = ("Closed",)
 
     jwo_no = models.TextField(db_index=True)
+    project = models.ForeignKey(
+        "pms.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="job_work_orders"
+    )
+    project_destination = models.TextField(default="Customer Project")
     process_plan = models.ForeignKey(
         ProcessPlan, null=True, blank=True, on_delete=models.SET_NULL,
         related_name="job_work_orders",
@@ -141,6 +155,7 @@ class JobWorkOrder(TenantModel, LegacyIdMixin):
     expected_completion = models.DateField(null=True, blank=True)
     status = models.TextField(choices=STATUSES, default="In-Process")
     remarks = models.TextField(null=True, blank=True)
+    signatures = models.JSONField(default=dict, blank=True)
 
     class Meta:
         db_table = "jobwork_orders"
@@ -198,6 +213,10 @@ class JWOOutward(TenantModel):
     warehouse = models.TextField(null=True, blank=True)
     vehicle_no = models.TextField(null=True, blank=True)
     driver = models.TextField(null=True, blank=True)
+    expected_return_date = models.DateField(null=True, blank=True)
+    authorized_by = models.ForeignKey(
+        "hrms.Employee", null=True, blank=True, on_delete=models.SET_NULL, related_name="authorized_jwo_outwards"
+    )
     remarks = models.TextField(null=True, blank=True)
     status = models.TextField(default="Sent")
 

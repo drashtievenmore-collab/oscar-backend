@@ -111,6 +111,10 @@ class SalesDocumentViewSet(TenantModelViewSet):
             .prefetch_related("line_items__item")
         )
 
+    def after_create(self, instance):
+        super().after_create(instance)
+        services.fill_salesperson(instance)
+
     def get_aggregates(self, queryset):
         rows = queryset.aggregate(
             count=Count("id"),
@@ -223,6 +227,7 @@ def _clone_document(source, target_model, overrides, *, number_field, series,
     target = target_model(**payload)
     setattr(target, number_field, allocate_number(source.client, series, target.doc_date))
     target.save()
+    services.fill_salesperson(target)
 
     module = importlib.import_module(target_model.__module__)
     line_model = getattr(module, line_model_name)
@@ -268,7 +273,68 @@ class QuotationViewSet(SalesDocumentViewSet):
         serializer.validated_data["quotation_number"] = allocate_number(
             self.request.user.client, "QT", serializer.validated_data.get("doc_date")
         )
-        return super().perform_create(serializer)
+        quotation = super().perform_create(serializer)
+        from apps.crm import services as crm_services
+        crm_services.advance_deal_for_quotation(
+            quotation, "Draft", actor=self.request.user,
+            description=f"Quotation {quotation.quotation_number} created in Draft.",
+        )
+        return quotation
+
+    def _hold_for_approval(self, quotation, note=None):
+        """Gate a quotation before it goes to the customer.
+
+        Returns a 409 response (and leaves the quotation in Pending Approval)
+        when an approver is needed, else None. Never raises, so the request
+        that was opened survives the caller's transaction.
+        """
+        from . import discount_control
+
+        quotation.refresh_from_db()
+        evaluation, req = discount_control.gate_document(
+            quotation, self.request.user, "Quotation", quotation.quotation_number, note=note
+        )
+        if req is None:
+            if quotation.status == "Pending Approval":
+                quotation.status = "Draft"
+                quotation.save(update_fields=["status", "updated_at"])
+            return None
+        if quotation.status != "Pending Approval":
+            quotation.status = "Pending Approval"
+            quotation.save(update_fields=["status", "updated_at"])
+        return _approval_required_response("Quotation", quotation.quotation_number, evaluation, req)
+
+    @action(detail=True, methods=["get"], url_path="discount-check")
+    def discount_check(self, request, pk=None):
+        """What this quotation's discounts need: per line, who must approve."""
+        from . import discount_control
+
+        return Response(discount_control.evaluate_document(self.get_object(), user=request.user))
+
+    @action(detail=True, methods=["post"], url_path="request-approval")
+    def request_approval(self, request, pk=None):
+        """``{ reason }`` -- ask for discount approval now, at save time,
+        instead of waiting for send. 200 ``{needsApproval: false}`` when the
+        discounts are within the user's authority."""
+        quotation = self.get_object()
+        if quotation.status not in self.draft_values:
+            raise Conflict(
+                f"This quotation is {quotation.status}; its discount is already settled.",
+                code=Codes.DRAFT_ONLY,
+            )
+        blocked = self._hold_for_approval(quotation, note=(request.data.get("reason") or "").strip() or None)
+        if blocked is None:
+            return Response({"needsApproval": False})
+        body = dict(blocked.data)
+        body["needsApproval"] = True
+        return Response(body)
+
+    @action(detail=True, methods=["post"])
+    def send(self, request, pk=None):
+        blocked = self._hold_for_approval(self.get_object())
+        if blocked is not None:
+            return blocked
+        return super().send(request, pk=pk)
 
     def _hold_for_approval(self, quotation, note=None):
         """Gate a quotation before it goes to the customer.
@@ -350,6 +416,11 @@ class QuotationViewSet(SalesDocumentViewSet):
                 crm_services.advance_deal_for_quotation(
                     quotation, "Won", actor=self.request.user,
                     description=f"Quotation {quotation.quotation_number} approved — deal won.",
+                )
+            elif quotation.status == "Draft":
+                crm_services.advance_deal_for_quotation(
+                    quotation, "Draft", actor=self.request.user,
+                    description=f"Quotation {quotation.quotation_number} reset to Draft.",
                 )
         return quotation
 
@@ -504,6 +575,9 @@ class QuotationViewSet(SalesDocumentViewSet):
             quotation.party = party
             quotation.freeze_party_snapshot(party)
             quotation.save()
+        # The deal owner is who earns the incentive on this sale; carry them
+        # onto the quotation so the order and invoice inherit it.
+        services.fill_salesperson(quotation)
         # An approval wins the linked deal: same transaction, so a failed
         # deal move rolls the approval back too.
         crm_services.advance_deal_for_quotation(

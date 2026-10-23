@@ -191,6 +191,7 @@ class IncentiveSchemeSerializer(BaseModelSerializer):
         fields = [
             "id", "name", "description", "period_type", "basis", "slab_type",
             "rate_pct", "slabs", "hold_unpaid_invoices", "exclude_gst",
+            "payout_after_days",
             "applies_from", "applies_to", "is_active", "created_at", "updated_at",
         ]
 

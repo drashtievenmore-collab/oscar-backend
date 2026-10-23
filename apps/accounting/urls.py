@@ -17,6 +17,7 @@ router.register("standalone-notes", views.StandaloneNoteViewSet, basename="accou
 
 urlpatterns = [
     path("balances/", views.BalancesView.as_view(), name="accounts-balances"),
+    path("accounting-log/", views.AccountingLogView.as_view(), name="accounts-accounting-log"),
     path(
         "ledger/<uuid:account_id>/",
         views.AccountLedgerView.as_view(),

@@ -988,6 +988,8 @@ class Trip(TenantModel, LegacyIdMixin):
         "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     remarks = models.TextField(null=True, blank=True)
+    # LR e-signatures keyed by signatory: consignor / driver / consignee.
+    signatures = models.JSONField(default=dict, blank=True)
 
     class Meta:
         db_table = "transport_trips"
@@ -1045,6 +1047,13 @@ class GreyStockAllocation(TenantModel):
     STATUS_RELEASED = "Released"
     STATUSES = [(STATUS_ACTIVE, STATUS_ACTIVE), (STATUS_RELEASED, STATUS_RELEASED)]
 
+    ALLOCATION_CUSTOMER = "Customer Project"
+    ALLOCATION_OWN = "Own Project"
+    ALLOCATION_TYPES = [
+        (ALLOCATION_CUSTOMER, ALLOCATION_CUSTOMER),
+        (ALLOCATION_OWN, ALLOCATION_OWN),
+    ]
+
     project = models.ForeignKey(
         "pms.Project", on_delete=models.PROTECT, related_name="grey_stock_allocations"
     )
@@ -1053,6 +1062,7 @@ class GreyStockAllocation(TenantModel):
     )
     item = models.ForeignKey("masters.Item", on_delete=models.PROTECT, related_name="+")
     quantity = models.DecimalField(max_digits=18, decimal_places=4)
+    allocation_type = models.TextField(choices=ALLOCATION_TYPES, default=ALLOCATION_CUSTOMER)
     uom = models.TextField(null=True, blank=True)
     status = models.TextField(choices=STATUSES, default=STATUS_ACTIVE)
     remarks = models.TextField(null=True, blank=True)
@@ -1072,6 +1082,7 @@ class GreyStockAllocation(TenantModel):
         ]
         indexes = [
             models.Index(fields=["client", "project", "status"], name="ix_grey_alloc_project"),
+            models.Index(fields=["client", "project", "allocation_type", "status"], name="ix_grey_alloc_type"),
             models.Index(fields=["client", "lot_taka", "status"], name="ix_grey_alloc_lot"),
         ]
 

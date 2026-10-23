@@ -6134,6 +6134,9 @@ class SampleViewSet(TenantModelViewSet):
         return Response(sampling_services.get_sample_expense_dashboard(request.client_id))
 
 
+TRIP_SIGNATORIES = ("consignor", "driver", "consignee")
+
+
 class TripViewSet(TenantModelViewSet):
     queryset = Trip.objects.select_related("transporter", "transporter_party").prefetch_related("materials")
     serializer_class = TripSerializer
@@ -6180,6 +6183,33 @@ class TripViewSet(TenantModelViewSet):
     def allocate_freight(self, request, pk=None):
         trip = self.get_object()
         trip = logistics_services.allocate_trip_freight(trip, user=request.user)
+        return Response(self.get_serializer(trip).data)
+
+    @action(detail=True, methods=["post"], url_path="sign")
+    @transaction.atomic
+    def sign(self, request, pk=None):
+        """Record (or clear, with ``signature: null``) an LR e-signature."""
+        trip = self.get_object()
+        sig_type = request.data.get("signatoryType")
+        if sig_type not in TRIP_SIGNATORIES:
+            raise ValidationFailed(
+                "Invalid signatory.",
+                field_errors={"signatoryType": [f"Must be one of: {', '.join(TRIP_SIGNATORIES)}."]},
+            )
+        signature = request.data.get("signature")
+        if signature is not None and not isinstance(signature, dict):
+            raise ValidationFailed("Signature must be an object.", field_errors={"signature": ["Expected an object."]})
+        sigs = dict(trip.signatures or {})
+        if signature is None:
+            sigs.pop(sig_type, None)
+        else:
+            sigs[sig_type] = {**signature, "recordedBy": getattr(request.user, "email", None)}
+        trip.signatures = sigs
+        trip.save(update_fields=["signatures", "updated_at"])
+        self.write_audit(
+            "sign", trip,
+            description=f"LR {sig_type} signature {'recorded' if signature is not None else 'removed'}",
+        )
         return Response(self.get_serializer(trip).data)
 
     @action(detail=True, methods=["post"], url_path="confirm-delivery")

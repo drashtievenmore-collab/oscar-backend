@@ -105,10 +105,17 @@ def fabric_stock_summary(client_id, *, project=None, item_id=None, fabric_qualit
     lots = list(qs)
 
     mine_by_lot = {}
+    customer_by_lot = {}
+    own_by_lot = {}
     if project:
         active_allocations = project_allocations(client_id, project)
         for a in active_allocations:
             mine_by_lot[a.lot_taka_id] = mine_by_lot.get(a.lot_taka_id, ZERO) + a.quantity
+            alloc_type = getattr(a, "allocation_type", GreyStockAllocation.ALLOCATION_CUSTOMER) or GreyStockAllocation.ALLOCATION_CUSTOMER
+            if alloc_type == GreyStockAllocation.ALLOCATION_OWN:
+                own_by_lot[a.lot_taka_id] = own_by_lot.get(a.lot_taka_id, ZERO) + a.quantity
+            else:
+                customer_by_lot[a.lot_taka_id] = customer_by_lot.get(a.lot_taka_id, ZERO) + a.quantity
 
         existing_lot_ids = {lot.id for lot in lots}
         missing_ids = [a.lot_taka_id for a in active_allocations if a.lot_taka_id not in existing_lot_ids]
@@ -174,6 +181,14 @@ def fabric_stock_summary(client_id, *, project=None, item_id=None, fabric_qualit
         else:
             status_label = "Available"
 
+        c_alloc = customer_by_lot.get(lot.id, ZERO)
+        o_alloc = own_by_lot.get(lot.id, ZERO)
+        alloc_destination = "Customer Project"
+        if o_alloc > ZERO and c_alloc > ZERO:
+            alloc_destination = "Mixed"
+        elif o_alloc > ZERO:
+            alloc_destination = "Own Project"
+
         lot_dict = {
             "id": str(lot.id),
             "lotTakaId": str(lot.id),
@@ -191,6 +206,11 @@ def fabric_stock_summary(client_id, *, project=None, item_id=None, fabric_qualit
             "reserved": float(reserved_others),
             "usable": float(usable),
             "allocateQty": float(mine),
+            "customerAllocateQty": float(c_alloc),
+            "ownAllocateQty": float(o_alloc),
+            "allocationType": alloc_destination,
+            "weightKg": float(lot.roll_weight) if lot.roll_weight else None,
+            "sourcePoNumber": lot.source_document_number or None,
             "balance": float(balance),
             "status": status_label,
             "qcStatus": lot.qc_status or ("Passed" if is_passed else "Pending"),
@@ -216,6 +236,8 @@ def fabric_stock_summary(client_id, *, project=None, item_id=None, fabric_qualit
                 "_reserved": ZERO,
                 "_usable": ZERO,
                 "_allocated": ZERO,
+                "_customer_allocated": ZERO,
+                "_own_allocated": ZERO,
                 "_balance": ZERO,
                 "takasCount": 0,
                 "_lot_numbers": set(),
@@ -231,6 +253,8 @@ def fabric_stock_summary(client_id, *, project=None, item_id=None, fabric_qualit
             fg["_reserved"] += reserved_others
             fg["_usable"] += usable
             fg["_allocated"] += mine
+            fg["_customer_allocated"] += c_alloc
+            fg["_own_allocated"] += o_alloc
             fg["_balance"] += balance
         elif is_rejected:
             fg["_rejected"] += physical
@@ -254,6 +278,8 @@ def fabric_stock_summary(client_id, *, project=None, item_id=None, fabric_qualit
             "reservedStock": float(fg["_reserved"]),
             "usableStock": float(fg["_usable"]),
             "allocatedToProject": float(fg["_allocated"]),
+            "customerAllocated": float(fg["_customer_allocated"]),
+            "ownAllocated": float(fg["_own_allocated"]),
             "balanceStock": float(fg["_balance"]),
             "takasCount": fg["takasCount"],
             "lotsCount": len(fg["_lot_numbers"]),
@@ -282,7 +308,7 @@ def _assert_allocatable(lot):
 
 
 @transaction.atomic
-def allocate_to_project(*, client_id, project, lot_taka_id, quantity, user=None, remarks=None):
+def allocate_to_project(*, client_id, project, lot_taka_id, quantity, allocation_type=GreyStockAllocation.ALLOCATION_CUSTOMER, user=None, remarks=None):
     quantity = round4(D(quantity))
     if quantity <= ZERO:
         raise ValidationFailed(
@@ -315,6 +341,7 @@ def allocate_to_project(*, client_id, project, lot_taka_id, quantity, user=None,
         lot_taka=lot,
         item_id=lot.item_id,
         quantity=quantity,
+        allocation_type=allocation_type or GreyStockAllocation.ALLOCATION_CUSTOMER,
         uom=lot.uom,
         remarks=remarks or None,
         created_by=user if getattr(user, "is_authenticated", False) else None,
@@ -330,7 +357,7 @@ def allocate_to_project(*, client_id, project, lot_taka_id, quantity, user=None,
         entity_type="GreyStockAllocation",
         entity_id=allocation.id,
         entity_label=f"{lot.lot_number}/{lot.taka_number} -> {project.code}",
-        description=f"{quantity} {lot.uom or ''} of {lot.taka_id or lot.lot_number} allocated to {project.code}",
+        description=f"{quantity} {lot.uom or ''} of {lot.taka_id or lot.lot_number} allocated [{allocation.allocation_type}] to {project.code}",
         after=snapshot(allocation),
     )
     return allocation
@@ -389,6 +416,7 @@ def serialize_allocation(allocation):
         "itemId": str(allocation.item_id),
         "itemName": getattr(lot.item, "name", None),
         "quantity": float(allocation.quantity),
+        "allocationType": getattr(allocation, "allocation_type", GreyStockAllocation.ALLOCATION_CUSTOMER),
         "uom": allocation.uom,
         "status": allocation.status,
         "remarks": allocation.remarks,
@@ -420,7 +448,7 @@ def serialize_lot(lot, allocated, unallocated):
 
 
 @transaction.atomic
-def set_project_lot_allocation(*, client_id, project, lot_taka_id, target_qty, user=None, remarks=None):
+def set_project_lot_allocation(*, client_id, project, lot_taka_id, target_qty, allocation_type=GreyStockAllocation.ALLOCATION_CUSTOMER, user=None, remarks=None):
     """Bring a project's active allocation on one lot to ``target_qty``.
 
     Used by screens that submit the desired quantity per lot rather than a
@@ -439,7 +467,8 @@ def set_project_lot_allocation(*, client_id, project, lot_taka_id, target_qty, u
         )
     )
     current = round4(sum((D(row.quantity) for row in current_rows), ZERO))
-    if target_qty == current:
+    current_type = current_rows[0].allocation_type if current_rows else None
+    if target_qty == current and (not current_rows or current_type == allocation_type):
         return current
     # Consolidate: release older active rows and allocate exact target_qty in a single clean row
     for row in current_rows:
@@ -447,7 +476,7 @@ def set_project_lot_allocation(*, client_id, project, lot_taka_id, target_qty, u
     if target_qty > ZERO:
         allocate_to_project(
             client_id=client_id, project=project, lot_taka_id=lot_taka_id,
-            quantity=target_qty, user=user, remarks=remarks,
+            quantity=target_qty, allocation_type=allocation_type, user=user, remarks=remarks,
         )
     return target_qty
 

@@ -2,7 +2,7 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, DecimalField, Q, Sum, Value
+from django.db.models import Count, DecimalField, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import status
@@ -46,6 +46,30 @@ class AccountViewSet(TenantModelViewSet):
     filter_map = {"type": "type", "subtype": "subtype", "isActive": "is_active"}
     search_fields = ["name", "code"]
     ordering = ["code"]
+
+    def get_queryset(self):
+        # Current balance = opening + debit - credit (same as the ledger view),
+        # skipping reversed entries and their reversals.
+        lines = JournalLine.objects.filter(
+            account_id=OuterRef("pk"), deleted_at__isnull=True
+        ).exclude(journal_entry__status="Reversed").exclude(
+            journal_entry__reversal_of__isnull=False
+        )
+        money = DecimalField(max_digits=18, decimal_places=2)
+
+        def total(column):
+            return Coalesce(
+                Subquery(
+                    lines.values("account_id").annotate(t=Sum(column)).values("t")[:1],
+                    output_field=money,
+                ),
+                Value(Decimal("0.00")),
+                output_field=money,
+            )
+
+        return super().get_queryset().annotate(
+            total_debit=total("debit"), total_credit=total("credit")
+        )
 
     def perform_destroy(self, instance):
         if instance.is_system:
@@ -121,6 +145,60 @@ class BalancesView(APIView):
             envelope(
                 rows,
                 aggregates={"totalBalance": round2(sum((r["balance"] for r in rows), ZERO))},
+            )
+        )
+
+
+class AccountingLogView(APIView):
+    """``GET /accounts/accounting-log/`` -- admin view of every ledger entry
+    raised by payroll, incentive, brokerage, expenses and payments in/out.
+
+    Query: ``module`` (payroll | incentive | broker | expense | payment_in |
+    payment_out), ``dateFrom``, ``dateTo``, ``search``, ``page``, ``pageSize``.
+    """
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_audit_logs"]
+
+    def get(self, request):
+        from datetime import date
+
+        from . import activity_log
+
+        params = request.query_params
+
+        def parse(name, alias):
+            value = params.get(name) or params.get(alias)
+            if not value:
+                return None
+            try:
+                return date.fromisoformat(value[:10])
+            except ValueError:
+                raise ValidationFailed(
+                    "Dates must be YYYY-MM-DD.", field_errors={name: ["Expected YYYY-MM-DD."]}
+                )
+
+        try:
+            page = max(1, int(params.get("page") or 1))
+            page_size = min(200, max(1, int(params.get("pageSize") or params.get("page_size") or 50)))
+        except ValueError:
+            raise ValidationFailed("page and pageSize must be numbers.")
+
+        filters = {
+            "date_from": parse("dateFrom", "date_from"),
+            "date_to": parse("dateTo", "date_to"),
+            "search": (params.get("search") or "").strip() or None,
+        }
+        rows, total = activity_log.accounting_log(
+            request.client_id, module=params.get("module"), page=page, page_size=page_size, **filters
+        )
+        return Response(
+            envelope(
+                rows,
+                count=total,
+                page=page,
+                page_size=page_size,
+                aggregates={"modules": activity_log.module_summary(request.client_id, **filters)},
             )
         )
 
@@ -280,6 +358,10 @@ class ExpenseCategoryViewSet(TenantModelViewSet):
     required_permissions = ["view_purchase"]
     status_field = None
     ordering = ["name"]
+
+    def list(self, request, *args, **kwargs):
+        services.seed_expense_categories(self.get_client_id())
+        return super().list(request, *args, **kwargs)
 
 
 class StandaloneNoteViewSet(TenantModelViewSet):
