@@ -871,7 +871,13 @@ def calendar_time_label(event):
 
 
 def org_chart(client_id):
-    """``GET /hrms/org-chart/`` -- a recursive walk over ``manager_id``."""
+    """``GET /hrms/org-chart/`` -- recursive hierarchy walk over ``manager_id``.
+
+    Arranges chart so that Admin Super User is at the top of the chart (root),
+    and CEO / Admin is placed directly under the Super User.
+    """
+    from apps.accounts.models import User
+
     # Current staff only: people who have left are not part of the structure.
     employees = list(
         Employee.objects.filter(client_id=client_id, deleted_at__isnull=True)
@@ -902,6 +908,10 @@ def org_chart(client_id):
         for employee in employees
     }
 
+    superuser_emails = set(
+        User.objects.filter(is_superuser=True).values_list("email", flat=True)
+    )
+
     roots = []
     for employee in employees:
         node = nodes[employee.id]
@@ -910,6 +920,89 @@ def org_chart(client_id):
             parent["reports"].append(node)
         else:
             roots.append(node)
+
+    def is_superuser_node(node):
+        email = (node.get("email") or "").lower()
+        if email in superuser_emails:
+            return True
+        desig = (node.get("designation") or "").lower()
+        name = (node.get("name") or "").lower()
+        if "super user" in desig or "superuser" in desig:
+            return True
+        if "super user" in name or "superuser" in name or name == "admin super user":
+            return True
+        return False
+
+    def is_ceo_admin_node(node):
+        if is_superuser_node(node):
+            return False
+        desig = (node.get("designation") or "").lower()
+        name = (node.get("name") or "").lower()
+        if "ceo" in desig or "administrator" in desig or "admin" in desig:
+            return True
+        if "ceo" in name or "administrator" in name or "admin" in name:
+            return True
+        return False
+
+    su_node = None
+    ceo_node = None
+    for n in nodes.values():
+        if is_superuser_node(n) and su_node is None:
+            su_node = n
+        elif is_ceo_admin_node(n) and ceo_node is None:
+            ceo_node = n
+
+    # Hierarchy arrangement:
+    # 1. Admin Super User is top of the chart (root)
+    # 2. CEO / Admin is placed directly under Super User
+    if su_node is not None:
+        if ceo_node is not None and ceo_node is not su_node:
+            if ceo_node not in su_node["reports"]:
+                if ceo_node in roots:
+                    roots.remove(ceo_node)
+                for parent_node in nodes.values():
+                    if parent_node is not su_node and ceo_node in parent_node["reports"]:
+                        parent_node["reports"].remove(ceo_node)
+                su_node["reports"].insert(0, ceo_node)
+
+        if su_node in roots:
+            roots.remove(su_node)
+            roots.insert(0, su_node)
+        else:
+            for parent_node in nodes.values():
+                if su_node in parent_node["reports"]:
+                    parent_node["reports"].remove(su_node)
+            roots.insert(0, su_node)
+
+        # Attach any other unassigned root employees under CEO/Admin or Super User
+        target_parent = ceo_node if ceo_node is not None else su_node
+        remaining_roots = [r for r in roots if r is not su_node]
+        for r in remaining_roots:
+            if r is not target_parent and r not in target_parent["reports"]:
+                roots.remove(r)
+                target_parent["reports"].append(r)
+
+    def sort_reports(node):
+        def rank(child):
+            desig = (child.get("designation") or "").lower()
+            name = (child.get("name") or "").lower()
+            if is_ceo_admin_node(child):
+                return (0, name)
+            if "director" in desig or "head" in desig:
+                return (1, name)
+            if "manager" in desig:
+                return (2, name)
+            if "officer" in desig or "lead" in desig or "inspector" in desig:
+                return (3, name)
+            return (4, name)
+
+        node["reports"].sort(key=rank)
+        for child in node["reports"]:
+            sort_reports(child)
+
+    for r in roots:
+        sort_reports(r)
+
     return roots
 
 
