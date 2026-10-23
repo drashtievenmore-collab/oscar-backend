@@ -881,6 +881,15 @@ class ProjectViewSet(TenantModelViewSet):
 
         return po, vendor, fabric_item
 
+    @action(detail=True, methods=["get"], url_path="production-lifecycle")
+    def production_lifecycle(self, request, pk=None):
+        """The 8-stage Production Lifecycle of every Vendor A Production PO
+        linked to this project. Read only; same derivation as the PO screen."""
+        from apps.pms.lifecycle_services import project_production_lifecycles
+
+        project = self.get_object()
+        return Response({"projectId": str(project.id), "lifecycles": project_production_lifecycles(project)})
+
     @action(detail=True, methods=["get", "post"], url_path="purchase-orders")
     @transaction.atomic
     def purchase_orders(self, request, pk=None):
@@ -925,6 +934,10 @@ class ProjectViewSet(TenantModelViewSet):
             Q(reference_number=project.code) |
             Q(id__in=linked_ids) |
             Q(notes__icontains=project.code)
+        ).exclude(
+            # Final Job Work POs carry the project for the production lifecycle;
+            # the purchase-branch stage workspaces read this list and never had them.
+            purchase_type="Final Job Work"
         ).select_related("party").prefetch_related("line_items__item").order_by("-created_at")
 
         data = []

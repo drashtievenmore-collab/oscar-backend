@@ -646,6 +646,45 @@ class JobWorkOrderViewSet(TenantModelViewSet):
         row = save_order_row(request, order, kind, serializer, instance=row)
         return Response(row_serializer(row, context=context).data)
 
+    @action(detail=True, methods=["post"], url_path="sign")
+    @transaction.atomic
+    def sign(self, request, pk=None):
+        """Record or clear digital/drawn/uploaded e-signature on JWO or its documents."""
+        order = self.get_object()
+        doc_type = request.data.get("documentType", "jwo")
+        doc_id = request.data.get("documentId")
+        sig_type = request.data.get("signatoryType", "authorized")
+        signature = request.data.get("signature")
+
+        sigs = dict(order.signatures or {})
+        if doc_type == "jwo":
+            sigs.setdefault("jwo", {})
+            if signature is None:
+                sigs["jwo"].pop(sig_type, None)
+            else:
+                sigs["jwo"][sig_type] = signature
+        elif doc_type in ("outward", "inward"):
+            bucket = "outwards" if doc_type == "outward" else "inwards"
+            sigs.setdefault(bucket, {})
+            key = str(doc_id) if doc_id else "default"
+            sigs[bucket].setdefault(key, {})
+            if signature is None:
+                sigs[bucket][key].pop(sig_type, None)
+            else:
+                sigs[bucket][key][sig_type] = signature
+
+        order.signatures = sigs
+        order.save(update_fields=["signatures", "updated_at"])
+
+        desc = f"Signature updated for {doc_type} ({sig_type})" if signature else f"Signature removed for {doc_type} ({sig_type})"
+        self.write_audit("sign", order, description=desc)
+
+        return Response({
+            "status": "success",
+            "signatures": order.signatures,
+            "order": self.get_serializer(order).data,
+        })
+
 
 def _uuid_or_404(value):
     try:

@@ -190,7 +190,7 @@ class Migration(migrations.Migration):
 
     dependencies = [
         ("hrms", "0006_employeeaward_employeepromotion_employeetransfer_and_more"),
-        ("pms", "0001_initial"),
+        ("pms", "0003_production_monitoring"),
         ("sales", "0001_initial"),
     ]
 

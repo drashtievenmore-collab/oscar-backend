@@ -55,6 +55,7 @@ class ProcessPlan(TenantModel, LegacyIdMixin):
     )
     status = models.TextField(choices=STATUSES, default="Active")
     remarks = models.TextField(null=True, blank=True)
+    signatures = models.JSONField(default=dict, blank=True)
 
     class Meta:
         db_table = "jobwork_process_plans"
@@ -141,6 +142,7 @@ class JobWorkOrder(TenantModel, LegacyIdMixin):
     expected_completion = models.DateField(null=True, blank=True)
     status = models.TextField(choices=STATUSES, default="In-Process")
     remarks = models.TextField(null=True, blank=True)
+    signatures = models.JSONField(default=dict, blank=True)
 
     class Meta:
         db_table = "jobwork_orders"

@@ -287,6 +287,7 @@ class JobWorkOrderSerializer(BaseModelSerializer):
     reprocesses = JWOReprocessSerializer(many=True, required=False)
     lossEntries = JWOLossEntrySerializer(source="loss_entries", many=True, read_only=True)
     documents = JWODocumentSerializer(many=True, read_only=True)
+    signatures = serializers.JSONField(required=False, default=dict)
 
     class Meta:
         model = JobWorkOrder
@@ -295,7 +296,7 @@ class JobWorkOrderSerializer(BaseModelSerializer):
             "assignedEmployeeId", "approverEmployeeId", "rateMasterId", "expectedLossPct",
             "orderDate", "plannedQty", "rate", "totalAmount", "expectedCompletion",
             "status", "remarks", "materials", "outwards", "inwards", "charges",
-            "reprocesses", "lossEntries", "documents",
+            "reprocesses", "lossEntries", "documents", "signatures",
             "created_at", "updated_at",
         ]
         read_only_fields = ["id", "jwoNo", "created_at", "updated_at"]

@@ -50,16 +50,88 @@ PURCHASE_PO_STAGES = [
 ]
 
 VENDOR_PRODUCTION_STAGES = [
-    {"name": "Production Work Instruction", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "FileText"},
-    {"name": "Assign Vendor A + Employee", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "Users"},
-    {"name": "Daily Production Entry", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "ClipboardList"},
-    {"name": "Production Completion", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "CheckCircle2"},
-    {"name": "Final Quantity Verification", "department_name": "Quality Control", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "ShieldCheck"},
-    {"name": "Generate Final Job Work PO", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "FileText"},
-    {"name": "Production / Job Work PO", "department_name": "Accounts", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "FileText"},
-    {"name": "Agency Bill Match (PO + verified qty + invoice)", "department_name": "Accounts", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "FileSpreadsheet"},
-    {"name": "Approval / Hold / Payment", "department_name": "Accounts", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "IndianRupee"},
+    # The 8 Production Lifecycle stages (apps/pms/lifecycle_services.py).
+    {"name": "Purchase Order", "department_name": "Purchase", "branch": "branch_production", "default_weight": Decimal("3.37"), "icon": "FileText"},
+    {"name": "Production Instruction", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.37"), "icon": "ClipboardList"},
+    {"name": "Daily Production Entry", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.37"), "icon": "FileSpreadsheet"},
+    {"name": "Quality Control (QC)", "department_name": "Quality Control", "branch": "branch_production", "default_weight": Decimal("3.37"), "icon": "ShieldCheck"},
+    {"name": "Completion Verification", "department_name": "Quality Control", "branch": "branch_production", "default_weight": Decimal("3.37"), "icon": "CheckCircle2"},
+    {"name": "Final Job Work PO", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.37"), "icon": "FileText"},
+    {"name": "Agency Bill Match", "department_name": "Accounts", "branch": "branch_production", "default_weight": Decimal("3.37"), "icon": "FileSpreadsheet"},
+    {"name": "Disbursement Payment", "department_name": "Accounts", "branch": "branch_production", "default_weight": Decimal("3.41"), "icon": "IndianRupee"},
 ]
+
+#: PMS production-branch stage -> Production Lifecycle stage key
+#: (lifecycle_services.STAGE_KEYS). The lifecycle is the single source of truth.
+PRODUCTION_LIFECYCLE_STAGE_MAP = {
+    "Purchase Order": "purchase_order",
+    "Production Instruction": "production_instruction",
+    "Daily Production Entry": "daily_production_entry",
+    "Quality Control (QC)": "grey_fabric_qc",
+    "Completion Verification": "completion_verification",
+    "Final Job Work PO": "final_job_work_po",
+    "Agency Bill Match": "agency_bill_match",
+    "Disbursement Payment": "disbursement_payment",
+}
+
+#: Old production-branch stage names -> the lifecycle stage that replaced them.
+LEGACY_PRODUCTION_STAGE_NAMES = {
+    "Production Work Instruction": "Production Instruction",
+    "Assign Vendor A + Employee": "Production Instruction",
+    "Production Completion": "Daily Production Entry",
+    "Final Quantity Verification": "Completion Verification",
+    "Generate Final Job Work PO": "Final Job Work PO",
+    "Production / Job Work PO": "Final Job Work PO",
+    "Agency Bill Match (PO + verified qty + invoice)": "Agency Bill Match",
+    "Approval / Hold / Payment": "Disbursement Payment",
+}
+
+
+def _carry_over_legacy_production_stages(project, allowed_names):
+    """Rename old production stage rows (or merge them into the new one) so
+    their tasks, documents, approvals and delays survive -- the sync deletes
+    any stage whose name is no longer in the pipeline, and those cascade."""
+    from .models import Approval, Delay, Document, Task
+
+    for old_name, new_name in LEGACY_PRODUCTION_STAGE_NAMES.items():
+        if new_name not in allowed_names:
+            continue
+        for old in ProjectStage.objects.filter(project=project, name=old_name):
+            target = ProjectStage.objects.filter(project=project, name=new_name).first()
+            if target is None:
+                old.name = new_name
+                old.save(update_fields=["name"])
+                continue
+            for model in (Task, Document, Approval, Delay):
+                model.objects.filter(stage=old).update(stage=target)
+            if project.current_stage_id == old.id:
+                project.current_stage = target
+                project.save(update_fields=["current_stage"])
+            old.delete()
+
+
+def lifecycle_stage_status(name, lifecycle):
+    """(status, pct, remarks, document) for a production-branch project stage."""
+    key = PRODUCTION_LIFECYCLE_STAGE_MAP[name]
+    stage = next(s for s in lifecycle["stages"] if s["key"] == key)
+    state = stage["state"]
+    if state == "completed":
+        status, pct = "Completed", 100
+    elif state == "active":
+        status, pct = "In Progress", 50
+        if key == "daily_production_entry" and stage.get("orderQuantity"):
+            pct = int(min(99, max(1, stage["quantity"] / stage["orderQuantity"] * 100)))
+    else:
+        status, pct = "Pending", 0
+    doc_number = stage.get("docNumber")
+    remarks = " · ".join(str(v) for v in (doc_number, stage.get("status")) if v) or f"{name} pending"
+    document = {
+        "type": key,
+        "number": doc_number or lifecycle["poNumber"],
+        "url": f"/purchase/orders?po={lifecycle['purchaseOrderId']}&stage={key}",
+        "label": f"{stage['label']}: {doc_number or lifecycle['poNumber']}",
+    }
+    return status, pct, remarks, document
 
 DOWNSTREAM_STAGES = [
     {"name": "Processing Plan & Vendor Assignment", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("10.00"), "icon": "ClipboardList"},
@@ -229,6 +301,8 @@ def sync_project_pipeline_stages(project):
     stage_defs = get_project_stage_definitions(project, stock_eval)
     allowed_names = [s["name"] for s in stage_defs]
 
+    _carry_over_legacy_production_stages(project, allowed_names)
+
     ProjectStage.objects.filter(project=project).filter(
         Q(name__iexact="dyeing")
         | Q(name__iexact="vbvb")
@@ -248,7 +322,7 @@ def sync_project_pipeline_stages(project):
     linked_po_ids = cfv.get("linked_purchase_order_ids", [])
     po = PurchaseOrder.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(
         Q(project=project) | Q(reference_number=project.code) | Q(reference_number=getattr(order, "order_number", "")) | Q(id__in=linked_po_ids) | Q(notes__icontains=project.code)
-    ).order_by("-created_at").first()
+    ).exclude(purchase_type="Final Job Work").order_by("-created_at").first()
 
     if not po and cfv.get("grey_stock_po"):
         gpo = cfv.get("grey_stock_po")
@@ -300,6 +374,13 @@ def sync_project_pipeline_stages(project):
             invoiced_amount += Decimal(str(getattr(inv, "total", 0) or 0))
             paid_amount += Decimal(str(getattr(inv, "amount_paid", 0) or 0))
         inv_doc = invoices.first()
+
+    production_lifecycle = None
+    if any(d.get("branch") == "branch_production" for d in stage_defs):
+        from .lifecycle_services import project_production_lifecycles
+
+        lifecycles = project_production_lifecycles(project)
+        production_lifecycle = lifecycles[0] if lifecycles else None
 
     departments_by_name = {d.name: d for d in Department.objects.filter(client_id=client_id)}
 
@@ -676,38 +757,10 @@ def sync_project_pipeline_stages(project):
                 }
 
 
-        elif name == "Production Work Instruction":
-            quantities["input"] = float(shortage_qty)
-            prod_data = cfv.get("grey_stock_production_order")
-            if prod_data:
-                status = "In Progress"
-                pct = 50
-                order_num = prod_data.get("orderNumber", "PROD-2026-0412")
-                remarks = f"Order {order_num} issued"
-                document = {
-                    "type": "ProductionOrder",
-                    "number": order_num,
-                    "url": "/production/orders",
-                    "label": f"Order: {order_num}",
-                }
-            else:
-                status = "Pending"
-                pct = 0
-                remarks = "Instruction pending"
-
-        elif name in (
-            "Assign Vendor A + Employee",
-            "Daily Production Entry",
-            "Production Completion",
-            "Final Quantity Verification",
-            "Generate Final Job Work PO",
-            "Production / Job Work PO",
-            "Agency Bill Match (PO + verified qty + invoice)",
-            "Approval / Hold / Payment",
-        ):
-            status = "Pending"
-            pct = 0
-            remarks = f"{name} pending"
+        elif name in PRODUCTION_LIFECYCLE_STAGE_MAP and production_lifecycle:
+            if name == "Purchase Order":
+                quantities["input"] = float(shortage_qty)
+            status, pct, remarks, document = lifecycle_stage_status(name, production_lifecycle)
 
         elif name == "Procurement (If Required)":
             if branch == "BRANCH_A":

@@ -824,6 +824,15 @@ def generate_final_job_work_po(instruction, *, user=None, custom_data=None):
         po.freeze_party_snapshot()
         po.save()
 
+    # Carry the project over from the Vendor A PO so PMS finds the final PO.
+    if not po.project_id:
+        from .lifecycle_services import source_purchase_order
+
+        source_po = source_purchase_order(instruction)
+        if source_po is not None and source_po.project_id:
+            po.project_id = source_po.project_id
+            po.save(update_fields=["project"])
+
     custom_items = custom_data.get("items") or []
     if custom_items:
         for idx, it in enumerate(custom_items, start=1):
