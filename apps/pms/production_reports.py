@@ -77,6 +77,7 @@ def agency_production_view(client_id, *, day=None):
         ).count()
 
         totals = _entry_totals(all_entries)
+        quality = _quality_split(all_entries)
         rows.append(
             {
                 "agency": agency_name,
@@ -95,9 +96,40 @@ def agency_production_view(client_id, *, day=None):
                 "dailyEntries": totals["entries"],
                 "metersMonitored": float(totals["meters"]),
                 "pendingReports": scoped.exclude(status__in=["Verified", "Closed", "PO Created"]).count(),
+                **quality,
             }
         )
     return rows
+
+
+def _quality_split(entries):
+    """Good / reject / reprocess out of submitted production (PDF §15
+    "QC / Wastage: pass %, reject %, reprocess %" by agency).
+
+    Same rule as the completion screen: drafts do not count, and a row with
+    no good-metre figure counts produced − reject − reprocess as good.
+    """
+    produced = rejected = reprocess = accepted = ZERO
+    for entry in entries.exclude(status="Draft"):
+        meters = D(entry.meters or 0)
+        reject = D(entry.reject_meter or 0)
+        rework = D(entry.reprocess_meter or 0)
+        produced += meters
+        rejected += reject
+        reprocess += rework
+        accepted += D(entry.good_meter) if entry.good_meter else max(ZERO, meters - reject - rework)
+
+    def pct(part):
+        return float(round2(part / produced * 100)) if produced > ZERO else 0.0
+
+    return {
+        "acceptedMeters": float(accepted),
+        "rejectedMeters": float(rejected),
+        "reprocessMeters": float(reprocess),
+        "acceptedPct": pct(accepted),
+        "rejectPct": pct(rejected),
+        "reprocessPct": pct(reprocess),
+    }
 
 
 def employee_production_view(client_id, *, employee_id=None, day=None):

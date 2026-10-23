@@ -18,7 +18,11 @@ from apps.core.exceptions import (
     PermissionDenied,
     ValidationFailed,
 )
-from apps.core.money import ZERO
+from apps.core.money import ZERO, D
+from apps.sales.models import BrokerCommission as SalesBrokerCommission
+from apps.pms.models import IncentiveScheme, IncentiveCalculation
+from apps.pms.production_serializers import IncentiveSchemeSerializer, IncentiveCalculationSerializer
+from apps.pms.production_views import IncentiveSchemeViewSet as PMSIncentiveSchemeViewSet, AgencyProductionView as PMSAgencyProductionView
 from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
 from apps.core.permissions import HasModulePermission, has_permission, IsAuthenticatedInTenant
@@ -27,6 +31,7 @@ from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
 
 from . import services
 from .models import (
+    EmployeeTransfer, EmployeePromotion, EmployeeWarning, EmployeeAward,
     Appraisal,
     AppraisalCycle,
     AppraisalHistory,
@@ -78,6 +83,7 @@ from .models import (
     BrokerCommissionRecord,
 )
 from .serializers import (
+    EmployeeTransferSerializer, EmployeePromotionSerializer, EmployeeWarningSerializer, EmployeeAwardSerializer,
     AppraisalCycleSerializer,
     AppraisalSerializer,
     ApprovalChainSerializer,
@@ -2345,42 +2351,39 @@ class HrmsSettingsView(APIView):
 # =============================================================================
 
 class BrokerCommissionViewSet(TenantModelViewSet):
-    queryset = BrokerCommissionRecord.objects.select_related("broker", "invoice", "party", "salesperson")
+    """Canonical BrokerCommission ViewSet for HRMS (P12 single source of truth)."""
+    queryset = SalesBrokerCommission.objects.select_related("broker", "invoice", "party", "salesperson")
     serializer_class = BrokerCommissionRecordSerializer
-    audit_entity_type = "BrokerCommissionRecord"
+    audit_entity_type = "BrokerCommission"
     permission_classes = [HasModulePermission]
     permission_map = {
-        "read": ["view_staff"],
-        "write": ["edit_staff"],
-        "approve": ["approve_payroll"],
-        "mark_payable": ["edit_staff"],
-        "mark_paid": ["approve_payroll"],
-        "hold": ["edit_staff"],
+        "read": ["view_staff", "view_sales"],
+        "write": ["edit_staff", "manage_brokers"],
+        "approve": ["approve_payroll", "manage_brokers"],
+        "mark_payable": ["edit_staff", "manage_brokers"],
+        "mark_paid": ["approve_payroll", "manage_brokers"],
+        "hold": ["edit_staff", "manage_brokers"],
     }
 
     @action(detail=True, methods=["POST"], url_path="approve")
     def approve(self, request, pk=None):
+        from apps.sales import broker_services
         item = self.get_object()
-        item.status = "Approved"
-        item.approved_by = request.user
-        item.approved_at = timezone.now()
-        item.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
+        item = broker_services.approve_broker_commission(item, user=request.user)
         return Response(self.get_serializer(item).data)
 
     @action(detail=True, methods=["POST"], url_path="mark-payable")
     def mark_payable(self, request, pk=None):
+        from apps.sales import broker_services
         item = self.get_object()
-        item.status = "Payable"
-        item.save(update_fields=["status", "updated_at"])
+        item = broker_services.make_broker_payable(item, user=request.user)
         return Response(self.get_serializer(item).data)
 
     @action(detail=True, methods=["POST"], url_path="mark-paid")
     def mark_paid(self, request, pk=None):
+        from apps.sales import broker_services
         item = self.get_object()
-        item.status = "Paid"
-        item.paid_at = timezone.now()
-        item.paid_amount = item.commission_amount
-        item.save(update_fields=["status", "paid_at", "paid_amount", "updated_at"])
+        item = broker_services.pay_broker_commission(item, user=request.user)
         return Response(self.get_serializer(item).data)
 
     @action(detail=True, methods=["POST"], url_path="hold")
@@ -2389,6 +2392,98 @@ class BrokerCommissionViewSet(TenantModelViewSet):
         item.status = "Hold"
         item.save(update_fields=["status", "updated_at"])
         return Response(self.get_serializer(item).data)
+
+
+class SalespersonIncentiveSchemeViewSet(PMSIncentiveSchemeViewSet):
+    """Thin proxy for HRMS pointing to canonical pms.IncentiveScheme (P12)."""
+    queryset = IncentiveScheme.objects.all()
+    serializer_class = IncentiveSchemeSerializer
+    audit_entity_type = "IncentiveScheme"
+    permission_classes = [HasModulePermission]
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+
+class SalespersonIncentiveViewSet(TenantModelViewSet):
+    """Thin proxy for HRMS pointing to canonical pms.IncentiveCalculation (P12)."""
+    queryset = IncentiveCalculation.objects.select_related("scheme", "employee", "salesperson")
+    serializer_class = IncentiveCalculationSerializer
+    audit_entity_type = "IncentiveCalculation"
+    permission_classes = [HasModulePermission]
+    permission_map = {
+        "read": ["view_staff"],
+        "write": ["edit_staff"],
+        "approve": ["approve_payroll"],
+    }
+
+    def get_object(self):
+        lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
+        pk = self.kwargs.get(lookup_url_kwarg)
+        calc = IncentiveCalculation.objects.filter(client_id=self.get_client_id(), pk=pk).first()
+        if calc is not None:
+            return calc
+        from apps.hrms.models import SalespersonIncentiveAccrual
+        accrual = SalespersonIncentiveAccrual.objects.filter(client_id=self.get_client_id(), pk=pk).first()
+        if accrual is not None:
+            return accrual
+        raise NotFound("Incentive record not found.")
+
+    def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if "status" in request.data:
+            raise ValidationFailed(
+                "Status is not editable directly; use approve action.",
+                field_errors={"status": ["Status cannot be changed via edit."]},
+            )
+        if "calculatedIncentive" in request.data or "incentive_amount" in request.data:
+            from apps.core.models import ApprovalRequest, ApprovalRule
+            new_amount = D(str(request.data.get("calculatedIncentive") or request.data.get("incentive_amount")))
+            reason = request.data.get("adjustmentReason", "Manual incentive adjustment")
+            rule = ApprovalRule.objects.filter(
+                client_id=request.client_id, document_type="incentive_adjustment", is_active=True
+            ).first()
+            approver_role = rule.approver_role.code if rule and rule.approver_role else "ACCOUNTS_MGR"
+            current_amt = getattr(instance, "calculated_incentive", None)
+            if current_amt is None:
+                current_amt = getattr(instance, "incentive_amount", 0)
+            app_req = ApprovalRequest.objects.create(
+                client_id=request.client_id,
+                document_type="incentive_adjustment",
+                document_id=str(instance.id),
+                requested_by=request.user,
+                reason=reason,
+                old_values={"calculatedIncentive": float(current_amt)},
+                new_values={"calculatedIncentive": float(new_amount), "approverRoleCodes": [approver_role]},
+                status="Pending",
+            )
+            data = {"id": str(instance.id), "calculatedIncentive": float(current_amt)}
+            data["pendingApproval"] = {
+                "approvalRequestId": str(app_req.id),
+                "approverRoleCodes": [approver_role],
+                "message": "The adjusted incentive amount applies once approved.",
+            }
+            return Response(data, status=status.HTTP_200_OK)
+
+        return super().update(request, *args, **kwargs)
+
+    @action(detail=True, methods=["POST"], url_path="approve")
+    def approve(self, request, pk=None):
+        if not has_permission(request.user, "approve_payroll") and not has_permission(request.user, "verify_production") and not getattr(request.user, "is_superuser", False):
+            raise PermissionDenied("Requires approve_payroll permission.")
+        item = self.get_object()
+        if isinstance(item, IncentiveCalculation):
+            from apps.pms import production_services
+            calc = production_services.approve_incentive(item, user=request.user)
+            return Response(IncentiveCalculationSerializer(calc).data)
+        item.status = "APPROVED"
+        item.approved_by = request.user
+        item.approved_at = timezone.now()
+        item.save(update_fields=["status", "approved_by", "approved_at", "updated_at"])
+        return Response({"id": str(item.id), "status": item.status})
+
+
+class AgencyProductionMonitoringView(PMSAgencyProductionView):
+    """Thin proxy for HRMS pointing to canonical PMS agency production (P12)."""
+    pass
 
 
 class StubLifecycleViewSet(viewsets.ViewSet):
@@ -2403,3 +2498,45 @@ class StubLifecycleViewSet(viewsets.ViewSet):
 
     def retrieve(self, request, pk=None):
         return Response({})
+
+
+# ---------------------------------------------------------------------------
+# Employee Lifecycle ViewSets (§11.9)
+# ---------------------------------------------------------------------------
+class EmployeeTransferViewSet(TenantModelViewSet):
+    queryset = EmployeeTransfer.objects.select_related("employee", "from_department", "to_department")
+    serializer_class = EmployeeTransferSerializer
+    audit_entity_type = "EmployeeTransfer"
+    status_field = "status"
+    ordering = ["-effective_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "employee": "employee_id"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+
+class EmployeePromotionViewSet(TenantModelViewSet):
+    queryset = EmployeePromotion.objects.select_related("employee", "previous_designation", "new_designation")
+    serializer_class = EmployeePromotionSerializer
+    audit_entity_type = "EmployeePromotion"
+    status_field = "status"
+    ordering = ["-effective_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "employee": "employee_id"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+
+class EmployeeWarningViewSet(TenantModelViewSet):
+    queryset = EmployeeWarning.objects.select_related("employee")
+    serializer_class = EmployeeWarningSerializer
+    audit_entity_type = "EmployeeWarning"
+    status_field = "status"
+    ordering = ["-issue_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "employee": "employee_id"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+
+class EmployeeAwardViewSet(TenantModelViewSet):
+    queryset = EmployeeAward.objects.select_related("employee")
+    serializer_class = EmployeeAwardSerializer
+    audit_entity_type = "EmployeeAward"
+    ordering = ["-award_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "employee": "employee_id"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}

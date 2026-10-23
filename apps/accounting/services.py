@@ -54,6 +54,9 @@ SYSTEM_ACCOUNTS = [
     ("brokerage_payable", "2360", "Brokerage Payable", "Liability", "Payable"),
     ("brokerage_expense", "5520", "Brokerage & Commission Expense", "Expense", None),
     ("sample_expense", "5410", "Sample Expense", "Expense", None),
+    # Processing / reprocess / other charges owed to job workers, accrued as
+    # material comes back (apps/jobwork/costing.py).
+    ("jobwork_payable", "2150", "Job Work Charges Payable", "Liability", "Payable"),
 ]
 
 
@@ -84,8 +87,8 @@ def system_account(client_id, system_key):
     if account is None:
         spec = next((item for item in SYSTEM_ACCOUNTS if item[0] == system_key), None)
         if spec:
-            from apps.core.models import Client
-            client = Client.objects.filter(id=client_id).first()
+            from apps.accounts.models import Client
+            client = Client.objects.filter(id=getattr(client_id, "id", client_id)).first()
             if client:
                 account, _ = Account.objects.get_or_create(
                     client=client,

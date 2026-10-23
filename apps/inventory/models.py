@@ -48,6 +48,10 @@ MOVEMENT_TYPES = [
     ("SALES_RETURN_REPROCESS", "SALES_RETURN_REPROCESS"),
     ("SALES_RETURN_SECOND_QUALITY", "SALES_RETURN_SECOND_QUALITY"),
     ("SALES_RETURN_REJECT", "SALES_RETURN_REJECT"),
+    # Several small lots combined into one processing batch (PDF §06 lot
+    # merge): out of each source taka, into the merged taka, same godown.
+    ("LOT_MERGE_OUT", "LOT_MERGE_OUT"),
+    ("LOT_MERGE_IN", "LOT_MERGE_IN"),
 ]
 
 #: Movements that reverse an earlier one, keyed to what they reverse.
@@ -954,6 +958,12 @@ class Trip(TenantModel, LegacyIdMixin):
     )
     transporter_party = models.ForeignKey(
         "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="transporter_trips"
+    )
+    vehicle = models.ForeignKey(
+        "masters.Vehicle", null=True, blank=True, on_delete=models.SET_NULL, related_name="trips"
+    )
+    driver = models.ForeignKey(
+        "masters.Driver", null=True, blank=True, on_delete=models.SET_NULL, related_name="trips"
     )
     vehicle_number = models.TextField()
     driver_name = models.TextField(null=True, blank=True)

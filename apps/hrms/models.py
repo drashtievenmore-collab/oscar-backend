@@ -1384,7 +1384,10 @@ class Complaint(TenantModel):
 # =============================================================================
 
 class SalespersonIncentiveScheme(TenantModel, LegacyIdMixin):
-    """Salesperson Incentive Scheme configuration (Oscar Scope §12)."""
+    """DEPRECATED (P12): Canonical model is in apps.pms (IncentiveScheme) per HRMS_ERP_CHANGES.md. Do not create new records here.
+    
+    Salesperson Incentive Scheme configuration (Oscar Scope §12).
+    """
 
     BASIS_CHOICES = [
         ("INVOICE_VALUE", "Invoice Value"),
@@ -1425,7 +1428,10 @@ class SalespersonIncentiveScheme(TenantModel, LegacyIdMixin):
 
 
 class SalespersonIncentiveAccrual(TenantModel, LegacyIdMixin):
-    """Periodic incentive accrual calculation per salesperson (Oscar Scope §12)."""
+    """DEPRECATED (P12): Canonical model is in apps.pms (IncentiveCalculation) per HRMS_ERP_CHANGES.md. Do not create new records here.
+    
+    Periodic incentive accrual calculation per salesperson (Oscar Scope §12).
+    """
 
     STATUSES = [
         ("DRAFT", "Draft"),
@@ -1502,7 +1508,10 @@ class AgencyStaffAssignment(TenantModel, LegacyIdMixin):
 
 
 class DailyAgencyProductionEntry(TenantModel, LegacyIdMixin):
-    """Daily field monitoring records entered by salaried production staff (Oscar Scope §02, §05, §15)."""
+    """DEPRECATED (P12): Canonical model is in apps.pms (DailyProductionEntry) per HRMS_ERP_CHANGES.md. Do not create new records here.
+    
+    Daily field monitoring records entered by salaried production staff (Oscar Scope §02, §05, §15).
+    """
 
     employee = models.ForeignKey(
         Employee, on_delete=models.CASCADE, related_name="daily_production_entries"
@@ -1576,7 +1585,10 @@ class PayrollCommercialAllocation(TenantModel, LegacyIdMixin):
 
 
 class BrokerCommissionRecord(TenantModel, LegacyIdMixin):
-    """Broker Commission integration record (Oscar Scope §12, §14)."""
+    """DEPRECATED (P12): Canonical model is in apps.sales (BrokerCommission) per HRMS_ERP_CHANGES.md. Do not create new records here.
+    
+    Broker Commission integration record (Oscar Scope §12, §14).
+    """
 
     STATUSES = [
         ("Accrued", "Accrued"),
@@ -1702,3 +1714,86 @@ class AttendancePunch(TenantModel, LegacyIdMixin):
 # class Interview(TenantModel, LegacyIdMixin): ...
 # class Offer(TenantModel, LegacyIdMixin): ...
 # class OnboardingTask(TenantModel, LegacyIdMixin): ...
+
+
+# ---------------------------------------------------------------------------
+# Employee Lifecycle: Transfers, Promotions, Warnings, Awards (§11.9)
+# ---------------------------------------------------------------------------
+class EmployeeTransfer(TenantModel, LegacyIdMixin):
+    employee = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, related_name="transfers"
+    )
+    from_department = models.ForeignKey(
+        Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="transfers_from"
+    )
+    to_department = models.ForeignKey(
+        Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="transfers_to"
+    )
+    from_department_name = models.TextField(null=True, blank=True)
+    to_department_name = models.TextField(null=True, blank=True)
+    from_location = models.ForeignKey(
+        Location, null=True, blank=True, on_delete=models.SET_NULL, related_name="transfers_from"
+    )
+    to_location = models.ForeignKey(
+        Location, null=True, blank=True, on_delete=models.SET_NULL, related_name="transfers_to"
+    )
+    effective_date = models.DateField(default=timezone.now)
+    reason = models.TextField(blank=True, default="")
+    status = models.TextField(default="Completed")
+
+    class Meta:
+        db_table = "hrms_employee_transfers"
+        ordering = ["-effective_date", "-created_at"]
+
+
+class EmployeePromotion(TenantModel, LegacyIdMixin):
+    employee = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, related_name="promotions"
+    )
+    previous_designation = models.ForeignKey(
+        Designation, null=True, blank=True, on_delete=models.SET_NULL, related_name="promotions_from"
+    )
+    new_designation = models.ForeignKey(
+        Designation, null=True, blank=True, on_delete=models.SET_NULL, related_name="promotions_to"
+    )
+    previous_designation_title = models.TextField(null=True, blank=True)
+    new_designation_title = models.TextField(null=True, blank=True)
+    previous_salary = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    new_salary = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    effective_date = models.DateField(default=timezone.now)
+    notes = models.TextField(blank=True, default="")
+    status = models.TextField(default="Effective")
+
+    class Meta:
+        db_table = "hrms_employee_promotions"
+        ordering = ["-effective_date", "-created_at"]
+
+
+class EmployeeWarning(TenantModel, LegacyIdMixin):
+    employee = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, related_name="warnings"
+    )
+    subject = models.TextField()
+    warning_level = models.TextField(default="First Written")
+    issue_date = models.DateField(default=timezone.now)
+    description = models.TextField(blank=True, default="")
+    status = models.TextField(default="Issued")
+
+    class Meta:
+        db_table = "hrms_employee_warnings"
+        ordering = ["-issue_date", "-created_at"]
+
+
+class EmployeeAward(TenantModel, LegacyIdMixin):
+    employee = models.ForeignKey(
+        Employee, on_delete=models.CASCADE, related_name="awards"
+    )
+    award_name = models.TextField()
+    category = models.TextField(default="Excellence")
+    award_date = models.DateField(default=timezone.now)
+    gift_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    citation = models.TextField(blank=True, default="")
+
+    class Meta:
+        db_table = "hrms_employee_awards"
+        ordering = ["-award_date", "-created_at"]

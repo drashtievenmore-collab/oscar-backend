@@ -11,6 +11,8 @@ from apps.core.exceptions import Conflict, ValidationFailed
 from apps.core.money import D, ZERO, round2
 from apps.core.numbering import allocate_number
 
+from . import costing as jobwork_costing
+
 from .models import (
     JobWorkOrder,
     JWOCharge,
@@ -443,49 +445,48 @@ def save_order_row(request, order, kind, serializer, instance=None):
                     user=user,
                 )
 
-                # Auto-post processing charges to LotCostEntry (PDF §09)
-                try:
+                # Processing charges are a direct cost of the received lot (PDF §09).
+                proc_cost = round2(D(order.rate or 0) * meters)
+                if proc_cost > ZERO:
                     from apps.inventory import costing_services
-                    proc_rate = D(order.rate or 0)
-                    proc_cost = round2(proc_rate * meters)
-                    if proc_cost > ZERO:
-                        costing_services.post_lot_cost(
-                            client_id=order.client_id,
-                            lot_number=rec_taka.lot_number if rec_taka else rec_lot_num,
-                            cost_type="Dyeing/Printing/Finishing",
-                            amount=proc_cost,
-                            quantity=meters,
-                            source_document_type="JobWorkInward",
-                            source_document_number=row.no or order.jwo_no,
-                            lot_taka=rec_taka,
-                            user=user,
-                            is_approved=True,
-                            remarks=f"Processing charges for JWO {order.jwo_no}",
-                        )
-                except Exception:
-                    pass
+
+                    costing_services.post_lot_cost(
+                        client_id=order.client_id,
+                        lot_number=rec_taka.lot_number if rec_taka else rec_lot_num,
+                        cost_type="Dyeing/Printing/Finishing",
+                        amount=proc_cost,
+                        quantity=meters,
+                        source_document_type="JobWorkInward",
+                        source_document_id=row.id,
+                        source_document_number=row.no or order.jwo_no,
+                        lot_taka=rec_taka,
+                        user=user,
+                        is_approved=True,
+                        remarks=f"Processing charges for JWO {order.jwo_no}",
+                    )
+
+        # ... and owed to the processor: accrue everything posted for this
+        # receipt so far in the books.
+        jobwork_costing.sync_jobwork_accrual(
+            order, source_type="JobWorkInward", source_id=row.id,
+            amount=jobwork_costing.total_posted(order.client_id, "JobWorkInward", row.id),
+            narration=f"Processing charges {row.no or ''}".strip(), user=user,
+        )
 
     elif kind == "reprocesses":
-        try:
-            from apps.inventory import costing_services
-            reprocess_rate = D(data.get("rate") or order.rate or 0)
-            reprocess_qty = D(data.get("qty") or 0)
-            reprocess_cost = round2(reprocess_rate * reprocess_qty)
-            if reprocess_cost > ZERO:
-                costing_services.post_lot_cost(
-                    client_id=order.client_id,
-                    lot_number=f"JWO-{order.jwo_no}",
-                    cost_type="Reprocess",
-                    amount=reprocess_cost,
-                    quantity=reprocess_qty,
-                    source_document_type="JWOReprocess",
-                    source_document_number=getattr(row, "no", "") or order.jwo_no,
-                    user=user,
-                    is_approved=True,
-                    remarks=f"Reprocess charges for JWO {order.jwo_no}",
-                )
-        except Exception:
-            pass
+        # The charge lands on the lots being reprocessed, next to their
+        # original processing entry (PDF §08 costing rule).
+        rate = serializer.initial_data.get("rate") if hasattr(serializer, "initial_data") else None
+        jobwork_costing.sync_reprocess_cost(
+            order, row, rate=D(rate) if rate not in (None, "") else None, user=user,
+        )
+
+    elif kind == "charges":
+        jobwork_costing.sync_jobwork_accrual(
+            order, source_type="JWOCharge", source_id=row.id,
+            amount=ZERO if row.status == "Cancelled" else row.amount,
+            narration=f"Job work charge: {row.type or row.description or ''}".strip(), user=user,
+        )
 
     if kind == "materials":
         recompute_order_totals(order)
@@ -501,6 +502,16 @@ def delete_order_row(request, order, kind, row):
     user = getattr(request, "user", None)
     before = snapshot(row)
     row.soft_delete(user if getattr(user, "is_authenticated", False) else None)
+    # A deleted charge or reprocess round no longer costs anything: its lot
+    # cost and accrual are reversed by an equal and opposite posting.
+    if kind == "charges":
+        jobwork_costing.sync_jobwork_accrual(
+            order, source_type="JWOCharge", source_id=row.id, amount=ZERO,
+            narration=f"Job work charge deleted: {row.type or ''}".strip(), user=user,
+        )
+    elif kind == "reprocesses":
+        row.status = "Cancelled"
+        jobwork_costing.sync_reprocess_cost(order, row, user=user)
     _audit(
         request, order, "JobWorkOrder", f"{kind}_delete",
         f"{label} {getattr(row, 'no', '') or ''} deleted".replace("  ", " "),
@@ -524,7 +535,13 @@ def create_order_rows(order, rows_by_kind, client):
             validate_order_row(order, kind, data)
             if series:
                 data["no"] = allocate_number(client, series, data.get("date"))
-            model.objects.create(client_id=order.client_id, job_work_order=order, **data)
+            row = model.objects.create(client_id=order.client_id, job_work_order=order, **data)
+            if kind == "charges":
+                jobwork_costing.sync_jobwork_accrual(
+                    order, source_type="JWOCharge", source_id=row.id,
+                    amount=ZERO if row.status == "Cancelled" else row.amount,
+                    narration=f"Job work charge: {row.type or row.description or ''}".strip(),
+                )
     recompute_order_totals(order)
 
 

@@ -14,6 +14,7 @@ from apps.core.serializers import (
 )
 
 from .models import (
+    Vehicle, Driver,
     Agency,
     Broker,
     CategoryCustomField,
@@ -29,6 +30,8 @@ from .models import (
     ItemPart,
     ItemSerial,
     JobWorkRateMaster,
+    RateMaster,
+    PriceList,
     Location,
     LossReasonMaster,
     Party,
@@ -1060,8 +1063,10 @@ class FabricVariantSerializer(TextileMasterSerializer):
         variant = super().update(instance, validated_data)
         self._sync_to_item(variant)
         return variant
-
-
+
+
+
+
 # ---------------------------------------------------------------------------
 # Items (api.md §4.2)
 # ---------------------------------------------------------------------------
@@ -1364,6 +1369,56 @@ class JobWorkRateMasterSerializer(BaseModelSerializer):
         read_only_fields = ["created_at", "updated_at"]
 
 
+class RateMasterSerializer(BaseModelSerializer):
+    rateType = serializers.CharField(source="rate_type", default="Sales")
+    partyName = serializers.CharField(source="party.name", read_only=True, allow_null=True)
+    partyCode = serializers.CharField(source="party.code", read_only=True, allow_null=True)
+    itemName = serializers.CharField(source="item.name", read_only=True, allow_null=True)
+    itemSku = serializers.CharField(source="item.sku", read_only=True, allow_null=True)
+    fabricQualityName = serializers.CharField(source="fabric_quality.name", read_only=True, allow_null=True)
+    designName = serializers.CharField(source="design.name", read_only=True, allow_null=True)
+    shadeName = serializers.CharField(source="shade.name", read_only=True, allow_null=True)
+
+    partyId = TenantPrimaryKeyRelatedField(
+        source="party", queryset=Party.objects.all(), required=False, allow_null=True
+    )
+    itemId = TenantPrimaryKeyRelatedField(
+        source="item", queryset=Item.objects.all(), required=False, allow_null=True
+    )
+    fabricQualityId = TenantPrimaryKeyRelatedField(
+        source="fabric_quality", queryset=FabricQuality.objects.all(), required=False, allow_null=True
+    )
+    designId = TenantPrimaryKeyRelatedField(
+        source="design", queryset=Design.objects.all(), required=False, allow_null=True
+    )
+    shadeId = TenantPrimaryKeyRelatedField(
+        source="shade", queryset=Shade.objects.all(), required=False, allow_null=True
+    )
+
+    minSellingRate = serializers.DecimalField(
+        source="min_selling_rate", max_digits=18, decimal_places=4, required=False, allow_null=True
+    )
+    validFrom = serializers.DateField(source="valid_from", required=False)
+    validTo = serializers.DateField(source="valid_to", required=False, allow_null=True)
+    isActive = serializers.BooleanField(source="is_active", required=False, default=True)
+
+    class Meta:
+        model = RateMaster
+        fields = [
+            "id", "rateType", "rate_type",
+            "partyId", "partyName", "partyCode",
+            "itemId", "itemName", "itemSku",
+            "fabricQualityId", "fabricQualityName",
+            "designId", "designName",
+            "shadeId", "shadeName",
+            "rate", "minSellingRate", "min_selling_rate",
+            "uom", "validFrom", "validTo", "valid_from", "valid_to",
+            "isActive", "is_active", "notes",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
 class DefectMasterSerializer(BaseModelSerializer):
     class Meta:
         model = DefectMaster
@@ -1409,3 +1464,69 @@ class TransporterSerializer(BaseModelSerializer):
         extra_kwargs = {"code": {"required": False, "allow_blank": True}}
 
 
+
+
+class VehicleSerializer(BaseModelSerializer):
+    vehicleNumber = serializers.CharField(source="vehicle_number", required=False)
+    vehicleType = serializers.CharField(source="vehicle_type", required=False, default="Truck")
+    transporterId = TenantPrimaryKeyRelatedField(
+        source="transporter", model="masters.Transporter", required=False, allow_null=True
+    )
+    transporterName = serializers.CharField(source="transporter.name", read_only=True)
+    isActive = serializers.BooleanField(source="is_active", required=False, default=True)
+
+    class Meta:
+        model = Vehicle
+        fields = [
+            "id", "vehicleNumber", "vehicle_number", "vehicleType", "vehicle_type",
+            "capacity", "transporterId", "transporter", "transporterName",
+            "isActive", "is_active", "remarks", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+        extra_kwargs = {
+            "vehicle_number": {"required": False},
+            "vehicle_type": {"required": False},
+            "is_active": {"required": False},
+        }
+
+    def to_internal_value(self, data):
+        data = dict(data)
+        if "vehicleNo" in data and "vehicleNumber" not in data and "vehicle_number" not in data:
+            data["vehicleNumber"] = data["vehicleNo"]
+        if "vehicle_no" in data and "vehicleNumber" not in data and "vehicle_number" not in data:
+            data["vehicleNumber"] = data["vehicle_no"]
+        if "type" in data and "vehicleType" not in data and "vehicle_type" not in data:
+            data["vehicleType"] = data["type"]
+        if "vehicle_number" not in data and "vehicleNumber" in data:
+            data["vehicle_number"] = data["vehicleNumber"]
+        if "vehicle_type" not in data and "vehicleType" in data:
+            data["vehicle_type"] = data["vehicleType"]
+        return super().to_internal_value(data)
+
+
+class DriverSerializer(BaseModelSerializer):
+    transporterId = TenantPrimaryKeyRelatedField(
+        source="transporter", model="masters.Transporter", required=False, allow_null=True
+    )
+    transporterName = serializers.CharField(source="transporter.name", read_only=True)
+    isActive = serializers.BooleanField(source="is_active", required=False, default=True)
+
+    class Meta:
+        model = Driver
+        fields = [
+            "id", "name", "mobile", "licence", "transporterId", "transporter",
+            "transporterName", "isActive", "is_active", "remarks",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+        extra_kwargs = {
+            "is_active": {"required": False},
+        }
+
+    def to_internal_value(self, data):
+        data = dict(data)
+        if "phone" in data and "mobile" not in data:
+            data["mobile"] = data["phone"]
+        if "license" in data and "licence" not in data:
+            data["licence"] = data["license"]
+        return super().to_internal_value(data)

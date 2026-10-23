@@ -24,7 +24,9 @@ def create_trip(
     client_id,
     from_location,
     to_location,
-    vehicle_number,
+    vehicle_number=None,
+    vehicle_id=None,
+    driver_id=None,
     trip_date=None,
     transporter_id=None,
     transporter_party_id=None,
@@ -51,6 +53,25 @@ def create_trip(
     other = D(other_charges or 0)
     total_charges = round2(freight + loading + unloading + other)
 
+    if vehicle_id and not vehicle_number:
+        from apps.masters.models import Vehicle
+        v_obj = Vehicle.objects.filter(client_id=client_id, pk=vehicle_id).first()
+        if v_obj:
+            vehicle_number = v_obj.vehicle_number
+            if not transporter_id and v_obj.transporter_id:
+                transporter_id = v_obj.transporter_id
+
+    if driver_id and (not driver_name or not driver_mobile):
+        from apps.masters.models import Driver
+        d_obj = Driver.objects.filter(client_id=client_id, pk=driver_id).first()
+        if d_obj:
+            if not driver_name:
+                driver_name = d_obj.name
+            if not driver_mobile:
+                driver_mobile = d_obj.mobile
+
+    vehicle_number = vehicle_number or "VEHICLE"
+
     trip = Trip.objects.create(
         client_id=client_id,
         trip_number=trip_number,
@@ -59,6 +80,8 @@ def create_trip(
         to_location=to_location,
         transporter_id=transporter_id,
         transporter_party_id=transporter_party_id,
+        vehicle_id=vehicle_id,
+        driver_id=driver_id,
         vehicle_number=vehicle_number,
         driver_name=driver_name,
         driver_mobile=driver_mobile,
@@ -160,7 +183,69 @@ def allocate_trip_freight(trip, *, user=None):
                 remarks=f"Freight allocation from Trip {trip.trip_number} ({trip.vehicle_number})",
             )
 
+        if trip.cost_allocation_target == "SALES_ORDER":
+            from apps.sales.models import SalesOrder
+            so = None
+            if line.document_reference_id:
+                so = SalesOrder.objects.filter(client_id=trip.client_id, pk=line.document_reference_id).first()
+            if not so and line.document_reference_number:
+                so = SalesOrder.objects.filter(client_id=trip.client_id, order_number=line.document_reference_number).first()
+            if so:
+                so.allocated_freight_cost = F("allocated_freight_cost") + round2(allocated)
+                so.save(update_fields=["allocated_freight_cost", "updated_at"])
+
+    # Post GL journal entry for EXPENSE target OR when paid_by is Company (freight payable)
+    if (trip.paid_by == "Company" or trip.cost_allocation_target == "EXPENSE") and total_charges > ZERO:
+        freight_acc = ledger.system_account(trip.client_id, "freight")
+        creditors_acc = ledger.system_account(trip.client_id, "creditors")
+        transporter_party = trip.transporter_party
+        if not transporter_party and trip.transporter:
+            from apps.masters.models import Party
+            transporter_party = Party.objects.filter(
+                client_id=trip.client_id,
+                name__iexact=trip.transporter.name,
+                deleted_at__isnull=True,
+            ).first()
+
+        ledger.post_entry(
+            client=trip.client_id,
+            entry_date=trip.trip_date or timezone.localdate(),
+            narration=f"Freight allocation for Trip {trip.trip_number} ({trip.vehicle_number})",
+            source_document_type="TRIP",
+            source_document_id=trip.id,
+            postings=[
+                ledger.debit(
+                    freight_acc,
+                    total_charges,
+                    description=f"Freight charge Trip {trip.trip_number}",
+                ),
+                ledger.credit(
+                    creditors_acc,
+                    total_charges,
+                    party=transporter_party,
+                    description=f"Freight payable Trip {trip.trip_number}",
+                ),
+            ],
+            user=user,
+        )
+
     trip.is_cost_allocated = True
-    trip.status = "Delivered" if trip.status == "In Transit" else trip.status
-    trip.save(update_fields=["is_cost_allocated", "status", "updated_at"])
+    trip.save(update_fields=["is_cost_allocated", "updated_at"])
+    return trip
+
+
+@transaction.atomic
+def confirm_trip_delivery(trip, *, delivery_time=None, proof_file_id=None, remarks=None, user=None):
+    """
+    Confirm delivery for a transport trip (PDF §13).
+    Sets status to 'Delivered', and optionally attaches proof file and remarks.
+    """
+    trip = Trip.objects.select_for_update().get(pk=trip.pk)
+    trip.status = "Delivered"
+    trip.delivery_time = delivery_time or timezone.now()
+    if proof_file_id:
+        trip.proof_file_id = proof_file_id
+    if remarks:
+        trip.remarks = f"{trip.remarks}\n{remarks}" if trip.remarks else remarks
+    trip.save(update_fields=["status", "delivery_time", "proof_file", "remarks", "updated_at"])
     return trip

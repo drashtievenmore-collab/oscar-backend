@@ -657,6 +657,35 @@ class ApprovalRequest(TenantModel):
         return f"{self.document_type} {self.document_number} - {self.status}"
 
 
+class DiscountPolicy(TenantModel):
+    """Who may give how much discount, per tenant (PDF §12 discount control).
+
+    A discount up to ``auto_allow_pct`` needs nobody. Up to the salesperson
+    limit (or the party's override) a salesperson may give it. Up to
+    ``manager_max_pct`` it needs the manager role; above that, or on a line
+    below cost / minimum margin, it needs the owner role.
+    """
+
+    auto_allow_pct = models.DecimalField(max_digits=7, decimal_places=2, default=1)
+    salesperson_max_pct = models.DecimalField(max_digits=7, decimal_places=2, default=2)
+    manager_max_pct = models.DecimalField(max_digits=7, decimal_places=2, default=5)
+    min_margin_pct = models.DecimalField(max_digits=7, decimal_places=2, default=5)
+    manager_role_code = models.CharField(max_length=64, default="SALES_MGR")
+    owner_role_code = models.CharField(max_length=64, default="OWNER")
+    #: ``[{"partyId": "<uuid>", "maxPct": "3.00"}]`` -- a salesperson limit
+    #: that replaces ``salesperson_max_pct`` for that party.
+    party_overrides = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        db_table = "discount_policies"
+        constraints = [
+            models.UniqueConstraint(fields=["client"], name="uq_discount_policy_client"),
+        ]
+
+    def __str__(self):
+        return f"Discount policy ({self.client_id})"
+
+
 # ---------------------------------------------------------------------------
 # db.md / PDF §19 -- Alerts & Exception Management
 # ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ One ``parties`` table serves customers and vendors; the UI shows it three ways
 (``/parties``, ``/crm/customers``, vendor pickers) but there is one record.
 """
 from django.db import models
+from django.utils import timezone
 
 from apps.core.models import LegacyIdMixin, TenantModel
 
@@ -671,6 +672,56 @@ class JobWorkRateMaster(TenantModel, LegacyIdMixin):
         return f"{self.processor.name} - {self.process.name}: {self.rate}/{self.rate_uom}"
 
 
+class RateMaster(TenantModel, LegacyIdMixin):
+    """Sales and purchase price list / rate master (PDF §01, §06, §11)."""
+
+    RATE_TYPES = [
+        ("Sales", "Sales"),
+        ("Purchase", "Purchase"),
+    ]
+
+    rate_type = models.CharField(max_length=16, choices=RATE_TYPES, default="Sales")
+    party = models.ForeignKey(
+        Party, null=True, blank=True, on_delete=models.CASCADE, related_name="rate_masters"
+    )
+    item = models.ForeignKey(
+        "masters.Item", null=True, blank=True, on_delete=models.CASCADE, related_name="rate_masters"
+    )
+    fabric_quality = models.ForeignKey(
+        FabricQuality, null=True, blank=True, on_delete=models.CASCADE, related_name="rate_masters"
+    )
+    design = models.ForeignKey(
+        Design, null=True, blank=True, on_delete=models.CASCADE, related_name="rate_masters"
+    )
+    shade = models.ForeignKey(
+        Shade, null=True, blank=True, on_delete=models.CASCADE, related_name="rate_masters"
+    )
+    rate = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    min_selling_rate = models.DecimalField(
+        max_digits=18, decimal_places=4, default=0, null=True, blank=True
+    )
+    uom = models.TextField(default="Meter")
+    valid_from = models.DateField(default=timezone.localdate)
+    valid_to = models.DateField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    notes = models.TextField(blank=True, default="")
+
+    class Meta:
+        db_table = "rate_masters"
+        ordering = ["-valid_from", "-created_at"]
+        indexes = [
+            models.Index(fields=["client", "rate_type", "is_active"], name="ix_rate_mstr_lookup"),
+            models.Index(fields=["client", "party", "rate_type"], name="ix_rate_mstr_party"),
+        ]
+
+    def __str__(self):
+        party_str = f" ({self.party.name})" if self.party else ""
+        return f"[{self.rate_type}] {self.rate}/{self.uom}{party_str}"
+
+
+PriceList = RateMaster
+
+
 class DefectMaster(TenantModel, LegacyIdMixin):
     """Configurable defect catalogue for QC inspections (PDF §04, §08)."""
 
@@ -1022,3 +1073,50 @@ class DocumentLineSerial(TenantModel):
             )
         ]
         indexes = [models.Index(fields=["serial"], name="ix_dls_serial")]
+
+
+class Vehicle(TenantModel, LegacyIdMixin):
+    """Vehicle master for logistics & fleet management (PDF §13)."""
+
+    vehicle_number = models.TextField(db_index=True)
+    vehicle_type = models.TextField(default="Truck")
+    capacity = models.TextField(null=True, blank=True)
+    transporter = models.ForeignKey(
+        Transporter, null=True, blank=True, on_delete=models.SET_NULL, related_name="vehicles_list"
+    )
+    is_active = models.BooleanField(default=True)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "logistics_vehicles"
+        ordering = ["vehicle_number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "vehicle_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_logistics_vehicle_number",
+            )
+        ]
+
+    def __str__(self):
+        return self.vehicle_number
+
+
+class Driver(TenantModel, LegacyIdMixin):
+    """Driver master for transport & fleet operations (PDF §13)."""
+
+    name = models.TextField()
+    mobile = models.TextField(null=True, blank=True)
+    licence = models.TextField(null=True, blank=True)
+    transporter = models.ForeignKey(
+        Transporter, null=True, blank=True, on_delete=models.SET_NULL, related_name="drivers_list"
+    )
+    is_active = models.BooleanField(default=True)
+    remarks = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "logistics_drivers"
+        ordering = ["name"]
+
+    def __str__(self):
+        return f"{self.name} ({self.mobile or self.licence or 'Driver'})"

@@ -235,7 +235,7 @@ class OrderStageTests(Phase1Base):
     def test_non_reserving_stages(self):
         self.assertEqual(
             set(NON_RESERVING_STAGES),
-            {"Draft", "Fully Dispatched", "Invoiced", "Closed", "Cancelled"},
+            {"Draft", "Pending Approval", "Fully Dispatched", "Invoiced", "Closed", "Cancelled"},
         )
         self.assertTrue(set(NON_RESERVING_STAGES) <= set(ORDER_STAGES))
 
