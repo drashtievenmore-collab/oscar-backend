@@ -75,8 +75,8 @@ router.register(
 )
 router.register("performance/goals", views.GoalViewSet, basename="hrms-goals")
 
-router.register("trainings", views.TrainingViewSet, basename="hrms-trainings")
-router.register("trainers", views.TrainerViewSet, basename="hrms-trainers")
+# router.register("trainings", views.TrainingViewSet, basename="hrms-trainings")
+# router.register("trainers", views.TrainerViewSet, basename="hrms-trainers")
 
 router.register("assets", views.AssetViewSet, basename="hrms-assets")
 router.register(
