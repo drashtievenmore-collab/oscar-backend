@@ -64,6 +64,8 @@ from .models import (
     Training,
     TrainingParticipant,
     WorkingDay,
+    SalespersonIncentiveScheme,
+    SalespersonIncentiveAccrual,
     BrokerCommissionRecord,
 )
 
@@ -810,6 +812,7 @@ class HrDocumentSerializer(BaseModelSerializer):
     )
     fileSize = serializers.IntegerField(source="file.file_size", read_only=True)
     fileType = serializers.CharField(source="file.content_type", read_only=True)
+    fileName = serializers.CharField(source="file.file_name", read_only=True)
     expiry = serializers.DateField(source="valid_until", required=False, allow_null=True)
     #: DERIVED from ``valid_until`` at read time (api.md §11.8).
     status = serializers.SerializerMethodField()
@@ -820,7 +823,7 @@ class HrDocumentSerializer(BaseModelSerializer):
         model = HrDocument
         fields = [
             "id", "title", "category", "employee", "employeeId", "version",
-            "expiry", "status", "fileId", "fileSize", "fileType", "uploadedBy",
+            "expiry", "status", "fileId", "fileSize", "fileType", "fileName", "uploadedBy",
             "updatedOn", "tags", "description", "valid_from", "is_confidential",
             "created_at",
         ]
@@ -1054,6 +1057,41 @@ class ComplaintSerializer(BaseModelSerializer):
 # =============================================================================
 # Textile Operational HR & Commercial Serializers (Oscar Letter Pad Scope)
 # =============================================================================
+
+class SalespersonIncentiveSchemeSerializer(BaseModelSerializer):
+    salespersonCount = serializers.IntegerField(
+        source="applicable_salespersons.count", read_only=True
+    )
+
+    class Meta:
+        model = SalespersonIncentiveScheme
+        fields = [
+            "id", "name", "code", "basis", "frequency", "slab_type",
+            "slabs", "flat_rate_percent", "deduct_returns", "deduct_bad_debts",
+            "is_active", "description", "salespersonCount", "applicable_salespersons",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class SalespersonIncentiveAccrualSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee", required=False)
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    schemeName = serializers.CharField(source="scheme.name", read_only=True)
+
+    class Meta:
+        model = SalespersonIncentiveAccrual
+        fields = [
+            "id", "employee", "employeeId", "employeeName", "employeeCode", "scheme", "schemeName",
+            "period_type", "period_name", "start_date", "end_date",
+            "gross_sales", "returns_deduction", "net_eligible_sales",
+            "applicable_rate", "calculated_incentive", "status", "hold_reason",
+            "approved_by", "approved_at", "paid_at", "journal_entry", "notes",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
 
 class BrokerCommissionRecordSerializer(BaseModelSerializer):
     brokerName = serializers.CharField(source="broker.name", read_only=True)
