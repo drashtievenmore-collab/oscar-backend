@@ -41,24 +41,25 @@ router.register("payroll", views.PayslipViewSet, basename="hrms-payroll")
 router.register("incentive-schemes", views.SalespersonIncentiveSchemeViewSet, basename="hrms-incentive-schemes")
 router.register("incentives", views.SalespersonIncentiveViewSet, basename="hrms-incentives")
 router.register("broker-commissions", views.BrokerCommissionViewSet, basename="hrms-broker-commissions")
-router.register("transfers", views.StubLifecycleViewSet, basename="hrms-transfers")
-router.register("promotions", views.StubLifecycleViewSet, basename="hrms-promotions")
-router.register("warnings", views.StubLifecycleViewSet, basename="hrms-warnings")
-router.register("awards", views.StubLifecycleViewSet, basename="hrms-awards")
-router.register("jobs", views.StubLifecycleViewSet, basename="hrms-jobs")
-router.register("candidates", views.StubLifecycleViewSet, basename="hrms-candidates")
-router.register("applications", views.StubLifecycleViewSet, basename="hrms-applications")
+router.register("incentive-schemes", views.SalespersonIncentiveSchemeViewSet, basename="hrms-incentive-schemes")
+router.register("incentives", views.SalespersonIncentiveViewSet, basename="hrms-incentives")
+# transfers / promotions / warnings / awards and jobs / candidates /
+# applications are registered further down with their real viewsets.
 
-# =============================================================================
-# COMMENTED OUT PER OSCAR LETTER PAD SCOPE (Kept for reference, do not delete):
-# =============================================================================
-# router.register("jobs", views.JobViewSet, basename="hrms-jobs")
-# router.register("candidates", views.CandidateViewSet, basename="hrms-candidates")
-# router.register("applications", views.ApplicationViewSet, basename="hrms-applications")
-# router.register("interviews", views.InterviewViewSet, basename="hrms-interviews")
-# router.register("offers", views.OfferViewSet, basename="hrms-offers")
-# router.register("onboarding", views.OnboardingViewSet, basename="hrms-onboarding")
-# router.register("recruitment/questions", views.ScreeningQuestionViewSet, basename="hrms-screening-questions")
+# Recruitment lives in the Oscar letter-pad scope again: the models, views and
+# serializers are complete, so the routes are mounted for the recruitment
+# screens. Meetings remain out of scope.
+router.register("jobs", views.JobViewSet, basename="hrms-jobs")
+router.register("candidates", views.CandidateViewSet, basename="hrms-candidates")
+router.register("applications", views.ApplicationViewSet, basename="hrms-applications")
+router.register("interviews", views.InterviewViewSet, basename="hrms-interviews")
+router.register("offers", views.OfferViewSet, basename="hrms-offers")
+router.register("onboarding", views.OnboardingViewSet, basename="hrms-onboarding")
+router.register(
+    "recruitment/questions",
+    views.ScreeningQuestionViewSet,
+    basename="hrms-screening-questions",
+)
 # router.register("meetings", views.CompanyMeetingViewSet, basename="hrms-meetings")
 # router.register("meeting-rooms", views.MeetingRoomViewSet, basename="hrms-meeting-rooms")
 
@@ -102,6 +103,11 @@ router.register(
 router.register("terminations", views.TerminationViewSet, basename="hrms-terminations")
 router.register("resignations", views.ResignationViewSet, basename="hrms-resignations")
 router.register("complaints", views.ComplaintViewSet, basename="hrms-complaints")
+router.register("transfers", views.EmployeeTransferViewSet, basename="hrms-transfers")
+router.register("promotions", views.EmployeePromotionViewSet, basename="hrms-promotions")
+router.register("warnings", views.EmployeeWarningViewSet, basename="hrms-warnings")
+router.register("awards", views.EmployeeAwardViewSet, basename="hrms-awards")
+
 
 urlpatterns = [
     path("org-chart/", views.OrgChartView.as_view(), name="hrms-org-chart"),
@@ -111,18 +117,18 @@ urlpatterns = [
         views.FlexibilityPolicyView.as_view(),
         name="hrms-attendance-flexibility",
     ),
-    # Recruitment views commented out per Oscar letter pad scope (kept for reference, do not remove):
-    # path(
-    #     "recruitment/funnel/",
-    #     views.RecruitmentFunnelView.as_view(),
-    #     {"section": "funnel"},
-    #     name="hrms-recruitment-funnel",
-    # ),
-    # path(
-    #     "recruitment/dashboard/",
-    #     views.RecruitmentFunnelView.as_view(),
-    #     name="hrms-recruitment-dashboard",
-    # ),
+    # Recruitment dashboard/funnel (the route block above is enabled again).
+    path(
+        "recruitment/funnel/",
+        views.RecruitmentFunnelView.as_view(),
+        {"section": "funnel"},
+        name="hrms-recruitment-funnel",
+    ),
+    path(
+        "recruitment/dashboard/",
+        views.RecruitmentFunnelView.as_view(),
+        name="hrms-recruitment-dashboard",
+    ),
     path(
         "performance/dashboard/",
         views.PerformanceDashboardView.as_view(),
@@ -130,5 +136,6 @@ urlpatterns = [
     ),
     path("working-days/", views.WorkingDayView.as_view(), name="hrms-working-days"),
     path("settings/", views.HrmsSettingsView.as_view(), name="hrms-settings"),
+    path("agency-monitoring/", views.AgencyProductionMonitoringView.as_view(), name="hrms-agency-monitoring"),
     path("", include(router.urls)),
 ]

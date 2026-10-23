@@ -12,7 +12,13 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.core.audit import notify
-from apps.core.exceptions import Codes, Conflict, NotFound, ValidationFailed
+from apps.core.exceptions import (
+    Codes,
+    Conflict,
+    NotFound,
+    PermissionDenied,
+    ValidationFailed,
+)
 from apps.core.money import ZERO, round2
 from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
@@ -743,9 +749,36 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
     def email_detail(self, request, pk=None, row_id=None):
         return self._delete_sub_resource(request, pk, row_id, "emails")
 
-    @action(detail=True, methods=["delete"], url_path=r"notes/(?P<row_id>[^/.]+)")
+    @action(detail=True, methods=["patch", "delete"], url_path=r"notes/(?P<row_id>[^/.]+)")
     def note_detail(self, request, pk=None, row_id=None):
-        return self._delete_sub_resource(request, pk, row_id, "notes")
+        if request.method == "DELETE":
+            return self._delete_sub_resource(request, pk, row_id, "notes")
+
+        lead = self.get_object()
+        row = lead.notes.filter(pk=row_id, deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound("That note no longer exists.")
+
+        user = request.user
+        is_admin = bool(
+            getattr(user, "is_superuser", False) or getattr(user, "is_staff", False)
+        )
+        # Only the author or an administrator may rewrite a note; every other
+        # user can still read the thread and add their own note.
+        if not is_admin and (
+            row.author_id is None or row.author_id != getattr(user, "id", None)
+        ):
+            raise PermissionDenied(
+                "Only the note author or an administrator can edit this note."
+            )
+
+        raw = request.data.dict() if hasattr(request.data, "dict") else dict(request.data)
+        serializer = LeadNoteSerializer(
+            row, data=raw, partial=True, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
 
     @action(detail=True, methods=["get", "post"], url_path="files")
     def files(self, request, pk=None):

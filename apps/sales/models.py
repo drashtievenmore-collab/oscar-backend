@@ -28,17 +28,21 @@ from apps.core.models import LegacyIdMixin, TenantModel
 
 # --- api.md Appendix A -------------------------------------------------------
 QUOTATION_STATUSES = [
-    "Draft", "Sent", "Viewed", "Accepted", "Rejected", "Expired",
+    "Draft", "Pending Approval", "Sent", "Viewed", "Accepted", "Rejected", "Expired",
     "Confirmed", "Converted", "Invoiced", "Cancelled",
 ]
 ORDER_STAGES = [
-    "Draft", "Confirmed", "Partially Dispatched", "Fully Dispatched", "Invoiced", "Closed", "Cancelled",
+    "Draft", "Pending Approval", "Confirmed", "Partially Dispatched", "Fully Dispatched",
+    "Invoiced", "Closed", "Cancelled",
 ]
 #: Stages whose open lines no longer reserve stock (api.md §5.4, db.md §5.2).
-#: A Draft order has not been committed yet; a Fully Dispatched / Invoiced /
+#: A Draft order has not been committed yet, and one waiting for a discount /
+#: margin approval is not committed either; a Fully Dispatched / Invoiced /
 #: Closed order has already moved its stock; a Cancelled one never will.
 #: Only Confirmed and Partially Dispatched orders reserve their pending qty.
-NON_RESERVING_STAGES = ["Draft", "Fully Dispatched", "Invoiced", "Closed", "Cancelled"]
+NON_RESERVING_STAGES = [
+    "Draft", "Pending Approval", "Fully Dispatched", "Invoiced", "Closed", "Cancelled",
+]
 PAYMENT_STATUSES = ["Unpaid", "Partially Paid", "Paid"]
 PROFORMA_STATUSES = ["Draft", "Sent", "Accepted", "Converted", "Expired", "Cancelled"]
 CHALLAN_STATUSES = ["Draft", "Dispatched", "In Transit", "Delivered", "Cancelled"]
@@ -204,6 +208,7 @@ class SalesOrder(DocumentHeader):
     dispatch_date = models.DateField(null=True, blank=True)
     vehicle_number = models.TextField(null=True, blank=True)
     transporter = models.TextField(null=True, blank=True)
+    allocated_freight_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
 
     class Meta:
         db_table = "sales_orders"
@@ -312,6 +317,7 @@ class DeliveryChallan(DocumentHeader):
     dispatch_date = models.DateField(null=True, blank=True)
     vehicle_number = models.TextField(null=True, blank=True)
     transporter = models.TextField(null=True, blank=True)
+    allocated_freight_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     lr_number = models.TextField(null=True, blank=True)
     delivery_location = models.TextField(null=True, blank=True)
     eway_bill_number = models.TextField(null=True, blank=True)
@@ -392,6 +398,7 @@ class SalesInvoice(DocumentHeader):
     dispatch_date = models.DateField(null=True, blank=True)
     vehicle_number = models.TextField(null=True, blank=True)
     transporter = models.TextField(null=True, blank=True)
+    allocated_freight_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
 
     class Meta:
         db_table = "sales_invoices"

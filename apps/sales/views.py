@@ -72,6 +72,21 @@ def money_sum(field, **kwargs):
     return Coalesce(Sum(field, **kwargs), Value(Decimal("0.00")), output_field=MONEY)
 
 
+def _approval_required_response(document_kind, number, evaluation, req):
+    """409 in the shape of the API's error envelope, returned (not raised) so
+    the approval request opened by the gate is kept."""
+    from . import discount_control
+
+    return Response(
+        {
+            "message": discount_control.approval_message(document_kind, number, evaluation),
+            "code": "APPROVAL_REQUIRED",
+            "payload": discount_control.approval_payload(req, evaluation),
+        },
+        status=status.HTTP_409_CONFLICT,
+    )
+
+
 class SalesDocumentViewSet(TenantModelViewSet):
     """Shared behaviour for the sales document family.
 
@@ -244,7 +259,10 @@ class QuotationViewSet(SalesDocumentViewSet):
     print_title = "Quotation"
     filter_map = {"customerId": "party_id", "customer_id": "party_id"}
     permission_map = {"read": ["view_sales"], "write": ["create_quotation"]}
-    draft_values = ("Draft", "Sent")
+    draft_values = ("Draft", "Pending Approval", "Sent")
+    #: Statuses that commit the quotation to the customer: reaching one goes
+    #: through the discount gate first.
+    committing_statuses = ("Sent", "Accepted", "Approved", "Confirmed")
 
     def perform_create(self, serializer):
         serializer.validated_data["quotation_number"] = allocate_number(
@@ -252,10 +270,71 @@ class QuotationViewSet(SalesDocumentViewSet):
         )
         return super().perform_create(serializer)
 
+    def _hold_for_approval(self, quotation, note=None):
+        """Gate a quotation before it goes to the customer.
+
+        Returns a 409 response (and leaves the quotation in Pending Approval)
+        when an approver is needed, else None. Never raises, so the request
+        that was opened survives the caller's transaction.
+        """
+        from . import discount_control
+
+        quotation.refresh_from_db()
+        evaluation, req = discount_control.gate_document(
+            quotation, self.request.user, "Quotation", quotation.quotation_number, note=note
+        )
+        if req is None:
+            if quotation.status == "Pending Approval":
+                quotation.status = "Draft"
+                quotation.save(update_fields=["status", "updated_at"])
+            return None
+        if quotation.status != "Pending Approval":
+            quotation.status = "Pending Approval"
+            quotation.save(update_fields=["status", "updated_at"])
+        return _approval_required_response("Quotation", quotation.quotation_number, evaluation, req)
+
+    @action(detail=True, methods=["get"], url_path="discount-check")
+    def discount_check(self, request, pk=None):
+        """What this quotation's discounts need: per line, who must approve."""
+        from . import discount_control
+
+        return Response(discount_control.evaluate_document(self.get_object(), user=request.user))
+
+    @action(detail=True, methods=["post"], url_path="request-approval")
+    def request_approval(self, request, pk=None):
+        """``{ reason }`` -- ask for discount approval now, at save time,
+        instead of waiting for send. 200 ``{needsApproval: false}`` when the
+        discounts are within the user's authority."""
+        quotation = self.get_object()
+        if quotation.status not in self.draft_values:
+            raise Conflict(
+                f"This quotation is {quotation.status}; its discount is already settled.",
+                code=Codes.DRAFT_ONLY,
+            )
+        blocked = self._hold_for_approval(quotation, note=(request.data.get("reason") or "").strip() or None)
+        if blocked is None:
+            return Response({"needsApproval": False})
+        body = dict(blocked.data)
+        body["needsApproval"] = True
+        return Response(body)
+
+    @action(detail=True, methods=["post"])
+    def send(self, request, pk=None):
+        blocked = self._hold_for_approval(self.get_object())
+        if blocked is not None:
+            return blocked
+        return super().send(request, pk=pk)
+
     def perform_update(self, serializer):
         from apps.crm import services as crm_services
         previous_status = serializer.instance.status
         quotation = super().perform_update(serializer)
+        if (
+            quotation.status in self.committing_statuses
+            and quotation.status != previous_status
+            and self._hold_for_approval(quotation) is not None
+        ):
+            return quotation
         if quotation.status != previous_status:
             if quotation.status == "Sent":
                 crm_services.advance_deal_for_quotation(
@@ -317,6 +396,9 @@ class QuotationViewSet(SalesDocumentViewSet):
             raise Conflict(
                 f"This quotation is {quotation.status}.", code=Codes.ALREADY_DONE
             )
+        blocked = self._hold_for_approval(quotation)
+        if blocked is not None:
+            return blocked
         if quotation.party_id is None:
             raise Conflict(
                 "This quotation has no customer account yet. Approve it first -- "
@@ -384,6 +466,10 @@ class QuotationViewSet(SalesDocumentViewSet):
                 f"This quotation is {quotation.status} and cannot be approved.",
                 code=Codes.ALREADY_DONE,
             )
+        if quotation.status not in ("Accepted", "Converted", "Invoiced"):
+            blocked = self._hold_for_approval(quotation)
+            if blocked is not None:
+                return blocked
 
         conversion = {"party": None, "created": False, "lead": None}
         if quotation.status not in ("Accepted", "Converted", "Invoiced"):
@@ -582,7 +668,9 @@ class SalesOrderViewSet(SalesDocumentViewSet):
             self.request.user.client, "SO", serializer.validated_data.get("doc_date")
         )
         serializer.validated_data.setdefault("stage", "Confirmed")
-        return super().perform_create(serializer)
+        order = super().perform_create(serializer)
+        self._gate_discount(order, previous_stage=None)
+        return order
 
     def perform_update(self, serializer):
         """Confirming an order reserves stock (api.md §5.4).
@@ -590,23 +678,66 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         Reservation is not a column -- it is derived from open order lines
         (db.md §5.2) -- so "reserving" here means enforcing the credit limit
         and letting the stage change make the reservation true.
+
+        A discount above the user's authority, or a line below cost / minimum
+        margin, holds the order in "Pending Approval" instead (PDF §12, §16).
         """
         previous_stage = serializer.instance.stage
         order = super().perform_update(serializer)
 
-        if previous_stage == "Draft" and order.stage == "Confirmed":
+        if previous_stage in ("Draft", "Pending Approval") and order.stage == "Confirmed":
             services.assert_credit_limit(
                 order.party,
                 order.total,
                 user=self.request.user,
                 override=bool(self.request.data.get("overrideCreditLimit")),
             )
+        if self._gate_discount(order, previous_stage=previous_stage):
+            return order
+        if previous_stage in ("Draft", "Pending Approval") and order.stage == "Confirmed":
             services.reserve_order_takas(order)
         return order
 
+    def _gate_discount(self, order, previous_stage):
+        """Hold a committed order whose discount needs an approver.
+
+        Returns True when the order was put (or kept) in Pending Approval.
+        """
+        from . import discount_control
+
+        if order.stage not in ("Confirmed", "Pending Approval"):
+            return False
+        if order.line_items.filter(dispatched_qty__gt=0).exists():
+            return False
+        order.refresh_from_db()
+        _, req = discount_control.gate_document(
+            order, self.request.user, "Sales Order", order.order_number
+        )
+        if req is not None:
+            if order.stage != "Pending Approval":
+                if previous_stage == "Confirmed":
+                    services.release_order_takas(order)
+                order.stage = "Pending Approval"
+                order.save(update_fields=["stage", "updated_at"])
+            return True
+        if order.stage == "Pending Approval":
+            # Nothing needs approval any more (the discount was lowered, or an
+            # earlier approval covers it): the order is confirmed.
+            order.stage = "Confirmed"
+            order.save(update_fields=["stage", "updated_at"])
+            services.reserve_order_takas(order)
+        return False
+
+    @action(detail=True, methods=["get"], url_path="discount-check")
+    def discount_check(self, request, pk=None):
+        """What this order's discounts need: per line, who must approve."""
+        from . import discount_control
+
+        return Response(discount_control.evaluate_document(self.get_object(), user=request.user))
+
     def check_draft_only(self, instance, verb):
         # An order stays editable while it is Confirmed but nothing has shipped.
-        if instance.stage in ("Draft", "Confirmed") and not instance.line_items.filter(
+        if instance.stage in ("Draft", "Pending Approval", "Confirmed") and not instance.line_items.filter(
             dispatched_qty__gt=0
         ).exists():
             return
@@ -669,6 +800,12 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         """Partial conversion (api.md §5.4): ``{ lines: [{ lineId, qty, serials[] }] }``."""
         if order.stage == "Cancelled":
             raise Conflict("This order is cancelled.", code=Codes.ALREADY_CANCELLED)
+        if order.stage == "Pending Approval":
+            raise Conflict(
+                f"Order {order.order_number} is waiting for discount approval and "
+                "cannot be dispatched or invoiced yet.",
+                code="APPROVAL_PENDING",
+            )
 
         requested = {
             str(row.get("lineId") or row.get("line_id")): row for row in data.get("lines") or []
@@ -1157,6 +1294,7 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
             transporter_id=data.get("transporterId") or data.get("transporter"),
             vehicle_no=data.get("vehicleNo") or data.get("vehicle_number"),
             approx_distance_km=int(data.get("distanceKm") or 100),
+            user=request.user,
         )
         self.write_audit("generate_eway_bill", challan, description=f"E-Way bill generated: {res['ewayBillNumber']}")
         return Response(self.get_serializer(challan).data)
@@ -1204,10 +1342,27 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         rows["outstanding"] = round2(rows["totalValue"] - rows["paid"])
         return rows
 
+    def _discount_gate(self, invoice):
+        from . import discount_control
+
+        invoice.refresh_from_db()
+        number = invoice.invoice_number or f"draft {str(invoice.id)[:8]}"
+        evaluation, req = discount_control.gate_document(
+            invoice, self.request.user, "Sales Invoice", number
+        )
+        return evaluation, req, number
+
     def perform_create(self, serializer):
-        """``POST /sales/invoices/`` -- Draft unless ``{ finalize: true }``."""
+        """``POST /sales/invoices/`` -- Draft unless ``{ finalize: true }``.
+
+        A discount that needs an approver keeps the invoice in Draft; the
+        approval request is opened and the invoice is finalized after it.
+        """
         invoice = super().perform_create(serializer)
         if self.request.data.get("finalize"):
+            _, req, _ = self._discount_gate(invoice)
+            if req is not None:
+                return invoice
             services.finalize_invoice(
                 invoice,
                 user=self.request.user,
@@ -1216,10 +1371,22 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
             invoice.refresh_from_db()
         return invoice
 
+    @action(detail=True, methods=["get"], url_path="discount-check")
+    def discount_check(self, request, pk=None):
+        """What this invoice's discounts need: per line, who must approve."""
+        from . import discount_control
+
+        return Response(discount_control.evaluate_document(self.get_object(), user=request.user))
+
     @action(detail=True, methods=["post"])
     def finalize(self, request, pk=None):
+        draft = self.get_object()
+        if draft.status == "Draft":
+            evaluation, req, number = self._discount_gate(draft)
+            if req is not None:
+                return _approval_required_response("Sales Invoice", number, evaluation, req)
         invoice = services.finalize_invoice(
-            self.get_object(),
+            draft,
             user=request.user,
             override_credit_limit=bool(request.data.get("overrideCreditLimit")),
         )
@@ -1264,7 +1431,7 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         invoice = self.get_object()
         reason = request.data.get("reason", "1")
         remarks = request.data.get("remarks", "")
-        einvoice_service.cancel_irn(invoice, reason=reason, remarks=remarks)
+        einvoice_service.cancel_irn(invoice, reason=reason, remarks=remarks, user=request.user)
         self.write_audit("cancel_irn", invoice, description=f"IRN cancelled: {remarks}")
         return Response(self.get_serializer(invoice).data)
 
@@ -1282,6 +1449,7 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
             transporter_id=data.get("transporterId") or data.get("transporter"),
             vehicle_no=data.get("vehicleNo") or data.get("vehicle_number"),
             approx_distance_km=int(data.get("distanceKm") or 100),
+            user=request.user,
         )
         self.write_audit("generate_eway_bill", invoice, description=f"E-Way bill generated: {res['ewayBillNumber']}")
         return Response(self.get_serializer(invoice).data)
@@ -1444,6 +1612,10 @@ class SalesReturnViewSet(PostedReturnGuardMixin, SalesDocumentViewSet):
             "return_number"
         ]
         serializer.validated_data.setdefault("party", invoice.party)
+        if invoice.salesperson_fk and not serializer.validated_data.get("salesperson_fk"):
+            serializer.validated_data["salesperson_fk"] = invoice.salesperson_fk
+        if invoice.salesperson and not serializer.validated_data.get("salesperson"):
+            serializer.validated_data["salesperson"] = invoice.salesperson
 
         sales_return = super().perform_create(serializer)
         self._validate_and_post_return(sales_return, invoice)
@@ -1692,6 +1864,9 @@ class BrokerCommissionViewSet(TenantModelViewSet):
     queryset = BrokerCommission.objects.select_related("broker", "invoice", "party", "salesperson")
     serializer_class = BrokerCommissionSerializer
     required_permissions = ["view_sales"]
+    # Reading needs view_sales; changing or settling a commission needs
+    # manage_brokers. A rate change additionally goes through approval.
+    permission_map = {"read": ["view_sales"], "write": ["manage_brokers"]}
     audit_entity_type = "BrokerCommission"
     audit_label_field = "commission_number"
     filter_map = {
@@ -1699,6 +1874,40 @@ class BrokerCommissionViewSet(TenantModelViewSet):
         "invoiceId": "invoice_id",
         "status": "status",
     }
+
+    def perform_update(self, serializer):
+        """Status and amount move only through the actions below, and a new
+        rate or commission type waits for approval (PDF §16)."""
+        data = serializer.validated_data
+        commission = serializer.instance
+        locked = [
+            field for field in ("status", "commission_amount", "paid_amount", "approved_by", "approved_at")
+            if field in data and data[field] != getattr(commission, field)
+        ]
+        if locked:
+            raise ValidationFailed(
+                "Status and amounts change only through approve / make-payable / pay, "
+                "and the amount follows the rate.",
+                field_errors={field: ["Not editable."] for field in locked},
+            )
+        new_rate = data.pop("rate", commission.rate)
+        new_type = data.pop("commission_type", commission.commission_type)
+        if D(new_rate or 0) != D(commission.rate or 0) or new_type != commission.commission_type:
+            self._pending_request = broker_services.request_rate_change(
+                commission, rate=new_rate, commission_type=new_type, user=self.request.user
+            )
+        return super().perform_update(serializer)
+
+    def update(self, request, *args, **kwargs):
+        self._pending_request = None
+        response = super().update(request, *args, **kwargs)
+        if self._pending_request is not None:
+            response.data["pendingApproval"] = {
+                "approvalRequestId": str(self._pending_request.id),
+                "approverRoleCodes": self._pending_request.new_values.get("approverRoleCodes"),
+                "message": "The new rate applies once approved.",
+            }
+        return response
 
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
@@ -1966,6 +2175,9 @@ class PartyDiscountViewSet(TenantModelViewSet):
     ).exclude(status="Cancelled")
     serializer_class = SalesInvoiceSerializer
     required_permissions = ["view_sales"]
+    # A read-only register over invoices: invoices are edited through
+    # /sales/invoices/ with its own permissions, never through this view.
+    http_method_names = ["get", "head", "options"]
 
     def list(self, request, *args, **kwargs):
         qs = self.get_queryset()

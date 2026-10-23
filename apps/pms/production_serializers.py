@@ -48,6 +48,8 @@ class ProductionInstructionSerializer(BaseModelSerializer):
     totalProduced = serializers.SerializerMethodField()
     acceptedQty = serializers.SerializerMethodField()
     shortageQty = serializers.SerializerMethodField()
+    rejectedQty = serializers.SerializerMethodField()
+    reprocessQty = serializers.SerializerMethodField()
     finalAmount = serializers.SerializerMethodField()
 
     class Meta:
@@ -60,14 +62,14 @@ class ProductionInstructionSerializer(BaseModelSerializer):
             "verification_remarks", "completed_at", "greyLotId", "greyLotNo", "finalPoId", "finalPoNumber",
             "employeeId", "employeeCode", "employeeName", "supervisorId", "supervisorName",
             "status", "verified_by", "verified_at", "notes",
-            "cumulative", "balance", "totalProduced", "acceptedQty",
+            "cumulative", "balance", "totalProduced", "acceptedQty", "rejectedQty", "reprocessQty",
             "shortageQty", "finalAmount", "created_at", "updated_at",
         ]
         read_only_fields = [
             "id", "instruction_number", "verified_by", "verified_at",
             "completed_at", "rejected_qty", "verification_remarks",
             "employeeCode", "employeeName", "cumulative", "balance",
-            "totalProduced", "acceptedQty", "shortageQty", "finalAmount",
+            "totalProduced", "acceptedQty", "rejectedQty", "reprocessQty", "shortageQty", "finalAmount",
             "agencyCode", "greyLotNo", "finalPoNumber",
             # Status only moves through approve/start/complete/verify/generate-po.
             "status",
@@ -115,6 +117,12 @@ class ProductionInstructionSerializer(BaseModelSerializer):
 
     def get_acceptedQty(self, instance):
         return self._completion(instance)["acceptedQty"]
+
+    def get_rejectedQty(self, instance):
+        return self._completion(instance)["rejectedQty"]
+
+    def get_reprocessQty(self, instance):
+        return self._completion(instance).get("reprocessQty", 0)
 
     def get_shortageQty(self, instance):
         return self._completion(instance)["shortageQty"]

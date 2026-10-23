@@ -82,6 +82,7 @@ urlpatterns = [
     path("combined-grey-stock/setting/", views.CombinedGreyStockSettingView.as_view(), name="inventory-combined-grey-stock-setting"),
     path("adjustments/", views.StockAdjustmentView.as_view(), name="inventory-adjustments"),
     path("lot-register/", views.LotTakaRegisterView.as_view(), name="inventory-lot-register"),
+    path("lot-register/merge/", views.LotMergeView.as_view(), name="inventory-lot-merge"),
     path("lot-register/<uuid:pk>/", views.LotTakaRegisterView.as_view(), name="inventory-lot-register-detail"),
     path("taka-tags/", views.TakaTagPrintView.as_view(), name="inventory-taka-tags"),
     path("taka-tags/print/", views.TakaTagPrintView.as_view(), name="inventory-taka-tags-print"),

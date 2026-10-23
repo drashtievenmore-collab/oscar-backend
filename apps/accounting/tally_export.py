@@ -73,9 +73,9 @@ def export_tally_masters_xml(client_id, company_name="Oscar ERP"):
         ET.SubElement(ledger_el, "PARENT").text = parent_name
         if party.gstin:
             ET.SubElement(ledger_el, "PARTYGSTIN").text = party.gstin
-        if party.pan:
+        if getattr(party, "pan", None):
             ET.SubElement(ledger_el, "PANNUMBER").text = party.pan
-        if party.state:
+        if getattr(party, "state", None):
             ET.SubElement(ledger_el, "STATENAME").text = party.state
 
     rough_string = ET.tostring(root, "utf-8")

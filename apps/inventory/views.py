@@ -460,39 +460,64 @@ class StockAdjustmentView(APIView):
                 code="NO_CHANGE",
             )
 
-        # TODO(Phase 4 approval engine): adjustments whose value exceeds
-        # settings.STOCK_ADJUSTMENT_APPROVAL_LIMIT must be routed for approval
-        # instead of posting directly. The engine does not exist yet, so the
-        # limit is only reported back to the caller.
+        # An adjustment worth more than STOCK_ADJUSTMENT_APPROVAL_LIMIT is not
+        # posted: it waits in the approvals inbox and is posted by
+        # inventory.approval_handlers once approved (PDF §16).
         from django.conf import settings as django_settings
 
-        approval_limit = getattr(django_settings, "STOCK_ADJUSTMENT_APPROVAL_LIMIT", None)
-        adjustment_value = round2(abs(delta) * D(data.get("unitCost") or item.cost_price or 0))
+        from . import adjustments
 
-        movement = stock.post_movement(
+        approval_limit = getattr(django_settings, "STOCK_ADJUSTMENT_APPROVAL_LIMIT", None)
+        unit_cost = data.get("unitCost") or item.cost_price
+        adjustment_value = round2(abs(delta) * D(unit_cost or 0))
+        exceeds = approval_limit is not None and adjustment_value > D(str(approval_limit))
+
+        if exceeds:
+            req = adjustments.request_adjustment_approval(
+                client_id=request.client_id,
+                item=item,
+                location=location,
+                lot=lot,
+                delta=delta,
+                unit_cost=unit_cost,
+                reason=data["reason"],
+                value=adjustment_value,
+                limit=D(str(approval_limit)),
+                user=request.user,
+            )
+            return Response(
+                {
+                    "pendingApproval": True,
+                    "approvalRequestId": str(req.id),
+                    "approverRoleCodes": req.new_values.get("approverRoleCodes"),
+                    "message": (
+                        f"Adjustment worth {adjustment_value} is above the approval limit of "
+                        f"{round2(D(str(approval_limit)))}. It will be posted once approved."
+                    ),
+                    "stock": stock.calculate_item_stock(request.client_id, item),
+                    "adjustmentValue": adjustment_value,
+                    "exceedsApprovalLimit": True,
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
+
+        movement = adjustments.post_adjustment(
             client_id=request.client_id,
             item=item,
             location=location,
-            type="ADJUSTMENT",
-            quantity=delta,
-            unit_cost=data.get("unitCost") or item.cost_price,
-            notes=data["reason"],
+            lot=lot,
+            delta=delta,
+            unit_cost=unit_cost,
+            reason=data["reason"],
             user=request.user,
-            lot_taka=lot,
         )
-
-        from apps.accounting.services import post_stock_adjustment
-
-        post_stock_adjustment(movement, user=request.user)
 
         return Response(
             {
                 "movement": StockMovementSerializer(movement).data,
                 "stock": stock.calculate_item_stock(request.client_id, item),
                 "adjustmentValue": adjustment_value,
-                "exceedsApprovalLimit": (
-                    approval_limit is not None and adjustment_value > D(str(approval_limit))
-                ),
+                "exceedsApprovalLimit": False,
             },
             status=status.HTTP_201_CREATED,
         )
@@ -1236,9 +1261,6 @@ class InventoryDashboardView(APIView):
             return unit.code if unit else ((item.uom or "").strip() or "Unit")
 
         item_unit = {item_id: unit_label(item) for item_id, item in item_map.items()}
-        units_in_scope = sorted(set(item_unit.values()))
-        mixed_units = len(units_in_scope) > 1
-        dominant_uom = units_in_scope[0] if len(units_in_scope) == 1 else ("Mixed" if mixed_units else "Mtr")
 
         # Balances
         balances_qs = StockBalance.objects.filter(client_id=client_id, deleted_at__isnull=True, item_id__in=item_ids)
@@ -1246,6 +1268,16 @@ class InventoryDashboardView(APIView):
             balances_qs = balances_qs.filter(location_id=godown_id)
 
         balance_rows = list(balances_qs.select_related("item", "location"))
+
+        # Determine real stock units for items that have physical stock on hand.
+        active_stock_units = sorted(set(
+            item_unit.get(b.item_id) for b in balance_rows if D(b.on_hand) > ZERO and item_unit.get(b.item_id)
+        ))
+        units_in_scope = active_stock_units if active_stock_units else sorted(set(item_unit.values()))
+        mixed_units = len(units_in_scope) > 1
+        dominant_uom = units_in_scope[0] if len(units_in_scope) == 1 else ("Mixed" if mixed_units else "Mtr")
+        if dominant_uom in ("Meter", "meter"):
+            dominant_uom = "Mtr"
 
         # Every stock figure below comes from stock_balances, split by the
         # *location* the stock is in: QC Hold / Reprocess / Second Quality /
@@ -2026,9 +2058,18 @@ class InventoryDashboardView(APIView):
                 "date": ret.sales_return.doc_date.strftime("%d-%m-%Y") if ret.sales_return_id and ret.sales_return.doc_date else "",
             })
 
-        if mixed_units:
-            on_hand_by_uom = per_unit(balance_rows, lambda b: b.on_hand)
-            damaged_by_uom = per_unit(balance_rows, lambda b: b.damaged)
+        on_hand_by_uom = per_unit(balance_rows, lambda b: b.on_hand)
+        damaged_by_uom = per_unit(balance_rows, lambda b: b.damaged)
+        if len(on_hand_by_uom) <= 1:
+            mixed_units = False
+            dominant_uom = on_hand_by_uom[0]["uom"] if on_hand_by_uom else "Mtr"
+            if dominant_uom in ("Meter", "meter"):
+                dominant_uom = "Mtr"
+            for key, card_row in summary_cards.items():
+                card_row["uom"] = dominant_uom
+            summary_cards["totalStock"]["byUom"] = on_hand_by_uom
+            summary_cards["wastageStock"]["byUom"] = damaged_by_uom
+        elif mixed_units:
             for key, card_row in summary_cards.items():
                 card_row["qty"] = None
                 card_row["changePct"] = None
@@ -5198,36 +5239,26 @@ class LotTakaRegisterView(APIView):
             raise ValidationFailed("Lot record not found.", field_errors={"id": ["Not found."]})
 
         data = request.data
-        is_manager = bool(
-            getattr(request.user, "is_staff", False)
-            or getattr(request.user, "is_superuser", False)
-            or request.user.has_perm("inventory.adjust_stock")
-            or (getattr(request.user, "role", None) and any(m in request.user.role.name.lower() for m in ("manager", "admin", "lead")))
-        )
+        # Quantity is never edited in place, not even by a manager: rewriting
+        # the movement would leave StockBalance stale (PDF §17). A quantity
+        # correction is a stock adjustment document.
         disallowed = [
-            f for f in ("locationId", "location", "rate", "status", "qcStatus", "qc_status", "availableQty")
+            f for f in (
+                "locationId", "location", "rate", "status", "qcStatus", "qc_status",
+                "availableQty", "receivedQty", "qty",
+            )
             if f in data
         ]
-        if not is_manager and ("receivedQty" in data or "qty" in data):
-            disallowed.append("receivedQty")
         if disallowed:
             raise ValidationFailed(
                 f"Direct edits to {', '.join(disallowed)} are not allowed. "
                 "Stock, location and status changes come from documents "
-                "(GRN, stock transfer, adjustment or QC disposition).",
+                "(GRN, stock transfer, stock adjustment or QC disposition).",
                 field_errors={f: ["Not editable."] for f in disallowed},
             )
 
         before = {"remarks": lot_taka.remarks, "rollWeight": str(lot_taka.roll_weight),
-                  "width": str(lot_taka.width), "gsm": str(lot_taka.gsm), "receivedQty": str(lot_taka.received_quantity)}
-        if is_manager and ("receivedQty" in data or "qty" in data):
-            new_qty = round4(D(str(data.get("receivedQty") or data.get("qty"))))
-            if new_qty <= ZERO:
-                raise ValidationFailed("Taka quantity must be greater than zero.", field_errors={"receivedQty": ["Must be > 0."]})
-            lot_taka.received_quantity = new_qty
-            if lot_taka.stock_movement:
-                lot_taka.stock_movement.quantity = new_qty
-                lot_taka.stock_movement.save(update_fields=["quantity", "updated_at"])
+                  "width": str(lot_taka.width), "gsm": str(lot_taka.gsm)}
         if "remarks" in data:
             lot_taka.remarks = data["remarks"]
         if "tags" in data:
@@ -5707,6 +5738,50 @@ class TakaTagPdfView(APIView):
         return response
 
 
+class LotMergeView(APIView):
+    """``POST /inventory/lot-register/merge/`` -- combine lots into one batch.
+
+    Body: ``{ lotTakaIds: [...], lotNumber?, remarks? }``. Same item, same
+    godown, available stock only. Returns the merged taka.
+    """
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["adjust_stock"]
+
+    def post(self, request):
+        from . import lot_merge
+
+        data = request.data
+        merged, sources = lot_merge.merge_lots(
+            client_id=request.client_id,
+            lot_taka_ids=data.get("lotTakaIds") or data.get("lot_taka_ids") or [],
+            lot_number=(data.get("lotNumber") or "").strip() or None,
+            remarks=data.get("remarks"),
+            user=request.user,
+        )
+        from apps.core.audit import record_audit
+
+        record_audit(
+            client=request.client_id, actor=request.user, action="merge", entity_type="LotTaka",
+            entity_id=merged.id, entity_label=merged.taka_id,
+            description=(
+                f"Merged {len(sources)} takas ({', '.join(s.taka_id or s.taka_number for s in sources)}) "
+                f"into lot {merged.lot_number}: {merged.received_quantity} {merged.uom or ''}"
+            ),
+        )
+        return Response({
+            "id": str(merged.id),
+            "takaId": merged.taka_id,
+            "lotNo": merged.lot_number,
+            "quantity": str(merged.available_quantity),
+            "rate": str(merged.rate),
+            "parentLots": [
+                {"id": str(s.id), "takaId": s.taka_id, "lotNo": s.lot_number} for s in sources
+            ],
+            "message": f"Merged {len(sources)} takas into lot {merged.lot_number}.",
+        }, status=status.HTTP_201_CREATED)
+
+
 class LotTraceabilityView(APIView):
     """
     GET /inventory/traceability/?target=<lot_or_taka>
@@ -6079,6 +6154,8 @@ class TripViewSet(TenantModelViewSet):
             from_location=data.get("fromLocation") or data.get("from_location"),
             to_location=data.get("toLocation") or data.get("to_location"),
             vehicle_number=data.get("vehicleNumber") or data.get("vehicle_number"),
+            vehicle_id=data.get("vehicleId") or data.get("vehicle_id"),
+            driver_id=data.get("driverId") or data.get("driver_id"),
             trip_date=data.get("tripDate") or data.get("trip_date"),
             transporter_id=data.get("transporterId") or data.get("transporter_id"),
             transporter_party_id=data.get("transporterPartyId") or data.get("transporter_party_id"),
@@ -6104,6 +6181,23 @@ class TripViewSet(TenantModelViewSet):
         trip = self.get_object()
         trip = logistics_services.allocate_trip_freight(trip, user=request.user)
         return Response(self.get_serializer(trip).data)
+
+    @action(detail=True, methods=["post"], url_path="confirm-delivery")
+    def confirm_delivery(self, request, pk=None):
+        trip = self.get_object()
+        data = request.data
+        delivery_time = data.get("deliveryTime") or data.get("delivery_time")
+        proof_file_id = data.get("proofFileId") or data.get("proof_file_id") or data.get("proof_file")
+        remarks = data.get("remarks")
+        trip = logistics_services.confirm_trip_delivery(
+            trip,
+            delivery_time=delivery_time,
+            proof_file_id=proof_file_id,
+            remarks=remarks,
+            user=request.user,
+        )
+        return Response(self.get_serializer(trip).data)
+
 
 
 

@@ -271,7 +271,13 @@ class IncentiveCalculationViewSet(ReadOnlyTenantViewSet):
     serializer_class = IncentiveCalculationSerializer
     ordering = ["-period_start"]
     filter_map = {"employeeId": "employee_id", "period": "period_label"}
-    permission_map = {"read": ["view_production"]}
+    # Approving, posting and paying an incentive are money movements.
+    permission_map = {
+        "read": ["view_production"],
+        "approve": ["verify_production"],
+        "post_to_ledger": ["verify_production"],
+        "pay": ["verify_production"],
+    }
 
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
