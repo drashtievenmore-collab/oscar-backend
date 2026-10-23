@@ -41,8 +41,6 @@ router.register("payroll", views.PayslipViewSet, basename="hrms-payroll")
 router.register("incentive-schemes", views.SalespersonIncentiveSchemeViewSet, basename="hrms-incentive-schemes")
 router.register("incentives", views.SalespersonIncentiveViewSet, basename="hrms-incentives")
 router.register("broker-commissions", views.BrokerCommissionViewSet, basename="hrms-broker-commissions")
-router.register("incentive-schemes", views.SalespersonIncentiveSchemeViewSet, basename="hrms-incentive-schemes")
-router.register("incentives", views.SalespersonIncentiveViewSet, basename="hrms-incentives")
 # transfers / promotions / warnings / awards and jobs / candidates /
 # applications are registered further down with their real viewsets.
 
