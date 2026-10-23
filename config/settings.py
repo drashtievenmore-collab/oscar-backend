@@ -324,3 +324,16 @@ LOGGING = {
 # wait in the approvals inbox and post once approved (apps/inventory/adjustments.py).
 # Unset (empty) means no limit.
 STOCK_ADJUSTMENT_APPROVAL_LIMIT = env("STOCK_ADJUSTMENT_APPROVAL_LIMIT", None) or None
+
+
+# --------------------------------------------------------------------------
+# E-Invoicing & E-Way Bill Integration (PDF §20)
+# --------------------------------------------------------------------------
+EINVOICE_ENABLED = env_bool("EINVOICE_ENABLED", False)
+EINVOICE_PROVIDER = env("EINVOICE_PROVIDER", "sandbox-sim")
+EINVOICE_SANDBOX_MODE = env_bool("EINVOICE_SANDBOX_MODE", True)
+EINVOICE_BASE_URL = env("EINVOICE_BASE_URL", "https://einv-apisandbox.nic.in")
+EINVOICE_CLIENT_ID = env("EINVOICE_CLIENT_ID", "")
+EINVOICE_CLIENT_SECRET = env("EINVOICE_CLIENT_SECRET", "")
+EINVOICE_USERNAME = env("EINVOICE_USERNAME", "")
+EINVOICE_PASSWORD = env("EINVOICE_PASSWORD", "")

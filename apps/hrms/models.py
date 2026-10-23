@@ -1384,7 +1384,10 @@ class Complaint(TenantModel):
 # =============================================================================
 
 class SalespersonIncentiveScheme(TenantModel, LegacyIdMixin):
-    """Salesperson Incentive Scheme configuration (Oscar Scope §12)."""
+    """DEPRECATED (P12): Canonical model is in apps.pms (IncentiveScheme) per HRMS_ERP_CHANGES.md. Do not create new records here.
+    
+    Salesperson Incentive Scheme configuration (Oscar Scope §12).
+    """
 
     BASIS_CHOICES = [
         ("INVOICE_VALUE", "Invoice Value"),
@@ -1425,7 +1428,10 @@ class SalespersonIncentiveScheme(TenantModel, LegacyIdMixin):
 
 
 class SalespersonIncentiveAccrual(TenantModel, LegacyIdMixin):
-    """Periodic incentive accrual calculation per salesperson (Oscar Scope §12)."""
+    """DEPRECATED (P12): Canonical model is in apps.pms (IncentiveCalculation) per HRMS_ERP_CHANGES.md. Do not create new records here.
+    
+    Periodic incentive accrual calculation per salesperson (Oscar Scope §12).
+    """
 
     STATUSES = [
         ("DRAFT", "Draft"),
@@ -1502,7 +1508,10 @@ class AgencyStaffAssignment(TenantModel, LegacyIdMixin):
 
 
 class DailyAgencyProductionEntry(TenantModel, LegacyIdMixin):
-    """Daily field monitoring records entered by salaried production staff (Oscar Scope §02, §05, §15)."""
+    """DEPRECATED (P12): Canonical model is in apps.pms (DailyProductionEntry) per HRMS_ERP_CHANGES.md. Do not create new records here.
+    
+    Daily field monitoring records entered by salaried production staff (Oscar Scope §02, §05, §15).
+    """
 
     employee = models.ForeignKey(
         Employee, on_delete=models.CASCADE, related_name="daily_production_entries"
@@ -1576,7 +1585,10 @@ class PayrollCommercialAllocation(TenantModel, LegacyIdMixin):
 
 
 class BrokerCommissionRecord(TenantModel, LegacyIdMixin):
-    """Broker Commission integration record (Oscar Scope §12, §14)."""
+    """DEPRECATED (P12): Canonical model is in apps.sales (BrokerCommission) per HRMS_ERP_CHANGES.md. Do not create new records here.
+    
+    Broker Commission integration record (Oscar Scope §12, §14).
+    """
 
     STATUSES = [
         ("Accrued", "Accrued"),

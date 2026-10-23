@@ -2,7 +2,7 @@
 from apps.core.approval_services import approval_handler, document_uuid
 
 
-@approval_handler("purchase_order")
+@approval_handler("purchase_order", "purchase_order_rate")
 def on_purchase_order(req, decision):
     from apps.purchase.models import PurchaseOrder
 

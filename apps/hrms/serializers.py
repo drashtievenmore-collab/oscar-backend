@@ -9,6 +9,7 @@ from apps.core.serializers import (
 )
 
 from . import services
+from apps.sales.models import BrokerCommission as SalesBrokerCommission
 from .models import (
     EmployeeTransfer, EmployeePromotion, EmployeeWarning, EmployeeAward,
     Appraisal,
@@ -1062,7 +1063,7 @@ class BrokerCommissionRecordSerializer(BaseModelSerializer):
     salespersonName = serializers.CharField(source="salesperson.name", read_only=True)
 
     class Meta:
-        model = BrokerCommissionRecord
+        model = SalesBrokerCommission
         fields = [
             "id", "commission_number", "broker", "brokerName", "brokerCode",
             "invoice", "invoiceNumber", "party", "partyName", "salesperson", "salespersonName",

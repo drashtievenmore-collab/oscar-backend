@@ -32,6 +32,8 @@ from .models import (
     ItemPart,
     ItemSerial,
     JobWorkRateMaster,
+    RateMaster,
+    PriceList,
     Location,
     LossReasonMaster,
     Party,
@@ -60,6 +62,7 @@ from .serializers import (
     ItemSerializer,
     ItemSerialSerializer,
     JobWorkRateMasterSerializer,
+    RateMasterSerializer,
     LocationSerializer,
     LossReasonMasterSerializer,
     PartyContactSerializer,
@@ -1382,6 +1385,89 @@ class JobWorkRateMasterViewSet(TenantModelViewSet):
         "processId": "process_id",
         "fabricQualityId": "fabric_quality_id",
     }
+
+
+class RateMasterViewSet(TenantModelViewSet):
+    queryset = RateMaster.objects.select_related("party", "item", "fabric_quality", "design", "shade")
+    serializer_class = RateMasterSerializer
+    required_permissions = ["view_masters"]
+    permission_map = {
+        "list": ["view_masters"],
+        "retrieve": ["view_masters"],
+        "create": ["view_masters"],
+        "update": ["view_masters"],
+        "partial_update": ["view_masters"],
+        "destroy": ["view_masters"],
+        "lookup": ["view_masters"],
+    }
+    audit_entity_type = "RateMaster"
+    filter_map = {
+        "isActive": "is_active",
+        "is_active": "is_active",
+        "rateType": "rate_type",
+        "rate_type": "rate_type",
+        "partyId": "party_id",
+        "itemId": "item_id",
+        "fabricQualityId": "fabric_quality_id",
+        "designId": "design_id",
+        "shadeId": "shade_id",
+    }
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        rate_type = self.request.query_params.get("rateType") or self.request.query_params.get("rate_type")
+        if rate_type:
+            qs = qs.filter(rate_type__iexact=rate_type)
+        party_id = self.request.query_params.get("partyId") or self.request.query_params.get("party_id")
+        if party_id:
+            qs = qs.filter(party_id=party_id)
+        search = self.request.query_params.get("search")
+        if search:
+            qs = qs.filter(
+                Q(party__name__icontains=search)
+                | Q(item__name__icontains=search)
+                | Q(fabric_quality__name__icontains=search)
+                | Q(design__name__icontains=search)
+                | Q(shade__name__icontains=search)
+                | Q(notes__icontains=search)
+            )
+        return qs
+
+    @action(detail=False, methods=["get", "post"], url_path="lookup")
+    def lookup(self, request):
+        from .rate_services import resolve_rate
+
+        data = request.data if request.method == "POST" else request.query_params
+        rate_type = data.get("rateType") or data.get("rate_type") or "Sales"
+        party_id = data.get("partyId") or data.get("party_id")
+        item_id = data.get("itemId") or data.get("item_id")
+        fabric_quality_id = data.get("fabricQualityId") or data.get("fabric_quality_id")
+        design_id = data.get("designId") or data.get("design_id")
+        shade_id = data.get("shadeId") or data.get("shade_id")
+        as_of = data.get("asOf") or data.get("as_of") or data.get("date")
+
+        matched = resolve_rate(
+            client_id=self.get_client_id(),
+            rate_type=rate_type,
+            party_id=party_id,
+            item_id=item_id,
+            fabric_quality_id=fabric_quality_id,
+            design_id=design_id,
+            shade_id=shade_id,
+            as_of=as_of,
+        )
+
+        if not matched:
+            return Response({"found": False, "rate": None, "minSellingRate": None, "uom": None})
+
+        return Response({
+            "found": True,
+            "rate": str(matched.rate),
+            "minSellingRate": str(matched.min_selling_rate) if matched.min_selling_rate is not None else None,
+            "uom": matched.uom,
+            "rateMasterId": str(matched.id),
+            "rateMaster": RateMasterSerializer(matched, context=self.get_serializer_context()).data,
+        })
 
 
 class DefectMasterViewSet(TenantModelViewSet):

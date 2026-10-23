@@ -39,6 +39,8 @@ router.register(
 )
 router.register("payroll", views.PayslipViewSet, basename="hrms-payroll")
 router.register("broker-commissions", views.BrokerCommissionViewSet, basename="hrms-broker-commissions")
+router.register("incentive-schemes", views.SalespersonIncentiveSchemeViewSet, basename="hrms-incentive-schemes")
+router.register("incentives", views.SalespersonIncentiveViewSet, basename="hrms-incentives")
 # transfers / promotions / warnings / awards and jobs / candidates /
 # applications are registered further down with their real viewsets.
 
@@ -132,5 +134,6 @@ urlpatterns = [
     ),
     path("working-days/", views.WorkingDayView.as_view(), name="hrms-working-days"),
     path("settings/", views.HrmsSettingsView.as_view(), name="hrms-settings"),
+    path("agency-monitoring/", views.AgencyProductionMonitoringView.as_view(), name="hrms-agency-monitoring"),
     path("", include(router.urls)),
 ]

@@ -1294,6 +1294,7 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
             transporter_id=data.get("transporterId") or data.get("transporter"),
             vehicle_no=data.get("vehicleNo") or data.get("vehicle_number"),
             approx_distance_km=int(data.get("distanceKm") or 100),
+            user=request.user,
         )
         self.write_audit("generate_eway_bill", challan, description=f"E-Way bill generated: {res['ewayBillNumber']}")
         return Response(self.get_serializer(challan).data)
@@ -1430,7 +1431,7 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         invoice = self.get_object()
         reason = request.data.get("reason", "1")
         remarks = request.data.get("remarks", "")
-        einvoice_service.cancel_irn(invoice, reason=reason, remarks=remarks)
+        einvoice_service.cancel_irn(invoice, reason=reason, remarks=remarks, user=request.user)
         self.write_audit("cancel_irn", invoice, description=f"IRN cancelled: {remarks}")
         return Response(self.get_serializer(invoice).data)
 
@@ -1448,6 +1449,7 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
             transporter_id=data.get("transporterId") or data.get("transporter"),
             vehicle_no=data.get("vehicleNo") or data.get("vehicle_number"),
             approx_distance_km=int(data.get("distanceKm") or 100),
+            user=request.user,
         )
         self.write_audit("generate_eway_bill", invoice, description=f"E-Way bill generated: {res['ewayBillNumber']}")
         return Response(self.get_serializer(invoice).data)
@@ -1610,6 +1612,10 @@ class SalesReturnViewSet(PostedReturnGuardMixin, SalesDocumentViewSet):
             "return_number"
         ]
         serializer.validated_data.setdefault("party", invoice.party)
+        if invoice.salesperson_fk and not serializer.validated_data.get("salesperson_fk"):
+            serializer.validated_data["salesperson_fk"] = invoice.salesperson_fk
+        if invoice.salesperson and not serializer.validated_data.get("salesperson"):
+            serializer.validated_data["salesperson"] = invoice.salesperson
 
         sales_return = super().perform_create(serializer)
         self._validate_and_post_return(sales_return, invoice)

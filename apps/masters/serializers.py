@@ -30,6 +30,8 @@ from .models import (
     ItemPart,
     ItemSerial,
     JobWorkRateMaster,
+    RateMaster,
+    PriceList,
     Location,
     LossReasonMaster,
     Party,
@@ -1363,6 +1365,56 @@ class JobWorkRateMasterSerializer(BaseModelSerializer):
             "id", "processorId", "processorName", "processId", "processName",
             "fabricQualityId", "fabricQualityName", "rate", "rate_uom",
             "effective_from", "effective_to", "is_active", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class RateMasterSerializer(BaseModelSerializer):
+    rateType = serializers.CharField(source="rate_type", default="Sales")
+    partyName = serializers.CharField(source="party.name", read_only=True, allow_null=True)
+    partyCode = serializers.CharField(source="party.code", read_only=True, allow_null=True)
+    itemName = serializers.CharField(source="item.name", read_only=True, allow_null=True)
+    itemSku = serializers.CharField(source="item.sku", read_only=True, allow_null=True)
+    fabricQualityName = serializers.CharField(source="fabric_quality.name", read_only=True, allow_null=True)
+    designName = serializers.CharField(source="design.name", read_only=True, allow_null=True)
+    shadeName = serializers.CharField(source="shade.name", read_only=True, allow_null=True)
+
+    partyId = TenantPrimaryKeyRelatedField(
+        source="party", queryset=Party.objects.all(), required=False, allow_null=True
+    )
+    itemId = TenantPrimaryKeyRelatedField(
+        source="item", queryset=Item.objects.all(), required=False, allow_null=True
+    )
+    fabricQualityId = TenantPrimaryKeyRelatedField(
+        source="fabric_quality", queryset=FabricQuality.objects.all(), required=False, allow_null=True
+    )
+    designId = TenantPrimaryKeyRelatedField(
+        source="design", queryset=Design.objects.all(), required=False, allow_null=True
+    )
+    shadeId = TenantPrimaryKeyRelatedField(
+        source="shade", queryset=Shade.objects.all(), required=False, allow_null=True
+    )
+
+    minSellingRate = serializers.DecimalField(
+        source="min_selling_rate", max_digits=18, decimal_places=4, required=False, allow_null=True
+    )
+    validFrom = serializers.DateField(source="valid_from", required=False)
+    validTo = serializers.DateField(source="valid_to", required=False, allow_null=True)
+    isActive = serializers.BooleanField(source="is_active", required=False, default=True)
+
+    class Meta:
+        model = RateMaster
+        fields = [
+            "id", "rateType", "rate_type",
+            "partyId", "partyName", "partyCode",
+            "itemId", "itemName", "itemSku",
+            "fabricQualityId", "fabricQualityName",
+            "designId", "designName",
+            "shadeId", "shadeName",
+            "rate", "minSellingRate", "min_selling_rate",
+            "uom", "validFrom", "validTo", "valid_from", "valid_to",
+            "isActive", "is_active", "notes",
+            "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
 

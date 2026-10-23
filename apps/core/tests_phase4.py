@@ -8,7 +8,7 @@ from rest_framework.test import APIClient
 
 from apps.accounts.authentication import build_tokens
 from apps.accounts.models import Client, User, Role
-from apps.core.models import ApprovalRule, ApprovalRequest, AlertSetting, AlertIncident
+from apps.core.models import ApprovalRule, ApprovalRequest, AlertSetting, AlertIncident, CompanyProfile
 from apps.core.approval_services import create_approval_request, approve_request, reject_request
 from apps.masters.models import Party, FabricQuality, Shade, Item, ItemCategory, Location
 from apps.sales.models import SalesInvoice, SalesInvoiceLine, DeliveryChallan
@@ -20,6 +20,17 @@ class Phase4ControlAndMISReportingTests(TestCase):
     def setUp(self):
         self.client_obj, _ = Client.objects.get_or_create(
             slug="phase4-tenant", defaults={"name": "Phase 4 Tenant"}
+        )
+        CompanyProfile.objects.get_or_create(
+            client=self.client_obj,
+            defaults={
+                "legal_name": "Phase 4 Textiles Pvt Ltd",
+                "trade_name": "Phase 4 Textiles",
+                "gstin": "24AAACS1234A1Z5",
+                "state": "Gujarat",
+                "state_code": "24",
+                "address": {"city": "Surat", "line1": "Ring Road", "pincode": 395002},
+            },
         )
         self.user = User.objects.create_user(
             email="phase4-admin@example.com",

@@ -283,6 +283,7 @@ Stated plainly rather than stubbed silently:
   - **Stock Ageing MIS**: 0-30, 31-60, 61-90, 91-180, and 180+ days (slow-moving) breakdown with meter quantities and valuation.
 
 ### 5. Compliance & Integrations (PDF §20)
-- **E-Invoicing & E-Way Bill**: `apps/sales/einvoice_service.py` with pluggable GSP architecture (`EINVOICE_ENABLED`, `EINVOICE_SANDBOX`). Generates 64-character IRN, signed QR code data, and 12-digit E-Way bills for Tax Invoices and Delivery Challans.
+- **E-Invoicing & E-Way Bill**: `apps/sales/einvoice_service.py` with pluggable GSP / NIC provider interface (`EINVOICE_ENABLED`, `EINVOICE_PROVIDER`, `EINVOICE_SANDBOX_MODE`). Supports `sandbox-sim` for deterministic offline simulation and `gsp-nic` for live GST Suvidha Provider / NIC ASP integration. Generates 64-character IRN, signed QR code data, and 12-digit E-Way bills for Tax Invoices and Delivery Challans. All request/response payloads are recorded in `AuditLog`.
+  > **Statutory Compliance Note (PDF §20)**: Applicable GST tax rates (CGST/SGST/IGST slabs) and the mandatory e-invoicing applicability threshold (turnover > ₹5 Cr or prevailing GST notification limit) must be validated with the client's Chartered Accountant (CA) prior to production deployment. Live NIC / GSP production credentials (`EINVOICE_CLIENT_ID`, `EINVOICE_CLIENT_SECRET`, portal username/password) must be procured through the client's registered GSP (e.g. ClearTax, Masters India, or direct NIC ASP gateway).
 - **ITC-04 Statutory GST Return**: Quarterly job-work reporting at `/job-work/itc-04` covering Table 4 (goods sent to job workers), Table 5A (goods received back from job workers), and direct CSV export for GST portal submission.
 
