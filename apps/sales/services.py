@@ -321,6 +321,35 @@ def refresh_order_payment_status(order):
     return order
 
 
+def _owner_employee(record):
+    """The HRMS employee behind a CRM deal/lead owner (a User), if any."""
+    owner = getattr(record, "owner", None) if record is not None else None
+    return getattr(owner, "employee", None) if owner is not None else None
+
+
+def fill_salesperson(document):
+    """Default a sales document's salesperson when nobody picked one.
+
+    Incentive is credited through ``salesperson_fk`` (PDF §12), so a document
+    left blank counts for nobody. Falls back to the CRM deal owner, then the
+    lead owner, then the customer's default salesperson. Never overwrites a
+    salesperson already on the document. Returns True when it set one.
+    """
+    if getattr(document, "salesperson_fk_id", None) or (getattr(document, "salesperson", None) or "").strip():
+        return False
+    employee = (
+        _owner_employee(getattr(document, "crm_deal", None))
+        or _owner_employee(getattr(document, "crm_lead", None))
+        or getattr(getattr(document, "party", None), "default_salesperson", None)
+    )
+    if employee is None:
+        return False
+    document.salesperson_fk = employee
+    document.salesperson = employee.name
+    document.save(update_fields=["salesperson_fk", "salesperson", "updated_at"])
+    return True
+
+
 def invoice_outstanding(invoice):
     """``GET /sales/invoices/{id}/outstanding/`` (api.md §5.7)."""
     from apps.core.money import ageing_bucket, days_overdue, effective_due_date
@@ -1008,6 +1037,7 @@ def allocate_payment_in(payment, allocations, *, user=None):
             code=Codes.ALREADY_CANCELLED,
         )
     allocated = ZERO
+    paid_invoices = []
     for row in allocations or []:
         invoice_id = row.get("invoiceId") or row.get("invoice_id") or row.get("documentId")
         requested = round2(row.get("amount"))
@@ -1063,6 +1093,7 @@ def allocate_payment_in(payment, allocations, *, user=None):
         )
         allocated += requested
         refresh_invoice_payment_status(invoice)
+        paid_invoices.append(invoice)
 
     total_allocated = round2(
         PaymentAllocation.objects.filter(
@@ -1080,6 +1111,13 @@ def allocate_payment_in(payment, allocations, *, user=None):
         )
     payment.allocated_amount = total_allocated
     payment.save(update_fields=["allocated_amount", "updated_at"])
+
+    # Money received releases held incentive / grows collection-based
+    # incentive on those invoices (PDF §12).
+    from apps.pms.production_services import sync_incentives_for_invoice
+
+    for invoice in paid_invoices:
+        sync_incentives_for_invoice(invoice, user=user)
     return payment
 
 
@@ -1114,8 +1152,12 @@ def cancel_payment_in(payment, *, reason=None, user=None):
         source_document_id=payment.id,
         user=user,
     )
+    from apps.pms.production_services import sync_incentives_for_invoice
+
     for invoice in SalesInvoice.objects.filter(pk__in=invoice_ids):
         refresh_invoice_payment_status(invoice)
+        # A bounced/cancelled receipt puts the incentive back on hold.
+        sync_incentives_for_invoice(invoice, user=user)
     ledger.recalculate_party_balance(payment.client_id, payment.party_id)
     return payment
 
