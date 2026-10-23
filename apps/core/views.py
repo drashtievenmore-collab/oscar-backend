@@ -20,11 +20,19 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from . import files as file_service
-from .audit import mark_read, request_ip
+from .audit import mark_read, record_audit, request_ip
 from .exceptions import NotFound, ValidationFailed
-from .models import AuditLog, CompanyProfile, File, Notification, Setting, SupportTicket
+from .models import (
+    AuditLog,
+    CompanyProfile,
+    DocumentSignature,
+    File,
+    Notification,
+    Setting,
+    SupportTicket,
+)
 from .pagination import envelope
-from .permissions import AllowPublic, HasModulePermission
+from .permissions import AllowPublic, HasModulePermission, IsAuthenticatedInTenant
 from .serializers_platform import (
     AuditLogSerializer,
     FileSerializer,
@@ -634,3 +642,81 @@ class GlobalSearchView(APIView):
             )
         )
         return Response(envelope(results))
+
+
+# ---------------------------------------------------------------------------
+# Digital signatures on printed documents
+# ---------------------------------------------------------------------------
+class DocumentSignatureView(APIView):
+    """``GET/POST /signatures/`` -- e-signatures for any printable document.
+
+    GET  ``?documentType=&documentId=`` -> ``{signatures: {signatory: {...}}}``
+    POST ``{documentType, documentId, signatoryType, signature}`` records one
+    signature line; ``signature: null`` removes it. Returns the same shape.
+    """
+
+    permission_classes = [IsAuthenticatedInTenant]
+
+    @staticmethod
+    def _slot_args(source):
+        doc_type = str(source.get("documentType") or "").strip()[:64]
+        doc_id = str(source.get("documentId") or "").strip()[:128]
+        if not doc_type or not doc_id:
+            raise ValidationFailed(
+                "documentType and documentId are required.",
+                field_errors={"documentType": ["Required."], "documentId": ["Required."]},
+            )
+        return doc_type, doc_id
+
+    @staticmethod
+    def _payload(client_id, doc_type, doc_id):
+        rows = DocumentSignature.objects.filter(
+            client_id=client_id, document_type=doc_type, document_id=doc_id
+        )
+        return {"signatures": {r.signatory: r.signature for r in rows}}
+
+    def get(self, request):
+        doc_type, doc_id = self._slot_args(request.query_params)
+        return Response(self._payload(request.client_id, doc_type, doc_id))
+
+    @transaction.atomic
+    def post(self, request):
+        data = request.data if isinstance(request.data, dict) else {}
+        doc_type, doc_id = self._slot_args(data)
+        signatory = str(data.get("signatoryType") or "").strip()[:64]
+        if not signatory:
+            raise ValidationFailed(
+                "Invalid signatory.", field_errors={"signatoryType": ["Required."]}
+            )
+        signature = data.get("signature")
+        if signature is not None and not isinstance(signature, dict):
+            raise ValidationFailed(
+                "Signature must be an object.", field_errors={"signature": ["Expected an object."]}
+            )
+        slot = dict(
+            client_id=request.client_id,
+            document_type=doc_type,
+            document_id=doc_id,
+            signatory=signatory,
+        )
+        if signature is None:
+            DocumentSignature.objects.filter(**slot).delete()
+        else:
+            DocumentSignature.objects.update_or_create(
+                **slot,
+                defaults={
+                    "signature": {**signature, "recordedBy": getattr(request.user, "email", None)},
+                    "updated_by": request.user,
+                },
+            )
+        record_audit(
+            client=request.client_id,
+            actor=request.user,
+            action="sign",
+            entity_type=doc_type,
+            entity_id=doc_id,
+            entity_label=doc_id,
+            description=f"{signatory} signature {'removed' if signature is None else 'recorded'}",
+            ip=request_ip(request),
+        )
+        return Response(self._payload(request.client_id, doc_type, doc_id))
