@@ -50,40 +50,47 @@ PURCHASE_PO_STAGES = [
 ]
 
 VENDOR_PRODUCTION_STAGES = [
-    # The 8 Production Lifecycle stages (apps/pms/lifecycle_services.py).
-    {"name": "Purchase Order", "department_name": "Purchase", "branch": "branch_production", "default_weight": Decimal("3.37"), "icon": "FileText"},
-    {"name": "Production Instruction", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.37"), "icon": "ClipboardList"},
-    {"name": "Daily Production Entry", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.37"), "icon": "FileSpreadsheet"},
-    {"name": "Quality Control (QC)", "department_name": "Quality Control", "branch": "branch_production", "default_weight": Decimal("3.37"), "icon": "ShieldCheck"},
-    {"name": "Completion Verification", "department_name": "Quality Control", "branch": "branch_production", "default_weight": Decimal("3.37"), "icon": "CheckCircle2"},
-    {"name": "Final Job Work PO", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.37"), "icon": "FileText"},
-    {"name": "Agency Bill Match", "department_name": "Accounts", "branch": "branch_production", "default_weight": Decimal("3.37"), "icon": "FileSpreadsheet"},
-    {"name": "Disbursement Payment", "department_name": "Accounts", "branch": "branch_production", "default_weight": Decimal("3.41"), "icon": "IndianRupee"},
+    # Purchase Order (Vendor A Production), then the client requirement PDF
+    # section 05 flow -- External Agency Grey Production.
+    {"name": "Purchase Order", "department_name": "Purchase", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "ShoppingCart"},
+    {"name": "Production Work Instruction", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "FileText"},
+    {"name": "External Agency Assignment", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "Users"},
+    {"name": "Daily Production Entry", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "ClipboardList"},
+    {"name": "Production Completion", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "CheckCircle2"},
+    {"name": "Final Quantity Verification", "department_name": "Quality Control", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "ShieldCheck"},
+    {"name": "Final Job Work PO", "department_name": "Production", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "FileText"},
+    {"name": "Agency Bill Match", "department_name": "Accounts", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "FileSpreadsheet"},
+    {"name": "Approval & Payable", "department_name": "Accounts", "branch": "branch_production", "default_weight": Decimal("3.00"), "icon": "IndianRupee"},
 ]
 
 #: PMS production-branch stage -> Production Lifecycle stage key
 #: (lifecycle_services.STAGE_KEYS). The lifecycle is the single source of truth.
 PRODUCTION_LIFECYCLE_STAGE_MAP = {
     "Purchase Order": "purchase_order",
-    "Production Instruction": "production_instruction",
+    "Production Work Instruction": "production_work_instruction",
+    "External Agency Assignment": "external_agency_assignment",
     "Daily Production Entry": "daily_production_entry",
-    "Quality Control (QC)": "grey_fabric_qc",
-    "Completion Verification": "completion_verification",
+    "Production Completion": "production_completion",
+    "Final Quantity Verification": "final_quantity_verification",
     "Final Job Work PO": "final_job_work_po",
     "Agency Bill Match": "agency_bill_match",
-    "Disbursement Payment": "disbursement_payment",
+    "Approval & Payable": "approval_payable",
 }
 
-#: Old production-branch stage names -> the lifecycle stage that replaced them.
+#: Old pipeline stage names -> the stage that replaced them (rows are renamed or merged, never dropped).
 LEGACY_PRODUCTION_STAGE_NAMES = {
-    "Production Work Instruction": "Production Instruction",
-    "Assign Vendor A + Employee": "Production Instruction",
-    "Production Completion": "Daily Production Entry",
-    "Final Quantity Verification": "Completion Verification",
+    "Assign Vendor A + Employee": "External Agency Assignment",
     "Generate Final Job Work PO": "Final Job Work PO",
     "Production / Job Work PO": "Final Job Work PO",
     "Agency Bill Match (PO + verified qty + invoice)": "Agency Bill Match",
-    "Approval / Hold / Payment": "Disbursement Payment",
+    "Approval / Hold / Payment": "Approval & Payable",
+    # Interim names used briefly before the PDF flow was applied.
+    "Production Instruction": "Production Work Instruction",
+    "Quality Control (QC)": "Final Quantity Verification",
+    "Completion Verification": "Final Quantity Verification",
+    "Disbursement Payment": "Approval & Payable",
+    # Downstream stage renamed (the word "Dyeing" dropped).
+    "Processing (Dyeing)": "Processing",
 }
 
 
@@ -127,16 +134,16 @@ def lifecycle_stage_status(name, lifecycle):
     remarks = " · ".join(str(v) for v in (doc_number, stage.get("status")) if v) or f"{name} pending"
     document = {
         "type": key,
-        "number": doc_number or lifecycle["poNumber"],
-        "url": f"/purchase/orders?po={lifecycle['purchaseOrderId']}&stage={key}",
-        "label": f"{stage['label']}: {doc_number or lifecycle['poNumber']}",
+        "number": doc_number or lifecycle["poNumber"] or lifecycle["instructionNumber"],
+        "url": None,  # worked on inside the PMS project slide
+        "label": f"{stage['label']}: {doc_number or lifecycle['poNumber'] or lifecycle['instructionNumber']}",
     }
     return status, pct, remarks, document
 
 DOWNSTREAM_STAGES = [
     {"name": "Processing Plan & Vendor Assignment", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("10.00"), "icon": "ClipboardList"},
     {"name": "Job Work Outward (Send to Vendor)", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("10.00"), "icon": "Truck"},
-    {"name": "Processing (Dyeing)", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("10.00"), "icon": "Cog"},
+    {"name": "Processing", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("10.00"), "icon": "Cog"},
     {"name": "Job Work Inward (Receive)", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("10.00"), "icon": "ArrowDownToLine"},
     {"name": "Quality Check & Stock Allocation", "department_name": "Quality Control", "branch": "common", "default_weight": Decimal("10.00"), "icon": "ShieldCheck"},
     {"name": "Customer Dispatch", "department_name": "Dispatch", "branch": "common", "default_weight": Decimal("10.00"), "icon": "Boxes"},
@@ -232,6 +239,36 @@ def evaluate_stock_and_route(project):
             available_stock = Decimal("0")
 
     cfv = get_project_cfv(project)
+    from apps.inventory.models import GreyStockAllocation
+    allocs = GreyStockAllocation.objects.filter(client_id=client_id, project=project, status="Active")
+    cust_alloc = Decimal("0")
+    own_alloc = Decimal("0")
+    if allocs.exists():
+        cust_alloc = sum((Decimal(str(a.quantity or 0)) for a in allocs if getattr(a, "allocation_type", "Customer Project") != "Own Project"), Decimal("0"))
+        own_alloc = sum((Decimal(str(a.quantity or 0)) for a in allocs if getattr(a, "allocation_type", "Customer Project") == "Own Project"), Decimal("0"))
+        allocated = cust_alloc + own_alloc
+        shortage = max(Decimal("0"), req_qty - cust_alloc)
+        if shortage <= Decimal("0"):
+            branch = "BRANCH_A"
+            label = "Branch A (100% Grey Stock Available in Warehouse)"
+        elif cust_alloc > Decimal("0"):
+            branch = "PARTIAL"
+            label = f"Partial Availability ({cust_alloc} M Available, {shortage} M Shortage)"
+        else:
+            branch = "BRANCH_B"
+            label = "Branch B (Stock Unavailable — Procurement Required)"
+        return {
+            "required_meters": round2(req_qty),
+            "available_meters": round2(available_stock),
+            "allocated_meters": round2(allocated),
+            "customer_allocated_meters": round2(cust_alloc),
+            "own_allocated_meters": round2(own_alloc),
+            "shortage_meters": round2(shortage),
+            "route_branch": branch,
+            "route_label": label,
+            "shortage_action": cfv.get("shortage_action"),
+        }
+
     if "grey_stock_allocated_meters" in cfv:
         allocated = Decimal(str(cfv.get("grey_stock_allocated_meters") or 0))
         shortage = max(Decimal("0"), req_qty - allocated)
@@ -248,6 +285,8 @@ def evaluate_stock_and_route(project):
             "required_meters": round2(req_qty),
             "available_meters": round2(available_stock),
             "allocated_meters": round2(allocated),
+            "customer_allocated_meters": round2(allocated),
+            "own_allocated_meters": round2(Decimal("0")),
             "shortage_meters": round2(shortage),
             "route_branch": branch,
             "route_label": label,
@@ -331,28 +370,55 @@ def sync_project_pipeline_stages(project):
         if not po and gpo.get("orderNumber"):
             po = PurchaseOrder.objects.filter(client_id=client_id, po_number=gpo["orderNumber"], deleted_at__isnull=True).first()
 
-    plan = ProcessPlan.objects.filter(client_id=client_id).filter(
-        Q(remarks__icontains=project.code) | Q(plan_no__icontains=project.code)
-    ).first()
+    plans_qs = ProcessPlan.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(
+        Q(project=project) | Q(remarks__icontains=project.code) | Q(plan_no__icontains=project.code)
+    ).order_by("-created_at")
+    # An approved plan (Active / Completed) wins over a draft.
+    plan = plans_qs.filter(status__in=("Active", "Completed")).first() or plans_qs.first()
 
-    jwo = JobWorkOrder.objects.filter(client_id=client_id).filter(
-        Q(remarks__icontains=project.code) | Q(jwo_no__icontains=project.code)
-    ).first()
+    jwos_qs = JobWorkOrder.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(
+        Q(project=project) | Q(remarks__icontains=project.code) | Q(jwo_no__icontains=project.code)
+    ).order_by("-created_at")
+    jwo = jwos_qs.first()
 
     jwo_sent = Decimal(str(project.dyeing_sent_meters or 0))
     jwo_received = Decimal(str(project.customer_project_received_meters or project.own_project_received_meters or 0))
     outward_challan = None
+    all_outwards = []
+    all_inwards = []
 
-    if jwo:
-        outwards = getattr(jwo, "outwards", None)
-        if outwards and outwards.exists():
-            outward_challan = outwards.first()
-            jwo_sent = sum((Decimal(str(o.meter or 0)) for o in outwards.all()), Decimal("0"))
-        inwards = getattr(jwo, "inwards", None)
-        if inwards and inwards.exists():
-            jwo_received = sum((Decimal(str(i.meter or 0)) for i in inwards.all()), Decimal("0"))
+    if jwos_qs.exists():
+        for order_obj in jwos_qs:
+            outwards = getattr(order_obj, "outwards", None)
+            if outwards and outwards.exists():
+                all_outwards.extend(list(outwards.filter(deleted_at__isnull=True)))
+            inwards = getattr(order_obj, "inwards", None)
+            if inwards and inwards.exists():
+                all_inwards.extend(list(inwards.filter(deleted_at__isnull=True)))
 
-    qc = QCInspection.objects.filter(client_id=client_id).first()
+        if all_outwards:
+            outward_challan = all_outwards[0]
+            jwo_sent = sum((Decimal(str(getattr(o, "qty", 0) or getattr(o, "meter", 0) or 0)) for o in all_outwards), Decimal("0"))
+        if all_inwards:
+            jwo_received = sum((Decimal(str(getattr(i, "qty", 0) or getattr(i, "meter", 0) or 0)) for i in all_inwards), Decimal("0"))
+
+    # Authoritative QC inspection lookup: match project's JWO inward receipts first, then project's PO or notes.
+    qc = None
+    qc_qs = QCInspection.objects.filter(client_id=client_id, deleted_at__isnull=True)
+    inward_ids = [i.id for i in all_inwards]
+    inward_nos = [i.no for i in all_inwards if getattr(i, "no", None)]
+    if inward_ids or inward_nos:
+        qc = qc_qs.filter(
+            Q(source_document_type="JWO_INWARD", source_document_id__in=inward_ids)
+            | Q(source_document_type="JWO_INWARD", source_document_number__in=inward_nos)
+            | Q(notes__icontains=project.code)
+        ).order_by("-inspection_date", "-created_at").first()
+    if not qc and po:
+        qc = qc_qs.filter(
+            Q(purchase_order=po) | Q(source_document_id=po.id) | Q(notes__icontains=project.code)
+        ).order_by("-inspection_date", "-created_at").first()
+    if not qc:
+        qc = qc_qs.filter(notes__icontains=project.code).order_by("-inspection_date", "-created_at").first()
 
     dispatched_qty = Decimal("0")
     dc_doc = None
@@ -377,9 +443,9 @@ def sync_project_pipeline_stages(project):
 
     production_lifecycle = None
     if any(d.get("branch") == "branch_production" for d in stage_defs):
-        from .lifecycle_services import project_production_lifecycles
+        from .lifecycle_services import project_flow_lifecycles
 
-        lifecycles = project_production_lifecycles(project)
+        lifecycles = project_flow_lifecycles(project)
         production_lifecycle = lifecycles[0] if lifecycles else None
 
     departments_by_name = {d.name: d for d in Department.objects.filter(client_id=client_id)}
@@ -794,8 +860,15 @@ def sync_project_pipeline_stages(project):
         elif name == "Processing Plan & Vendor Assignment":
             quantities["input"] = float(req_qty)
             if plan or jwo:
-                status = "Completed"
-                pct = 100
+                # Requirement PDF section 07: a plan needs its approver; a
+                # draft plan is in progress, an approved one (or a job order)
+                # completes the stage.
+                if jwo or plan.status in ("Active", "Completed"):
+                    status = "Completed"
+                    pct = 100
+                else:
+                    status = "In Progress"
+                    pct = 50
                 doc_num = plan.plan_no if plan else jwo.jwo_no
                 doc_url = f"/job-work/plans?id={plan.id}" if plan else f"/job-work/orders?id={jwo.id}"
                 document = {
@@ -852,7 +925,7 @@ def sync_project_pipeline_stages(project):
             else:
                 remarks = "Outward pending"
 
-        elif name == "Processing (Dyeing)":
+        elif name == "Processing":
             quantities["input"] = float(jwo_sent)
             quantities["produced"] = float(jwo_received)
             if jwo_received >= jwo_sent and jwo_sent > Decimal("0"):

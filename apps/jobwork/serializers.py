@@ -48,6 +48,14 @@ class PlanChargeSerializer(BaseModelSerializer):
 
 class ProcessPlanSerializer(BaseModelSerializer):
     planNo = serializers.CharField(source="plan_no", required=False)
+    projectId = serializers.UUIDField(source="project_id", required=False, allow_null=True)
+    projectCode = serializers.ReadOnlyField(source="project.code")
+    projectDestination = serializers.CharField(source="project_destination", required=False)
+    priority = serializers.CharField(required=False)
+    targetShadeFkId = TenantPrimaryKeyRelatedField(
+        source="target_shade_fk", model="masters.Shade", required=False, allow_null=True
+    )
+    selectedTakas = serializers.JSONField(source="selected_takas", required=False)
     processCategory = serializers.CharField(
         source="process_category", required=False, allow_null=True, allow_blank=True
     )
@@ -90,7 +98,9 @@ class ProcessPlanSerializer(BaseModelSerializer):
     class Meta:
         model = ProcessPlan
         fields = [
-            "id", "planNo", "date", "process", "processCategory", "vendor",
+            "id", "planNo", "projectId", "projectCode", "projectDestination", "priority",
+            "targetShadeFkId", "selectedTakas",
+            "date", "process", "processCategory", "vendor",
             "contactPerson", "phone", "email", "address",
             "fabricItem", "greyLotNo", "fabricQuality", "takaRollNo", "shade",
             "expectedQty", "expectedLoss", "expectedReturnQty",
@@ -100,7 +110,7 @@ class ProcessPlanSerializer(BaseModelSerializer):
             "status", "remarks", "charges",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "planNo", "created_at", "updated_at"]
+        read_only_fields = ["id", "planNo", "projectCode", "created_at", "updated_at"]
 
 
 class JWOMaterialSerializer(BaseModelSerializer):
@@ -248,6 +258,13 @@ class JWODocumentSerializer(BaseModelSerializer):
 
 class JobWorkOrderSerializer(BaseModelSerializer):
     jwoNo = serializers.CharField(source="jwo_no", required=False)
+    projectId = serializers.UUIDField(
+        source="project_id", required=False, allow_null=True
+    )
+    projectCode = serializers.ReadOnlyField(source="project.code")
+    projectDestination = serializers.CharField(
+        source="project_destination", required=False
+    )
     processPlanId = serializers.UUIDField(
         source="process_plan_id", required=False, allow_null=True
     )
@@ -292,11 +309,12 @@ class JobWorkOrderSerializer(BaseModelSerializer):
     class Meta:
         model = JobWorkOrder
         fields = [
-            "id", "jwoNo", "processPlanId", "process", "processMasterId", "vendor", "vendorId",
+            "id", "jwoNo", "projectId", "projectCode", "projectDestination",
+            "processPlanId", "process", "processMasterId", "vendor", "vendorId",
             "assignedEmployeeId", "approverEmployeeId", "rateMasterId", "expectedLossPct",
             "orderDate", "plannedQty", "rate", "totalAmount", "expectedCompletion",
             "status", "remarks", "materials", "outwards", "inwards", "charges",
             "reprocesses", "lossEntries", "documents", "signatures",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "jwoNo", "created_at", "updated_at"]
+        read_only_fields = ["id", "jwoNo", "projectCode", "created_at", "updated_at"]

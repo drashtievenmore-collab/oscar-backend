@@ -77,6 +77,13 @@ class ProcessPlanViewSet(TenantModelViewSet):
     ordering = ["-date", "-created_at"]
     idempotent_create = True
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        proj = self.request.query_params.get("project") or self.request.query_params.get("projectId")
+        if proj:
+            qs = qs.filter(project_id=proj)
+        return qs
+
     #: Plan statuses only an approver may move a plan into or out of.
     APPROVAL_STATUSES = ("Completed",)
 
@@ -153,6 +160,105 @@ class ProcessPlanViewSet(TenantModelViewSet):
         """Active → Completed (approval point)."""
         return self._status_change(request, "Completed", ("Active",), "completed")
 
+    @action(detail=True, methods=["post"], url_path="create-jwo")
+    @transaction.atomic
+    def create_jwo(self, request, pk=None):
+        """Create a Stage 12 Job Work Order from this Stage 11 Process Plan.
+        Idempotent: if a JWO already exists for this plan, returns the existing JWO.
+        """
+        plan = self.get_object()
+        require_permission(request.user, "manage_jobwork", "Permission required to create Job Work Order.")
+
+        existing = JobWorkOrder.objects.filter(
+            client_id=plan.client_id, process_plan=plan, deleted_at__isnull=True
+        ).first()
+        if existing:
+            ser = JobWorkOrderSerializer(existing, context=self.get_serializer_context())
+            return Response(ser.data, status=status.HTTP_200_OK)
+
+        from apps.masters.models import Party
+        vendor_obj = Party.objects.filter(
+            client_id=plan.client_id, name__iexact=plan.vendor_name, deleted_at__isnull=True
+        ).first() if plan.vendor_name else None
+
+        today = timezone.localdate()
+        jwo_no = allocate_number(plan.client, "JWO", today)
+
+        first_charge = plan.charges.filter(deleted_at__isnull=True).first()
+        plan_rate = first_charge.rate if first_charge else ZERO
+
+        order = JobWorkOrder.objects.create(
+            client_id=plan.client_id,
+            process_plan=plan,
+            project=plan.project,
+            project_destination=plan.project_destination or "Customer Project",
+            jwo_no=jwo_no,
+            vendor=vendor_obj,
+            vendor_name=plan.vendor_name or (vendor_obj.name if vendor_obj else ""),
+            process=plan.process or "",
+            order_date=today,
+            expected_completion=plan.expected_completion_date,
+            expected_loss_pct=plan.expected_loss or ZERO,
+            rate=plan_rate,
+            status="Draft",
+            remarks=f"Created from Process Plan {plan.plan_no}",
+            created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+        )
+
+        from .models import JWOMaterial
+        takas = plan.selected_takas if isinstance(plan.selected_takas, list) else []
+        if takas:
+            groups = {}
+            for t in takas:
+                key = (
+                    t.get("fabricItem") or t.get("fabricName") or plan.fabric_item or "",
+                    t.get("fabricQuality") or plan.fabric_quality or "",
+                    t.get("shade") or plan.shade or "",
+                    t.get("lotNumber") or plan.grey_lot_no or "",
+                )
+                m = D(str(t.get("meters") or t.get("usable") or t.get("totalStock") or t.get("selectedQty") or 0))
+                groups[key] = groups.get(key, ZERO) + m
+
+            for (f_item, f_qual, f_shade, f_lot), qty in groups.items():
+                JWOMaterial.objects.create(
+                    client_id=plan.client_id,
+                    job_work_order=order,
+                    fabric_item=f_item,
+                    fabric_quality=f_qual,
+                    shade=f_shade,
+                    lot_no=f_lot,
+                    qty=qty,
+                    rate=plan_rate,
+                    amount=round4(qty * plan_rate),
+                )
+        else:
+            qty = D(str(plan.expected_qty or 0))
+            JWOMaterial.objects.create(
+                client_id=plan.client_id,
+                job_work_order=order,
+                fabric_item=plan.fabric_item or "",
+                fabric_quality=plan.fabric_quality or "",
+                shade=plan.shade or "",
+                lot_no=plan.grey_lot_no or "",
+                qty=qty,
+                rate=plan_rate,
+                amount=round4(qty * plan_rate),
+            )
+
+        from .services import recompute_order_totals
+        recompute_order_totals(order)
+
+        if plan.status == "Draft":
+            plan.status = "Active"
+            plan.save(update_fields=["status", "updated_at"])
+
+        if plan.project:
+            from apps.pms.pipeline_services import sync_project_pipeline_stages
+            sync_project_pipeline_stages(plan.project)
+
+        ser = JobWorkOrderSerializer(order, context=self.get_serializer_context())
+        return Response(ser.data, status=status.HTTP_201_CREATED)
+
     # -- charge rows: /process-plans/{id}/charges/[{rowId}/] -----------------
     @action(detail=True, methods=["get", "post"], url_path="charges", url_name="charges")
     @transaction.atomic
@@ -211,6 +317,13 @@ class JobWorkOrderViewSet(TenantModelViewSet):
     search_fields = ["jwo_no", "process", "vendor_name"]
     ordering = ["-order_date", "-created_at"]
     idempotent_create = True
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        proj = self.request.query_params.get("project") or self.request.query_params.get("projectId")
+        if proj:
+            qs = qs.filter(project_id=proj)
+        return qs
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(

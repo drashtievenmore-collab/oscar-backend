@@ -306,61 +306,136 @@ class ProductionLifecycleTests(TestCase):
         self.assertEqual(stage["state"], "active")
 
     # -- endpoints, PMS sync and PO paths --------------------------------------
-    def test_purchase_and_pms_endpoints_return_identical_stages(self):
-        self.run_to_final_po()
-        po_res = self.api.get(f"/api/v1/purchase/orders/{self.po.id}/production-lifecycle/")
-        self.assertEqual(po_res.status_code, 200)
-        self.assertTrue(po_res.data["applicable"])
-        pms_res = self.api.get(f"/api/v1/pms/projects/{self.project.id}/production-lifecycle/")
-        self.assertEqual(pms_res.status_code, 200)
-        self.assertEqual(len(pms_res.data["lifecycles"]), 1)
-        self.assertEqual(
-            [(s["key"], s["state"]) for s in pms_res.data["lifecycles"][0]["stages"]],
-            [(s["key"], s["state"]) for s in po_res.data["stages"]],
-        )
-        # Not applicable to other PO types.
-        res = self.api.get(f"/api/v1/purchase/orders/{self.final_po.id}/production-lifecycle/")
-        self.assertFalse(res.data["applicable"])
+    # -- PMS project view: client PDF section 05 flow -------------------------
+    def po_pi(self):
+        """Production Work Instruction raised from the approved Vendor A PO."""
+        res = self.api.post("/api/v1/production/instructions/", {
+            "agencyId": str(self.agency.id), "agencyName": self.agency.name,
+            "orderReference": self.po.po_number, "orderMeter": 1000,
+            "employeeId": str(self.employee.id), "fabric": self.fabric.name, "processType": "Weaving",
+            "agreedJobRate": 5.5, "expectedCompletionDate": "2026-11-30",
+        }, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        pi = ProductionInstruction.objects.get(id=res.data["id"])
+        self.assertEqual(str(pi.expected_completion_date), "2026-11-30")
+        return pi
 
-    def test_pms_pipeline_production_stages_follow_lifecycle(self):
-        sync_project_pipeline_stages(self.project)
-        self.assertEqual(
-            ProjectStage.objects.get(project=self.project, name="Daily Production Entry").status, "Pending"
+    def pms_states(self):
+        res = self.api.get(f"/api/v1/pms/projects/{self.project.id}/production-lifecycle/")
+        self.assertEqual(res.status_code, 200)
+        return res.data["lifecycles"]
+
+    def pms_state_map(self):
+        return {s["key"]: s for s in self.pms_states()[0]["stages"]}
+
+    def test_pms_flow_po_first_then_pdf_stages_to_payable(self):
+        lc = self.pms_states()[0]
+        self.assertEqual(lc["purchaseOrderId"], str(self.po.id))
+        self.assertEqual([s["label"] for s in lc["stages"]], [
+            "Purchase Order", "Production Work Instruction", "External Agency Assignment",
+            "Daily Production Entry", "Production Completion", "Final Quantity Verification",
+            "Final Job Work PO", "Agency Bill Match", "Approval & Payable",
+        ])
+        st = self.pms_state_map()
+        self.assertEqual(st["purchase_order"]["state"], "active")  # Draft PO
+        self.assertEqual(st["production_work_instruction"]["state"], "pending")
+
+        self.po.status = "Approved"
+        self.po.save()
+        st = self.pms_state_map()
+        self.assertEqual(st["purchase_order"]["state"], "completed")
+        self.assertEqual(st["production_work_instruction"]["state"], "active")
+
+        pi = self.po_pi()
+        self.assertEqual(self.pms_states()[0]["instructionId"], str(pi.id))
+        self.assertEqual(self.api.post(f"/api/v1/production/instructions/{pi.id}/approve/").status_code, 200)
+        self.assertEqual(self.api.post(f"/api/v1/production/instructions/{pi.id}/start/").status_code, 200)
+        self.pi = pi
+        self.produce("600")
+        st = self.pms_state_map()
+        self.assertEqual(st["production_work_instruction"]["state"], "completed")
+        self.assertEqual(st["external_agency_assignment"]["state"], "completed")
+        self.assertEqual(st["daily_production_entry"]["state"], "active")
+        self.produce("400")
+        res = self.api.post(f"/api/v1/production/instructions/{pi.id}/complete/")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(self.pms_state_map()["production_completion"]["state"], "completed")
+
+        pi.refresh_from_db()
+        self.pi = pi
+        self.verify()
+        instruction = production_services.generate_final_job_work_po(
+            pi, user=self.admin,
+            custom_data={"vendorId": str(self.agency_party.id), "agreedJobRate": 5.5, "action": "approve_generate"},
         )
-        self.run_to_final_po()
+        final_po = PurchaseOrder.objects.get(id=instruction.final_po_id)
+        st = self.pms_state_map()
+        self.assertEqual(st["final_quantity_verification"]["state"], "completed")
+        self.assertEqual(st["final_job_work_po"]["state"], "completed")
+        self.assertEqual(st["agency_bill_match"]["state"], "active")
+
+        # Bill matched on the ORIGINAL PO: the server joins PO + Job Work PO + bill.
+        line = final_po.line_items.first()
+        res = self.api.post("/api/v1/purchase/vendor-bills/agency-match/", {
+            "purchaseOrderId": str(self.po.id), "vendorBillNumber": "INV-PDF-1", "billDate": "2026-10-16",
+            "qty": float(line.qty), "rate": float(line.rate), "gstPct": float(line.tax_pct),
+            "action": "submit_approval",
+        }, format="json")
+        self.assertEqual(res.status_code, 200, res.data)
+        matching = res.data["matching"]
+        self.assertTrue(matching["isAgencyMatch"])
+        fields = [r["field"] for r in matching["threeWayReconciliation"]]
+        self.assertIn("Original PO Reference", fields)
+        self.assertIn("Final Job Work PO Reference", fields)
+        lc = self.pms_states()[0]
+        st = {s["key"]: s for s in lc["stages"]}
+        self.assertEqual(st["agency_bill_match"]["state"], "completed", st["agency_bill_match"])
+        self.assertEqual(st["approval_payable"]["state"], "active")
+
+        res = self.api.post(f"/api/v1/purchase/vendor-bills/{lc['vendorBillId']}/approve/",
+                            {"remarks": "ok", "createPayable": True}, format="json")
+        self.assertEqual(res.status_code, 200, res.data)
+        lc = self.pms_states()[0]
+        payable = [s for s in lc["stages"] if s["key"] == "approval_payable"][0]
+        self.assertEqual(payable["state"], "completed")
+        self.assertEqual(payable["payableStatus"], "Unpaid")
+        self.assertTrue(lc["isComplete"])
+
+        # PMS pipeline: the same 9 stages, all completed.
         result = sync_project_pipeline_stages(self.project)
-        by_name = {s["name"]: s for s in result["stages"]}
-        for name in (
-            "Purchase Order", "Production Instruction", "Daily Production Entry",
-            "Quality Control (QC)", "Completion Verification", "Final Job Work PO",
-        ):
-            self.assertEqual(by_name[name]["status"], "Completed", name)
-        self.assertEqual(by_name["Agency Bill Match"]["status"], "In Progress")
-        self.assertEqual(by_name["Disbursement Payment"]["status"], "Pending")
-        self.assertIn(f"po={self.po.id}", by_name["Daily Production Entry"]["document"]["url"])
-        # The pipeline's production branch is exactly the 8 lifecycle stages.
-        production = [s["name"] for s in result["stages"] if s["branch"] == "branch_production"]
-        self.assertEqual(production, [s["label"] for s in self.lifecycle()["stages"]])
+        production = {s["name"]: s["status"] for s in result["stages"] if s["branch"] == "branch_production"}
+        self.assertEqual(list(production), [s["label"] for s in lc["stages"]])
+        self.assertTrue(all(v == "Completed" for v in production.values()), production)
 
     def test_renamed_production_stages_keep_their_tasks(self):
         from apps.pms.models import Task
         old_a = ProjectStage.objects.create(
-            client=self.tenant, project=self.project, name="Production Work Instruction", sequence=2,
+            client=self.tenant, project=self.project, name="Generate Final Job Work PO", sequence=7,
         )
         old_b = ProjectStage.objects.create(
-            client=self.tenant, project=self.project, name="Assign Vendor A + Employee", sequence=3,
+            client=self.tenant, project=self.project, name="Production / Job Work PO", sequence=8,
         )
-        Task.objects.create(client=self.tenant, project=self.project, stage=old_a, task_name="Brief agency")
-        Task.objects.create(client=self.tenant, project=self.project, stage=old_b, task_name="Assign supervisor")
+        Task.objects.create(client=self.tenant, project=self.project, stage=old_a, task_name="Draft PO")
+        Task.objects.create(client=self.tenant, project=self.project, stage=old_b, task_name="Send PO")
         sync_project_pipeline_stages(self.project)
-        stage = ProjectStage.objects.get(project=self.project, name="Production Instruction")
+        stage = ProjectStage.objects.get(project=self.project, name="Final Job Work PO")
         self.assertEqual(
             sorted(Task.objects.filter(stage=stage).values_list("task_name", flat=True)),
-            ["Assign supervisor", "Brief agency"],
+            ["Draft PO", "Send PO"],
         )
         self.assertFalse(ProjectStage.objects.filter(project=self.project, name__in=[
-            "Production Work Instruction", "Assign Vendor A + Employee",
+            "Generate Final Job Work PO", "Production / Job Work PO",
         ]).exists())
+
+    def test_purchase_po_endpoint_unchanged_for_vendor_a_po(self):
+        self.run_to_final_po()
+        po_res = self.api.get(f"/api/v1/purchase/orders/{self.po.id}/production-lifecycle/")
+        self.assertEqual(po_res.status_code, 200)
+        self.assertTrue(po_res.data["applicable"])
+        res = self.api.get(f"/api/v1/purchase/orders/{self.final_po.id}/production-lifecycle/")
+        self.assertFalse(res.data["applicable"])
+        # The instruction of a project Vendor A PO also shows in the PMS flow.
+        self.assertEqual([lc["instructionId"] for lc in self.pms_states()], [str(self.pi.id)])
 
     def test_generated_final_po_carries_project_but_stays_out_of_purchase_branch_list(self):
         self.po.status = "Approved"
@@ -397,8 +472,7 @@ class ProductionLifecycleTests(TestCase):
         self.assertEqual(po.status, "Approved")
         self.assertEqual(po.project_id, self.project.id)
         # A grey purchase PO is not part of the production lifecycle.
-        lifecycles = self.api.get(f"/api/v1/pms/projects/{self.project.id}/production-lifecycle/").data["lifecycles"]
-        self.assertEqual([lc["purchaseOrderId"] for lc in lifecycles], [str(self.po.id)])
+        self.assertEqual([lc["purchaseOrderId"] for lc in self.pms_states()], [str(self.po.id)])
 
     def test_payable_bill_is_not_duplicated(self):
         self.run_to_final_po()
@@ -408,3 +482,28 @@ class ProductionLifecycleTests(TestCase):
         self.assertEqual(
             PurchaseBill.objects.filter(client=self.tenant, purchase_order=self.final_po).count(), 1
         )
+
+    def test_processing_plan_stage_needs_an_approved_plan(self):
+        from apps.jobwork.models import ProcessPlan
+
+        def plan_stage():
+            result = sync_project_pipeline_stages(self.project)
+            return {s["name"]: s for s in result["stages"]}["Processing Plan & Vendor Assignment"]
+
+        self.assertEqual(plan_stage()["status"], "Pending")
+        res = self.api.post("/api/v1/jobwork/process-plans/", {
+            "date": "2026-10-20", "process": "Dyeing", "vendor": "Shree Processors",
+            "fabricItem": self.fabric.name, "expectedQty": 1000, "expectedLoss": 2,
+            "expectedReturnQty": 980, "expectedCompletionDate": "2026-11-05",
+            "status": "Draft", "remarks": f"Project {self.project.code}",
+        }, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(plan_stage()["status"], "In Progress")
+        res = self.api.post(f"/api/v1/jobwork/process-plans/{res.data['id']}/approve/", {}, format="json")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(plan_stage()["status"], "Completed")
+        # The downstream stage is named "Processing" (no hard-coded dyeing).
+        names = [s["name"] for s in sync_project_pipeline_stages(self.project)["stages"]]
+        self.assertIn("Processing", names)
+        self.assertNotIn("Processing (Dyeing)", names)
+        self.assertEqual(ProcessPlan.objects.filter(client=self.tenant).count(), 1)
