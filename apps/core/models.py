@@ -755,3 +755,34 @@ class AlertIncident(TenantModel):
     def __str__(self):
         return f"[{self.severity}] {self.title} - {self.status}"
 
+
+
+# ---------------------------------------------------------------------------
+# Digital signatures on printed documents (challans, invoices, receipts, ...)
+# ---------------------------------------------------------------------------
+class DocumentSignature(TenantModel):
+    """One e-signature on one signature line of any printable document.
+
+    Keyed by ``(document_type, document_id, signatory)`` so every print view can
+    share a single store instead of each model growing its own JSON column.
+    ``signature`` is the DigitalSignatureModal payload: type, name,
+    designation, signatureData (data-URL for drawn/uploaded) and signedAt.
+    """
+
+    document_type = models.CharField(max_length=64)
+    document_id = models.CharField(max_length=128)
+    signatory = models.CharField(max_length=64)
+    signature = models.JSONField(default=dict)
+
+    class Meta:
+        db_table = "document_signatures"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "document_type", "document_id", "signatory"],
+                name="uq_document_signature_slot",
+            )
+        ]
+        indexes = [models.Index(fields=["client", "document_type", "document_id"])]
+
+    def __str__(self):
+        return f"{self.document_type}:{self.document_id} [{self.signatory}]"

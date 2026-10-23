@@ -55,6 +55,7 @@ urlpatterns = [
     path("support/", include(support_router.urls)),
     path("events/stream/", views.EventStreamView.as_view(), name="events-stream"),
     path("search/", views.GlobalSearchView.as_view(), name="global-search"),
+    path("signatures/", views.DocumentSignatureView.as_view(), name="document-signatures"),
     path(
         "approvals/discount-policy/",
         approval_views.DiscountPolicyView.as_view(),

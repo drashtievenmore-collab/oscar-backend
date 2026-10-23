@@ -273,7 +273,13 @@ class QuotationViewSet(SalesDocumentViewSet):
         serializer.validated_data["quotation_number"] = allocate_number(
             self.request.user.client, "QT", serializer.validated_data.get("doc_date")
         )
-        return super().perform_create(serializer)
+        quotation = super().perform_create(serializer)
+        from apps.crm import services as crm_services
+        crm_services.advance_deal_for_quotation(
+            quotation, "Draft", actor=self.request.user,
+            description=f"Quotation {quotation.quotation_number} created in Draft.",
+        )
+        return quotation
 
     def _hold_for_approval(self, quotation, note=None):
         """Gate a quotation before it goes to the customer.
@@ -355,6 +361,11 @@ class QuotationViewSet(SalesDocumentViewSet):
                 crm_services.advance_deal_for_quotation(
                     quotation, "Won", actor=self.request.user,
                     description=f"Quotation {quotation.quotation_number} approved — deal won.",
+                )
+            elif quotation.status == "Draft":
+                crm_services.advance_deal_for_quotation(
+                    quotation, "Draft", actor=self.request.user,
+                    description=f"Quotation {quotation.quotation_number} reset to Draft.",
                 )
         return quotation
 
