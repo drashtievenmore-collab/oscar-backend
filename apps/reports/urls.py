@@ -50,6 +50,17 @@ public_urlpatterns = [
         public_views.PublicProofDecisionView.as_view(),
         name="public-proof-decide",
     ),
+    # PMS daily production entry link
+    path(
+        "production/<str:token>/",
+        public_views.PublicProductionLinkView.as_view(),
+        name="public-production-link",
+    ),
+    path(
+        "production/<str:token>/entries/",
+        public_views.PublicProductionEntryView.as_view(),
+        name="public-production-entry",
+    ),
     # Public lead forms (api.md §9.7)
     path(
         "forms/<slug:slug>/",

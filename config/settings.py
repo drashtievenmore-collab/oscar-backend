@@ -185,7 +185,9 @@ AUTH_PASSWORD_VALIDATORS = [
 SILENCED_SYSTEM_CHECKS = ["auth.E003"]
 
 LANGUAGE_CODE = "en-us"
-TIME_ZONE = "UTC"
+# Wall-clock for "today", punch times, late marks and payroll months. Values
+# are still stored in UTC (USE_TZ); this only decides how they are read.
+TIME_ZONE = os.environ.get("TIME_ZONE", "Asia/Kolkata")
 USE_I18N = True
 USE_TZ = True
 
