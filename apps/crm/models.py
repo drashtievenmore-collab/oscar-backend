@@ -764,6 +764,9 @@ class Form(TenantModel, LegacyIdMixin):
     is_published = models.BooleanField(default=False)
     published_at = models.DateTimeField(null=True, blank=True)
     kind = models.TextField(default="lead")  # lead | task
+    # The lead form Create Lead renders, for every user of the client. At most
+    # one lead form is active; none active means Create Lead is switched off.
+    is_active = models.BooleanField(default=False)
 
     class Meta:
         db_table = "crm_forms"

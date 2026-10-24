@@ -17,7 +17,9 @@ QTY_EXP = Decimal("0.0001")
 RATE_EXP = Decimal("0.0001")
 
 #: api.md §5.7 -- "line `tax` = 18% when not supplied".
-DEFAULT_TAX_PCT = Decimal("18")
+#: Default statutory tax percent: fabric/textile transactions default to 5% GST,
+#: dynamically configurable per line and pulled from Item Master.
+DEFAULT_TAX_PCT = Decimal("5")
 
 #: api.md §5.7 -- recomputed totals may differ from the client's by at most this.
 ROUNDING_TOLERANCE = Decimal("0.01")

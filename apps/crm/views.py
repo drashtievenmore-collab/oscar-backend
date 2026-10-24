@@ -1552,6 +1552,44 @@ class FormViewSet(TenantModelViewSet):
             )
         )
 
+    @action(detail=False, methods=["get"], url_path="active")
+    def active(self, request):
+        """``GET /crm/forms/active/?kind=lead`` -- the form Create Lead renders."""
+        kind = request.query_params.get("kind") or "lead"
+        form = Form.objects.filter(
+            client_id=request.client_id, kind=kind, is_active=True, deleted_at__isnull=True
+        ).first()
+        return Response({"formId": str(form.id) if form else None, "kind": kind})
+
+    @action(detail=False, methods=["post"], url_path="set-active")
+    @transaction.atomic
+    def set_active(self, request):
+        """``POST /crm/forms/set-active/`` ``{formId, kind}`` -- switch one form on
+        for every user; ``formId: null`` switches them all off."""
+        kind = request.data.get("kind") or "lead"
+        form_id = request.data.get("formId")
+        forms = Form.objects.select_for_update().filter(
+            client_id=request.client_id, kind=kind, deleted_at__isnull=True
+        )
+        target = None
+        if form_id:
+            import uuid
+
+            try:
+                uuid.UUID(str(form_id))
+            except ValueError:
+                raise ValidationFailed("Form not found.", field_errors={"formId": ["Not found."]})
+            target = forms.filter(pk=form_id).first()
+            if target is None:
+                raise ValidationFailed("Form not found.", field_errors={"formId": ["Not found."]})
+        forms.filter(is_active=True).exclude(pk=getattr(target, "pk", None)).update(
+            is_active=False, updated_at=timezone.now()
+        )
+        if target is not None and not target.is_active:
+            target.is_active = True
+            target.save(update_fields=["is_active", "updated_at"])
+        return Response({"formId": str(target.id) if target else None, "kind": kind})
+
     @action(detail=True, methods=["post"])
     def publish(self, request, pk=None):
         """Produce a public capture URL (api.md §9.7)."""

@@ -4297,6 +4297,10 @@ class QCReinspectionView(APIView):
             records.append({
                 "id": str(r.id),
                 "reprocessNo": r.no,
+                "status": r.status,
+                "jwoId": str(jwo.id) if jwo else None,
+                "jwoNo": (jwo.jwo_no or None) if jwo else None,
+                "reason": r.reason or None,
                 "date": r.date.strftime("%d-%m-%Y") if r.date else "",
                 "rawDate": r.date.isoformat() if r.date else "",
                 "sourceQcNo": r.inward_no or (jwo.jwo_no if jwo else None),
@@ -4419,6 +4423,24 @@ class QCReinspectionView(APIView):
                             )
                         moved += len(movements)
 
+                # "Repeat": the failed quantity goes round again as a new
+                # reprocess order on the same job work order and source.
+                repeat = None
+                if quantities["reprocess"] > ZERO:
+                    on_date = timezone.localdate()
+                    repeat = JWOReprocess.objects.create(
+                        client_id=client_id,
+                        job_work_order=reprocess.job_work_order,
+                        no=allocate_number(request.user.client, "RP", on_date),
+                        inward_no=reprocess.inward_no,
+                        date=on_date,
+                        qty=quantities["reprocess"],
+                        reason=remarks or f"Repeat reprocess after reinspection of {reprocess.no}",
+                        status="Pending",
+                        created_by=request.user,
+                    )
+                    result["repeatNo"] = repeat.no
+
                 result["stockPosted"] = bool(units)
                 reprocess.status = "Completed"
                 reprocess.remarks = json.dumps(result)
@@ -4431,6 +4453,8 @@ class QCReinspectionView(APIView):
                 f"Reinspection of {reprocess.no} recorded. No stock of this order is held at the "
                 "Reprocess location, so no stock moved."
             )
+            if repeat is not None:
+                message += f" Repeat reprocess {repeat.no} created for {quantities['reprocess']} m."
             return Response({"success": True, "status": reprocess.status, "stockPosted": bool(units), "message": message})
 
         # Create a reprocess / reinspection entry -- explicit inputs only.
