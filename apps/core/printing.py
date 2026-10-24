@@ -233,6 +233,24 @@ def _deliver_email(*, recipients, subject, message, attachments=()):
     if not to:
         raise EmailDeliveryFailed("Add at least one recipient email address.")
     if not getattr(settings, "EMAIL_HOST", ""):
+        if getattr(settings, "DEBUG", False) or "console" in getattr(settings, "EMAIL_BACKEND", "").lower():
+            try:
+                from django.core.mail import get_connection
+                connection = get_connection("django.core.mail.backends.console.EmailBackend")
+                mail = EmailMultiAlternatives(
+                    subject=subject,
+                    body=message,
+                    from_email=sender or "noreply@oscartextiles.com",
+                    to=to,
+                    connection=connection,
+                )
+                mail.attach_alternative(_html_email_body(message), "text/html")
+                for filename, content, mimetype in attachments or ():
+                    mail.attach(filename, content, mimetype)
+                mail.send(fail_silently=False)
+                return True
+            except Exception:
+                pass
         raise EmailNotConfigured()
     sender = getattr(settings, "DEFAULT_FROM_EMAIL", "") or getattr(
         settings, "EMAIL_HOST_USER", ""

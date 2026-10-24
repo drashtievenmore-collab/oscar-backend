@@ -3081,44 +3081,91 @@ class QCCompleteInspectionView(APIView):
             receipt = GoodsReceipt.objects.filter(
                 client_id=client_id, id=receipt_id, deleted_at__isnull=True
             ).first() if receipt_id else None
-            if receipt is None:
+            inward = None
+            if receipt is None and receipt_id:
+                inward = JWOInward.objects.filter(client_id=client_id, id=receipt_id).first()
+            if receipt is None and inward is None:
                 raise ValidationFailed(
-                    "Goods receipt not found.", field_errors={"receiptId": ["Not found."]}
+                    "Goods receipt or Job Work Inward not found.", field_errors={"receiptId": ["Not found."]}
                 )
 
-            jwo = None
-            jwo_id = request.data.get("jwoId") or request.data.get("jobWorkOrderId")
-            if jwo_id:
-                jwo = JobWorkOrder.objects.filter(client_id=client_id, id=jwo_id).first()
-                if jwo is None:
-                    raise ValidationFailed("Job work order not found.", field_errors={"jwoId": ["Not found."]})
+            if receipt is not None:
+                jwo = None
+                jwo_id = request.data.get("jwoId") or request.data.get("jobWorkOrderId")
+                if jwo_id:
+                    jwo = JobWorkOrder.objects.filter(client_id=client_id, id=jwo_id).first()
+                    if jwo is None:
+                        raise ValidationFailed("Job work order not found.", field_errors={"jwoId": ["Not found."]})
 
-            result = qc_service.dispose_receipt(
-                receipt,
-                quantities=quantities,
-                line_quantities=request.data.get("lines") or None,
-                taka_dispositions=taka_items,
-                user=request.user,
-                remarks=request.data.get("remarks") or None,
-                job_work_order=jwo,
-            )
+                result = qc_service.dispose_receipt(
+                    receipt,
+                    quantities=quantities,
+                    line_quantities=request.data.get("lines") or None,
+                    taka_dispositions=taka_items,
+                    user=request.user,
+                    remarks=request.data.get("remarks") or None,
+                    job_work_order=jwo,
+                )
 
-        return Response({
-            "success": True,
-            "status": result["verdict"],
-            "stockPosted": result["stockPosted"],
-            "message": (
-                f"QC recorded for {receipt.grn_number}: {result['verdict']}."
-                + ("" if result["stockPosted"] else " This receipt has no stock posted, so no stock moved.")
-            ),
-            "goodQty": float(result["quantities"].get("good", 0)),
-            "secondQty": float(result["quantities"].get("second", 0)),
-            "reprocessQty": float(result["quantities"].get("reprocess", 0)),
-            "rejectQty": float(result["quantities"].get("reject", 0)),
-            "holdQty": float(result["quantities"].get("hold", 0)),
-            "postedStock": float(result["quantities"].get("good", 0)),
-            **{f"{k}Qty": float(v) for k, v in result["quantities"].items()},
-        })
+                return Response({
+                    "success": True,
+                    "status": result["verdict"],
+                    "stockPosted": result["stockPosted"],
+                    "message": (
+                        f"QC recorded for {receipt.grn_number}: {result['verdict']}."
+                        + ("" if result["stockPosted"] else " This receipt has no stock posted, so no stock moved.")
+                    ),
+                    "goodQty": float(result["quantities"].get("good", 0)),
+                    "secondQty": float(result["quantities"].get("second", 0)),
+                    "reprocessQty": float(result["quantities"].get("reprocess", 0)),
+                    "rejectQty": float(result["quantities"].get("reject", 0)),
+                    "holdQty": float(result["quantities"].get("hold", 0)),
+                    "postedStock": float(result["quantities"].get("good", 0)),
+                    **{f"{k}Qty": float(v) for k, v in result["quantities"].items()},
+                })
+            else:
+                total = sum(quantities.values(), ZERO)
+                if total <= ZERO:
+                    raise ValidationFailed(
+                        "Enter the disposition quantities before approving.",
+                        field_errors={"goodQty": ["Total must be greater than zero."]},
+                    )
+                verdict = qc_service.verdict_for(
+                    {k: quantities[k] for k in ("good", "second", "reprocess", "reject")},
+                    quantities["hold"],
+                )
+                inward.accepted = quantities["good"] + quantities["second"]
+                inward.rejected = quantities["reject"]
+                inward.status = verdict
+                inward.save(update_fields=["accepted", "rejected", "status", "updated_at"])
+                if quantities["reprocess"] > ZERO:
+                    from apps.jobwork.models import JWOReprocess
+                    if not JWOReprocess.objects.filter(client_id=client_id, inward_no=inward.no).exists():
+                        on_date = timezone.localdate()
+                        rp_no = allocate_number(request.user.client, "RP", on_date)
+                        JWOReprocess.objects.create(
+                            client_id=client_id,
+                            job_work_order=inward.job_work_order,
+                            no=rp_no,
+                            inward_no=inward.no,
+                            date=on_date,
+                            qty=quantities["reprocess"],
+                            reason=request.data.get("remarks") or f"Reprocess required from {inward.no}",
+                            status="Pending",
+                            created_by=request.user,
+                        )
+                return Response({
+                    "success": True,
+                    "status": verdict,
+                    "stockPosted": False,
+                    "message": f"QC recorded for Job Work Inward {inward.no}: {verdict}.",
+                    "goodQty": float(quantities["good"]),
+                    "secondQty": float(quantities["second"]),
+                    "reprocessQty": float(quantities["reprocess"]),
+                    "rejectQty": float(quantities["reject"]),
+                    "holdQty": float(quantities["hold"]),
+                    "postedStock": float(quantities["good"]),
+                })
 
 
 class QCRegisterView(APIView):

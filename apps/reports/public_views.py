@@ -355,19 +355,34 @@ def _production_instruction_payload(instruction):
     from apps.pms import production_services
 
     progress = production_services.instruction_progress(instruction)
+    balance = progress["balance"]
+    is_completed = (
+        instruction.status in ("Completed", "Verified", "PO Pending", "PO Created", "Closed")
+        or balance <= 0
+    )
+    can_record = (
+        instruction.status != "Draft"
+        and not is_completed
+        and instruction.status not in production_services.LOCKED_INSTRUCTION_STATUSES
+        and balance > 0
+    )
+    display_status = (
+        "Completed"
+        if (is_completed and instruction.status not in ("Verified", "Closed", "PO Pending", "PO Created"))
+        else instruction.status
+    )
     return {
         "id": str(instruction.id),
         "instructionNumber": str(instruction),
         "agencyName": instruction.agency_name,
         "fabric": instruction.fabric,
         "processType": instruction.process_type,
-        "status": instruction.status,
+        "status": display_status,
         "orderMeter": progress["orderMeter"],
         "cumulative": progress["cumulative"],
         "balance": progress["balance"],
-        # Mirrors lock_open_instruction: Draft and closed-out runs take no entries.
-        "canRecord": instruction.status != "Draft"
-        and instruction.status not in production_services.LOCKED_INSTRUCTION_STATUSES,
+        "isCompleted": is_completed,
+        "canRecord": can_record,
     }
 
 
@@ -384,6 +399,20 @@ class PublicProductionLinkView(PublicView):
         link = _resolve_production_link(token)
         project = link.project
         instructions = list(project_production_instructions(project))
+        instruction_payloads = [_production_instruction_payload(pi) for pi in instructions]
+        open_instructions = [pi for pi in instruction_payloads if pi["canRecord"]]
+
+        is_project_closed = project.status in ("Completed", "Closed")
+        all_instructions_done = (
+            len(instruction_payloads) > 0
+            and len(open_instructions) == 0
+            and all(pi.get("isCompleted") or pi.get("balance", 0) <= 0 for pi in instruction_payloads)
+        )
+        is_completed = is_project_closed or all_instructions_done
+
+        total_ordered = sum(pi.get("orderMeter", 0) for pi in instruction_payloads)
+        total_produced = sum(pi.get("cumulative", 0) for pi in instruction_payloads)
+
         recent = (
             DailyProductionEntry.objects.filter(
                 instruction__in=instructions, deleted_at__isnull=True
@@ -400,8 +429,19 @@ class PublicProductionLinkView(PublicView):
                     "code": project.code,
                     "customerName": project.customer_name,
                     "productName": project.product_name,
+                    "status": project.status,
                 },
-                "instructions": [_production_instruction_payload(pi) for pi in instructions],
+                "isCompleted": is_completed,
+                "completionReason": (
+                    "Project is marked Completed"
+                    if is_project_closed
+                    else "All production quantities have been completed"
+                    if all_instructions_done
+                    else None
+                ),
+                "totalOrdered": total_ordered,
+                "totalProduced": total_produced,
+                "instructions": instruction_payloads,
                 "employees": [
                     {"id": str(e.id), "name": e.name, "code": e.employee_code}
                     for e in employees
@@ -451,6 +491,12 @@ class PublicProductionEntryView(PublicWriteView):
         link = _resolve_production_link(token)
         project = link.project
 
+        if project.status in ("Completed", "Closed"):
+            raise ValidationFailed(
+                f"Project {project.code} is already completed. No further production entries can be recorded.",
+                field_errors={"project": ["Project is completed."]},
+            )
+
         serializer = PublicProductionEntrySerializer(data=request.data)
         if not serializer.is_valid():
             raise ValidationFailed(
@@ -476,6 +522,19 @@ class PublicProductionEntryView(PublicWriteView):
             raise ValidationFailed(
                 "Select an active employee.",
                 field_errors={"enteredByEmployeeId": ["This employee cannot record production."]},
+            )
+
+        progress = production_services.instruction_progress(instruction)
+        if progress["balance"] <= 0 or instruction.status in ("Completed", "Verified", "Closed", "PO Pending", "PO Created"):
+            raise ValidationFailed(
+                f"Production for {instruction} is already completed ({progress['cumulative']} of {progress['orderMeter']} Mtr produced).",
+                field_errors={"instructionId": ["This production instruction is already complete."]},
+            )
+        from decimal import Decimal
+        if Decimal(str(data["meters"])) > progress["balance"]:
+            raise ValidationFailed(
+                f"Today's produced quantity ({data['meters']} Mtr) cannot exceed remaining balance ({progress['balance']} Mtr).",
+                field_errors={"meters": [f"Cannot exceed remaining balance of {progress['balance']} Mtr."]},
             )
 
         with transaction.atomic():
