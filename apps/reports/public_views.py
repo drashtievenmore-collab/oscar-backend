@@ -11,7 +11,7 @@ from datetime import timedelta
 
 from django.db import transaction
 from django.utils import timezone
-from rest_framework import status
+from rest_framework import serializers, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -329,6 +329,191 @@ class PublicProofDecisionView(PublicWriteView):
             )
 
         return Response({"decision": decision, "decidedAt": share.decided_at})
+
+
+# ---------------------------------------------------------------------------
+# PMS daily production entry link
+# ---------------------------------------------------------------------------
+def _resolve_production_link(token):
+    from apps.pms.models import ProductionEntryLink
+
+    link = (
+        ProductionEntryLink.objects.filter(token=token, deleted_at__isnull=True)
+        .select_related("project", "project__client")
+        .first()
+    )
+    if link is None:
+        raise NotFound("This production link is not valid.")
+    if link.status != "Active":
+        raise Conflict("This production link has been revoked.", code=Codes.TOKEN_REVOKED)
+
+    set_current_client_id(link.client_id)
+    return link
+
+
+def _production_instruction_payload(instruction):
+    from apps.pms import production_services
+
+    progress = production_services.instruction_progress(instruction)
+    return {
+        "id": str(instruction.id),
+        "instructionNumber": str(instruction),
+        "agencyName": instruction.agency_name,
+        "fabric": instruction.fabric,
+        "processType": instruction.process_type,
+        "status": instruction.status,
+        "orderMeter": progress["orderMeter"],
+        "cumulative": progress["cumulative"],
+        "balance": progress["balance"],
+        # Mirrors lock_open_instruction: Draft and closed-out runs take no entries.
+        "canRecord": instruction.status != "Draft"
+        and instruction.status not in production_services.LOCKED_INSTRUCTION_STATUSES,
+    }
+
+
+class PublicProductionLinkView(PublicView):
+    """``GET /public/production/{token}/`` -- the project's open instructions,
+    the employees who may record production, and the latest entries."""
+
+    def get(self, request, token):
+        from apps.core.printing import company_payload
+        from apps.pms import production_services
+        from apps.pms.lifecycle_services import project_production_instructions
+        from apps.pms.models import DailyProductionEntry
+
+        link = _resolve_production_link(token)
+        project = link.project
+        instructions = list(project_production_instructions(project))
+        recent = (
+            DailyProductionEntry.objects.filter(
+                instruction__in=instructions, deleted_at__isnull=True
+            )
+            .select_related("instruction", "entered_by_employee")
+            .order_by("-entry_date", "-created_at")[:15]
+        )
+        employees = production_services.active_employee_queryset(link.client_id)
+        return Response(
+            {
+                "company": company_payload(link.client_id, request),
+                "project": {
+                    "id": str(project.id),
+                    "code": project.code,
+                    "customerName": project.customer_name,
+                    "productName": project.product_name,
+                },
+                "instructions": [_production_instruction_payload(pi) for pi in instructions],
+                "employees": [
+                    {"id": str(e.id), "name": e.name, "code": e.employee_code}
+                    for e in employees
+                ],
+                "recentEntries": [
+                    {
+                        "id": str(entry.id),
+                        "instructionNumber": str(entry.instruction),
+                        "entryDate": entry.entry_date,
+                        "meters": entry.meters,
+                        "goodMeter": entry.good_meter,
+                        "rejectMeter": entry.reject_meter,
+                        "reprocessMeter": entry.reprocess_meter,
+                        "employeeName": getattr(entry.entered_by_employee, "name", None),
+                        "status": entry.status,
+                    }
+                    for entry in recent
+                ],
+                "today": timezone.localdate(),
+            }
+        )
+
+
+class PublicProductionEntrySerializer(serializers.Serializer):
+    instructionId = serializers.UUIDField()
+    entryDate = serializers.DateField()
+    meters = serializers.DecimalField(max_digits=18, decimal_places=4)
+    rejectMeter = serializers.DecimalField(
+        max_digits=18, decimal_places=4, required=False, default=0
+    )
+    reprocessMeter = serializers.DecimalField(
+        max_digits=18, decimal_places=4, required=False, default=0
+    )
+    enteredByEmployeeId = serializers.UUIDField()
+    remarks = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
+class PublicProductionEntryView(PublicWriteView):
+    """``POST /public/production/{token}/entries/`` -- records a submitted daily
+    entry through the same service the in-app Daily Production page uses."""
+
+    def post(self, request, token):
+        from apps.core.audit import record_audit
+        from apps.pms import production_services
+        from apps.pms.lifecycle_services import project_production_instructions
+
+        link = _resolve_production_link(token)
+        project = link.project
+
+        serializer = PublicProductionEntrySerializer(data=request.data)
+        if not serializer.is_valid():
+            raise ValidationFailed(
+                "Some fields need attention.",
+                field_errors={k: [str(m) for m in v] for k, v in serializer.errors.items()},
+            )
+        data = serializer.validated_data
+
+        instruction = (
+            project_production_instructions(project).filter(pk=data["instructionId"]).first()
+        )
+        if instruction is None:
+            raise ValidationFailed(
+                "Select a production instruction of this project.",
+                field_errors={"instructionId": ["Not an instruction of this project."]},
+            )
+        employee = (
+            production_services.active_employee_queryset(link.client_id)
+            .filter(pk=data["enteredByEmployeeId"])
+            .first()
+        )
+        if employee is None:
+            raise ValidationFailed(
+                "Select an active employee.",
+                field_errors={"enteredByEmployeeId": ["This employee cannot record production."]},
+            )
+
+        with transaction.atomic():
+            entry = production_services.record_daily_entry(
+                client=project.client,
+                instruction=instruction,
+                entry_date=data["entryDate"],
+                meters=data["meters"],
+                reject_meter=data.get("rejectMeter") or 0,
+                reprocess_meter=data.get("reprocessMeter") or 0,
+                entered_by_employee=employee,
+                entered_by_user=None,
+                remarks=data.get("remarks") or None,
+                status="Submitted",
+            )
+            link.last_used_at = timezone.now()
+            link.save(update_fields=["last_used_at", "updated_at"])
+            record_audit(
+                client=link.client_id, actor=None, action="create",
+                entity_type="DailyProductionEntry", entity_id=entry.id,
+                entity_label=str(instruction),
+                description=(
+                    f"{entry.meters} m recorded by {employee.name} "
+                    f"via the production link of {project.code}"
+                ),
+            )
+
+        instruction.refresh_from_db()
+        return Response(
+            {
+                "id": str(entry.id),
+                "entryDate": entry.entry_date,
+                "meters": entry.meters,
+                "goodMeter": entry.good_meter,
+                "instruction": _production_instruction_payload(instruction),
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 # ---------------------------------------------------------------------------

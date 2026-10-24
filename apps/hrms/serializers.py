@@ -1,4 +1,6 @@
 """HRMS serializers (api.md §11)."""
+import re
+
 from rest_framework import serializers
 
 from apps.core.serializers import (
@@ -268,6 +270,27 @@ class RegularizationSerializer(BaseModelSerializer):
         ]
         read_only_fields = ["approver", "decided_at", "created_at"]
 
+    #: ``09:00`` / ``09:00:00`` -- a bare clock time on the request's own date.
+    _TIME_ONLY = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
+
+    def to_internal_value(self, data):
+        """Accept ``requestedCheckIn: "09:00"`` as well as a full datetime.
+
+        The self-service forms collect a clock time for the day being
+        regularized; it is pinned to ``date`` here so it parses as a datetime.
+        """
+        day = data.get("date") if hasattr(data, "get") else None
+        if day:
+            patched = None
+            for key in ("requestedCheckIn", "requestedCheckOut"):
+                value = data.get(key)
+                if isinstance(value, str) and self._TIME_ONLY.match(value.strip()):
+                    patched = patched or (data.copy() if hasattr(data, "copy") else dict(data))
+                    patched[key] = f"{day}T{value.strip()}"
+            if patched is not None:
+                data = patched
+        return super().to_internal_value(data)
+
 
 # ---------------------------------------------------------------------------
 # Leave (api.md §11.3)
@@ -289,7 +312,11 @@ class LeaveRequestSerializer(BaseModelSerializer):
     employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
     type = serializers.CharField(source="leave_type.name", read_only=True)
     leaveTypeId = TenantPrimaryKeyRelatedField(
-        source="leave_type", model="hrms.LeaveType"
+        source="leave_type", model="hrms.LeaveType", required=False, allow_null=True
+    )
+    #: Write-only alternative to ``leaveTypeId``: the leave type's name or code.
+    leaveTypeName = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, allow_null=True
     )
     fromDate = serializers.DateField(source="from_date")
     toDate = serializers.DateField(source="to_date")
@@ -302,8 +329,8 @@ class LeaveRequestSerializer(BaseModelSerializer):
         model = LeaveRequest
         fields = [
             "id", "employeeId", "employeeName", "employeeCode", "type",
-            "leaveTypeId", "fromDate", "toDate", "days", "reason", "delegateId",
-            "delegate_confirmed_at", "status", "approver", "decided_at",
+            "leaveTypeId", "leaveTypeName", "fromDate", "toDate", "days", "reason",
+            "delegateId", "delegate_confirmed_at", "status", "approver", "decided_at",
             "remark", "created_at", "updated_at",
         ]
         read_only_fields = [
@@ -316,6 +343,25 @@ class LeaveRequestSerializer(BaseModelSerializer):
         end = attrs.get("to_date") or getattr(self.instance, "to_date", None)
         if start and end and end < start:
             raise serializers.ValidationError({"toDate": ["Must be on or after the start date."]})
+
+        type_name = attrs.pop("leaveTypeName", None)
+        if self.instance is None:
+            request = self.context.get("request")
+            client_id = getattr(request, "client_id", None) or getattr(
+                getattr(request, "user", None), "client_id", None
+            )
+            if not attrs.get("leave_type"):
+                leave_type = services.resolve_leave_type(client_id, type_name)
+                if leave_type is None:
+                    raise serializers.ValidationError({"leaveTypeId": [
+                        f"No leave type named \"{type_name}\" is set up."
+                        if type_name else "This field is required."
+                    ]})
+                attrs["leave_type"] = leave_type
+            if "days" not in attrs and start and end:
+                attrs["days"] = len(services.working_days_in(client_id, start, end)) or (
+                    (end - start).days + 1
+                )
         return attrs
 
 
@@ -422,6 +468,8 @@ class PayslipSerializer(BaseModelSerializer):
     bank = serializers.CharField(source="bank_account.name", read_only=True)
     components = PayslipComponentSerializer(many=True, read_only=True)
     netPayable = MoneyField(source="net_payable", read_only=True)
+    breakdown = serializers.SerializerMethodField()
+    attendance = serializers.SerializerMethodField()
 
     class Meta:
         model = Payslip
@@ -430,10 +478,35 @@ class PayslipSerializer(BaseModelSerializer):
             "standardSalary", "earnedSalary", "additionalEarnings", "deductions",
             "advance", "paidLeaves", "basic", "hra", "allowances", "status",
             "paidAmount", "paymentDate", "bank", "attendedDays", "totalDays",
-            "netPayable", "earned_salary_overridden", "components",
-            "created_at", "updated_at",
+            "netPayable", "earned_salary_overridden", "components", "breakdown",
+            "attendance", "created_at", "updated_at",
         ]
         read_only_fields = ["status", "earned_salary_overridden", "created_at", "updated_at"]
+
+    def get_breakdown(self, payslip):
+        """Per-day rate, absent days and the deduction, as the payslip computed them."""
+        result = services.compute_salary(
+            standard_salary=payslip.standard_salary,
+            total_days=payslip.total_days,
+            attended_days=payslip.attended_days,
+            paid_leaves=payslip.paid_leaves,
+            additional_earnings=payslip.additional_earnings,
+            deductions=payslip.deductions,
+            advance=payslip.advance_recovery,
+        )
+        return {
+            "perDaySalary": float(result["perDaySalary"]),
+            "absentDays": float(result["absentDays"]),
+            "attendanceDeduction": float(result["attendanceDeduction"]),
+        }
+
+    def get_attendance(self, payslip):
+        """The month's attendance and leave counts behind the attended/paid-leave days."""
+        counts = services.attendance_counts(
+            payslip.client_id, payslip.employee, payslip.period_month,
+            services._month_end(payslip.period_month),
+        )
+        return {key: float(value) for key, value in counts.items()}
 
 
 class PayrollRunSerializer(BaseModelSerializer):
@@ -753,12 +826,33 @@ class AssetAssignmentSerializer(BaseModelSerializer):
         ]
 
 
+def _asset_category_named(context, name):
+    """The tenant's asset category called ``name``, created on first use."""
+    name = str(name or "").strip()
+    if not name:
+        return None
+    request = context.get("request")
+    client_id = context.get("client_id") or getattr(request, "client_id", None)
+    row = AssetCategory.objects.filter(
+        client_id=client_id, name__iexact=name, deleted_at__isnull=True
+    ).first()
+    return row or AssetCategory.objects.create(client_id=client_id, name=name)
+
+
 class AssetSerializer(BaseModelSerializer):
     assetCode = serializers.CharField(source="asset_code", read_only=True)
     category = serializers.CharField(source="category.name", read_only=True)
     categoryId = TenantPrimaryKeyRelatedField(
         source="category", model="hrms.AssetCategory", required=False, allow_null=True
     )
+    #: The register form picks a category by name; it is created if new.
+    categoryName = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, allow_null=True
+    )
+    employeeCode = serializers.CharField(
+        source="assigned_employee.employee_code", read_only=True
+    )
+    pendingRequests = serializers.SerializerMethodField()
     assignedTo = serializers.CharField(source="assigned_employee.name", read_only=True)
     employeeId = TenantPrimaryKeyRelatedField(
         source="assigned_employee", model="hrms.Employee", required=False, allow_null=True
@@ -781,12 +875,24 @@ class AssetSerializer(BaseModelSerializer):
     class Meta:
         model = Asset
         fields = [
-            "id", "assetCode", "name", "category", "categoryId", "serialNumber",
-            "assignedTo", "employeeId", "dept", "status", "condition",
-            "purchaseDate", "purchaseCost", "warrantyExpiry", "location",
-            "notes", "history", "created_at", "updated_at",
+            "id", "assetCode", "name", "category", "categoryId", "categoryName",
+            "serialNumber", "assignedTo", "employeeId", "employeeCode", "dept",
+            "status", "condition", "purchaseDate", "purchaseCost", "warrantyExpiry",
+            "location", "notes", "history", "pendingRequests", "created_at", "updated_at",
         ]
         read_only_fields = ["assetCode", "created_at", "updated_at"]
+
+    def get_pendingRequests(self, asset):
+        return sum(
+            1 for row in asset.requests.all()
+            if row.status == "Pending" and row.deleted_at is None
+        )
+
+    def validate(self, attrs):
+        name = attrs.pop("categoryName", None)
+        if name and not attrs.get("category"):
+            attrs["category"] = _asset_category_named(self.context, name)
+        return attrs
 
 
 class AssetRequestSerializer(BaseModelSerializer):
@@ -794,16 +900,93 @@ class AssetRequestSerializer(BaseModelSerializer):
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    dept = serializers.CharField(source="employee.department.name", read_only=True)
+    requestType = serializers.ChoiceField(
+        source="request_type", choices=AssetRequest.REQUEST_TYPES, required=False
+    )
+    requestedAssetId = TenantPrimaryKeyRelatedField(
+        source="requested_asset", model="hrms.Asset", required=False, allow_null=True
+    )
+    requestedAsset = serializers.CharField(source="requested_asset.name", read_only=True)
+    requestedAssetCode = serializers.CharField(
+        source="requested_asset.asset_code", read_only=True
+    )
+    requestedAssetStatus = serializers.CharField(
+        source="requested_asset.status", read_only=True
+    )
+    itemName = serializers.CharField(
+        source="item_name", required=False, allow_blank=True, allow_null=True
+    )
     categoryId = TenantPrimaryKeyRelatedField(
         source="category", model="hrms.AssetCategory", required=False, allow_null=True
     )
+    category = serializers.CharField(source="category.name", read_only=True)
+    categoryName = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, allow_null=True
+    )
+    priority = serializers.ChoiceField(choices=AssetRequest.PRIORITIES, required=False)
+    approverName = serializers.CharField(source="approver.name", read_only=True)
+    decidedAt = serializers.DateTimeField(source="decided_at", read_only=True)
+    fulfilledAssetId = serializers.CharField(source="fulfilled_asset_id", read_only=True)
+    fulfilledAsset = serializers.CharField(source="fulfilled_asset.name", read_only=True)
+    fulfilledAssetCode = serializers.CharField(
+        source="fulfilled_asset.asset_code", read_only=True
+    )
+    requestedDate = serializers.SerializerMethodField()
 
     class Meta:
         model = AssetRequest
         fields = [
-            "id", "employeeId", "employeeName", "categoryId", "justification",
-            "status", "approver", "fulfilled_asset", "created_at",
+            "id", "employeeId", "employeeName", "employeeCode", "dept",
+            "requestType", "requestedAssetId", "requestedAsset", "requestedAssetCode",
+            "requestedAssetStatus", "itemName", "categoryId", "category", "categoryName",
+            "priority", "justification", "status", "approver", "approverName",
+            "decidedAt", "remark", "fulfilledAssetId", "fulfilledAsset",
+            "fulfilledAssetCode", "requestedDate", "created_at",
         ]
+        # Status moves only through the approve / reject / fulfil / cancel actions.
+        read_only_fields = ["status", "approver", "remark", "created_at"]
+
+    def get_requestedDate(self, row):
+        return row.created_at.date().isoformat() if row.created_at else None
+
+    def validate(self, attrs):
+        name = attrs.pop("categoryName", None)
+        if name and not attrs.get("category"):
+            attrs["category"] = _asset_category_named(self.context, name)
+
+        instance = self.instance
+        request_type = attrs.get("request_type") or getattr(instance, "request_type", None)
+        asset = attrs.get("requested_asset", getattr(instance, "requested_asset", None))
+        if request_type is None:
+            request_type = "Inventory" if asset is not None else "Other"
+            attrs["request_type"] = request_type
+
+        if request_type == "Inventory":
+            if asset is None:
+                raise serializers.ValidationError(
+                    {"requestedAssetId": ["Pick an asset from the inventory."]}
+                )
+            if instance is None and asset.status != "Available":
+                raise serializers.ValidationError({"requestedAssetId": [
+                    f"{asset.name} is {asset.status.lower()} and cannot be requested."
+                ]})
+            attrs.setdefault("category", asset.category)
+            attrs.setdefault("item_name", asset.name)
+        else:
+            attrs["requested_asset"] = None
+            item = (attrs.get("item_name") or getattr(instance, "item_name", None) or "").strip()
+            if not item:
+                raise serializers.ValidationError(
+                    {"itemName": ["Describe the item you need."]}
+                )
+
+        if instance is None and not (attrs.get("justification") or "").strip():
+            raise serializers.ValidationError(
+                {"justification": ["Explain why you need it."]}
+            )
+        return attrs
 
 
 class HrDocumentSerializer(BaseModelSerializer):

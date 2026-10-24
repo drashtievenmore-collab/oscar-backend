@@ -1062,18 +1062,36 @@ class AssetAssignment(TenantModel):
 
 
 class AssetRequest(TenantModel):
+    """An employee's ask for equipment.
+
+    ``Inventory`` requests name one registered asset that was Available when
+    asked for; approving one hands that exact unit over. ``Other`` requests
+    describe something not in the register (``item_name``) -- approving one
+    records the decision, and HR fulfils it with an asset once one exists.
+    """
+
     STATUSES = [("Pending", "Pending"), ("Approved", "Approved"), ("Fulfilled", "Fulfilled"),
-                ("Rejected", "Rejected")]
+                ("Rejected", "Rejected"), ("Cancelled", "Cancelled")]
+    REQUEST_TYPES = [("Inventory", "Inventory"), ("Other", "Other")]
+    PRIORITIES = [("Low", "Low"), ("Medium", "Medium"), ("High", "High"), ("Urgent", "Urgent")]
 
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="asset_requests")
+    request_type = models.TextField(choices=REQUEST_TYPES, default="Other")
+    requested_asset = models.ForeignKey(
+        Asset, null=True, blank=True, on_delete=models.SET_NULL, related_name="requests"
+    )
+    item_name = models.TextField(null=True, blank=True)
     category = models.ForeignKey(
         AssetCategory, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    priority = models.TextField(choices=PRIORITIES, default="Medium")
     justification = models.TextField(null=True, blank=True)
     status = models.TextField(choices=STATUSES, default="Pending")
     approver = models.ForeignKey(
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    remark = models.TextField(null=True, blank=True)
     fulfilled_asset = models.ForeignKey(
         Asset, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
