@@ -1683,13 +1683,13 @@ def evaluate_combined_grey_stock_alert(client_id):
     if available < threshold:
         shortage = round4(threshold - available)
         severity = "Critical" if available <= round4(threshold / Decimal("2")) else "Warning"
-        title = f"Combined Grey Stock Low: {available} Mtr (Min {threshold} Mtr)"
+        title = f"Combined Grey Stock Low: {round2(available)} Mtr (Min {round2(threshold)} Mtr)"
         message = (
-            f"Combined available grey fabric stock ({available} Mtr) is below the configured "
-            f"minimum threshold of {threshold} Mtr across {calc['qualities_count']} fabric qualities. "
-            f"Shortage: {shortage} Mtr. "
-            f"(Physical Godown Grey: {calc['physical_grey_stock']} Mtr, Reserved: {calc['reserved_grey_stock']} Mtr, "
-            f"External WIP: {calc['external_wip']} Mtr)."
+            f"Combined available grey fabric stock ({round2(available)} Mtr) is below the configured "
+            f"minimum threshold of {round2(threshold)} Mtr across {calc['qualities_count']} fabric qualities. "
+            f"Shortage: {round2(shortage)} Mtr. "
+            f"(Physical Godown Grey: {round2(calc['physical_grey_stock'])} Mtr, Reserved: {round2(calc['reserved_grey_stock'])} Mtr, "
+            f"External WIP: {round2(calc['external_wip'])} Mtr)."
         )
         metadata = {
             "current_stock": float(available),

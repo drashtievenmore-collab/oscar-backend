@@ -1032,10 +1032,17 @@ def party_ledger(client_id, party_id, *, date_from=None, date_to=None):
     if date_to:
         queryset = queryset.filter(journal_entry__entry_date__lte=date_to)
 
+    is_vendor_or_processor = party and party.type in ("Vendor", "Processor")
     running = opening
     entries = []
     for line in queryset:
-        running = round2(running + D(line.debit) - D(line.credit))
+        if is_vendor_or_processor:
+            running = round2(running + D(line.credit) - D(line.debit))
+            balance_type = "Cr" if running >= ZERO else "Dr"
+        else:
+            running = round2(running + D(line.debit) - D(line.credit))
+            balance_type = "Dr" if running >= ZERO else "Cr"
+
         entries.append(
             {
                 "date": line.journal_entry.entry_date,
@@ -1044,14 +1051,20 @@ def party_ledger(client_id, party_id, *, date_from=None, date_to=None):
                 "description": line.description or line.journal_entry.narration,
                 "debit": line.debit,
                 "credit": line.credit,
-                "balance": running,
+                "balance": abs(running),
+                "rawBalance": running,
+                "balanceType": balance_type,
             }
         )
+
+    closing_type = ("Cr" if running >= ZERO else "Dr") if is_vendor_or_processor else ("Dr" if running >= ZERO else "Cr")
 
     return {
         "openingBalance": opening,
         "entries": entries,
-        "closingBalance": running,
+        "closingBalance": abs(running),
+        "rawClosingBalance": running,
+        "balanceType": closing_type,
     }
 
 

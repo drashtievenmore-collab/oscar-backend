@@ -408,9 +408,10 @@ class QuotationViewSet(SalesDocumentViewSet):
     @transaction.atomic
     def convert_to_order(self, request, pk=None):
         quotation = self.get_object()
-        if quotation.status in ("Converted", "Cancelled"):
+        if quotation.status in ("Converted", "Cancelled", "Rejected", "REJECTED"):
             raise Conflict(
-                f"This quotation is {quotation.status}.", code=Codes.ALREADY_DONE
+                f"This quotation is {quotation.status} and cannot be converted to a Sales Order. Please create a revised quotation.",
+                code=Codes.ALREADY_DONE if quotation.status == "Converted" else "REJECTED_QUOTATION"
             )
         blocked = self._hold_for_approval(quotation)
         if blocked is not None:
@@ -1474,6 +1475,37 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         return Response(self.get_serializer(invoice).data)
 
     @action(detail=True, methods=["post"], url_path="e-invoice")
+    def e_invoice(self, request, pk=None):
+        """IRN generator compatibility endpoint."""
+        return self.generate_irn(request, pk=pk)
+
+    @action(detail=True, methods=["post"], url_path="convert-to-challan")
+    @transaction.atomic
+    def convert_to_challan(self, request, pk=None):
+        """Direct convert invoice into delivery challan."""
+        invoice = self.get_object()
+        overrides = {"status": "Draft"}
+        if invoice.sales_order_id:
+            overrides["sales_order"] = invoice.sales_order
+        challan = _clone_document(
+            invoice,
+            DeliveryChallan,
+            overrides,
+            number_field="challan_number",
+            series="DC",
+            line_model_name="DeliveryChallanLine",
+            line_fk="delivery_challan",
+        )
+        if not invoice.delivery_challan_id:
+            invoice.delivery_challan = challan
+            invoice.save(update_fields=["delivery_challan"])
+        self.write_audit(
+            "convert", invoice, description=f"Challan {challan.challan_number} created from Invoice {invoice.invoice_number}"
+        )
+        return Response(
+            DeliveryChallanSerializer(challan, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
     def e_invoice(self, request, pk=None):
         """IRN generator compatibility endpoint."""
         return self.generate_irn(request, pk=pk)
