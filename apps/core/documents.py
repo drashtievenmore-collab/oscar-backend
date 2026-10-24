@@ -140,7 +140,7 @@ class DocumentLine(TenantModel):
     amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     discount_pct = models.DecimalField(max_digits=7, decimal_places=4, default=0)
     discount_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
-    tax_pct = models.DecimalField(max_digits=7, decimal_places=4, default=18)
+    tax_pct = models.DecimalField(max_digits=7, decimal_places=4, default=5)
     tax_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     line_total = models.DecimalField(max_digits=18, decimal_places=2, default=0)
 
@@ -190,6 +190,8 @@ class DocumentLine(TenantModel):
         self.item_name = item.name
         self.hsn_code = self.hsn_code or item.hsn_code
         self.uom = self.uom or item.uom
+        if getattr(item, "tax_pct", None) is not None and (self.tax_pct is None or self.tax_pct == 5):
+            self.tax_pct = item.tax_pct
         from apps.masters.uom import line_factor
 
         self.uom_factor = line_factor(self.client_id, item, self.uom)

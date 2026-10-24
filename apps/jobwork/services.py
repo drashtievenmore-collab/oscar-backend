@@ -190,6 +190,10 @@ def validate_order_row(order, kind, data, instance=None):
         inward_no = values["inward_no"] or ""
         if inward_no:
             inward = next((i for i in live(order.inwards) if i.no == inward_no), None)
+            if inward is None and instance is not None and instance.inward_no == inward_no:
+                # Raised by a GRN QC disposition: inward_no is the GRN number,
+                # not an inward of this order. Status / date edits stay allowed.
+                return
             if inward is None:
                 raise ValidationFailed(
                     f"Inward receipt {inward_no} does not belong to this order.",
