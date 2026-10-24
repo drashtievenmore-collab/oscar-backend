@@ -26,11 +26,11 @@ from .services import BLOCKED_LOCATION_CODES
 ZERO = Decimal("0")
 
 #: A lot can be allocated only once QC has passed it into a godown.
-ALLOCATABLE_QC_STATUSES = ("Passed",)
+ALLOCATABLE_QC_STATUSES = ("Passed", "Pass")
 NON_ALLOCATABLE_STATUSES = (
     LotTaka.STATUS_EXTERNAL_WIP, LotTaka.STATUS_QC_HOLD, LotTaka.STATUS_REPROCESS,
     LotTaka.STATUS_SECOND_QUALITY, LotTaka.STATUS_REJECT, LotTaka.STATUS_SAMPLE,
-    LotTaka.STATUS_DISPATCHED, LotTaka.STATUS_FINISHED,
+    LotTaka.STATUS_DISPATCHED,
 )
 
 

@@ -265,6 +265,10 @@ def _touch(header, user):
         header.updated_by = user
         fields.append("updated_by")
     header.save(update_fields=fields)
+    project = getattr(header, "project", None)
+    if project:
+        from apps.pms.pipeline_services import sync_project_pipeline_stages
+        sync_project_pipeline_stages(project)
 
 
 

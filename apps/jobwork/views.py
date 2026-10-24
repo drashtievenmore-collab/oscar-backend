@@ -16,7 +16,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from apps.core.audit import snapshot
-from apps.core.exceptions import Conflict, NotFound
+from apps.core.exceptions import Conflict, NotFound, ValidationFailed
 from apps.core.money import D, ZERO, round4
 from apps.core.numbering import allocate_number
 from apps.core.permissions import HasModulePermission, require_permission
@@ -95,8 +95,71 @@ class ProcessPlanViewSet(TenantModelViewSet):
                 self.request.user, "approve_jobwork",
                 "Only an approver can create a Completed process plan.",
             )
+
+        # Strict stock & allocation validation (Example 2 compliance)
+        from apps.pms.models import Project
+        project = serializer.validated_data.get("project")
+        if not project and serializer.validated_data.get("project_id"):
+            project = Project.objects.filter(id=serializer.validated_data.get("project_id")).first()
+        client_id = self.get_client_id() or getattr(self.request.user, "client_id", None) or (project.client_id if project else None)
+        expected_qty = D(str(serializer.validated_data.get("expected_qty") or serializer.validated_data.get("planned_qty") or 0))
+        if project and expected_qty > ZERO:
+            from apps.inventory.models import GreyStockAllocation, LotTaka
+
+            allocs = GreyStockAllocation.objects.filter(
+                project=project,
+                status=GreyStockAllocation.STATUS_ACTIVE,
+                deleted_at__isnull=True,
+            )
+            if client_id:
+                allocs = allocs.filter(client_id=client_id)
+            total_allocated = sum((D(str(a.quantity or 0)) for a in allocs), ZERO)
+
+            existing_plans = ProcessPlan.objects.filter(
+                project=project,
+                deleted_at__isnull=True,
+            ).exclude(status="Cancelled")
+            if client_id:
+                existing_plans = existing_plans.filter(client_id=client_id)
+            already_planned = sum((D(str(p.expected_qty or 0)) for p in existing_plans), ZERO)
+
+            fabric_item_str = serializer.validated_data.get("fabric_item") or ""
+            usable_stock_qs = LotTaka.objects.filter(
+                deleted_at__isnull=True,
+                available_quantity__gt=0,
+                qc_status__in=("Passed", "Pass"),
+            ).exclude(status__in=("External WIP", "QC Hold", "Dispatched", "Reject", "Scrapped"))
+            if client_id:
+                usable_stock_qs = usable_stock_qs.filter(client_id=client_id)
+            if fabric_item_str:
+                usable_stock_qs = usable_stock_qs.filter(
+                    Q(item__name__icontains=fabric_item_str)
+                    | Q(fabric_quality__name__icontains=fabric_item_str)
+                    | Q(item__fabric_quality__icontains=fabric_item_str)
+                )
+            physical_available = sum((D(str(l.available_quantity or 0)) for l in usable_stock_qs), ZERO)
+
+            max_eligible = total_allocated if total_allocated > ZERO else physical_available
+
+            if (expected_qty + already_planned) > max_eligible and max_eligible > ZERO:
+                shortage = (expected_qty + already_planned) - max_eligible
+                raise ValidationFailed(
+                    f"Proposed processing quantity ({expected_qty:,.2f} M) exceeds eligible available stock "
+                    f"({max_eligible:,.2f} M). Actual Shortage: {shortage:,.2f} M.",
+                    code="STOCK_SHORTAGE",
+                    field_errors={"expected_qty": [f"Shortage of {shortage:,.2f} M. Only {max_eligible:,.2f} M eligible."]},
+                )
+            elif max_eligible <= ZERO and not allocs.exists() and physical_available <= ZERO:
+                raise ValidationFailed(
+                    f"No QC-passed eligible grey fabric available for processing {expected_qty:,.2f} M. "
+                    f"Actual Shortage: {expected_qty:,.2f} M.",
+                    code="INSUFFICIENT_STOCK",
+                    field_errors={"expected_qty": ["No physical stock or allocation available."]},
+                )
+
+        client_obj = getattr(self.request.user, "client", None) or (project.client if project else None)
         serializer.validated_data["plan_no"] = allocate_number(
-            self.request.user.client, "PP",
+            client_obj, "PP",
             serializer.validated_data.get("date"),
         )
         plan = super().perform_create(serializer)
@@ -105,7 +168,7 @@ class ProcessPlanViewSet(TenantModelViewSet):
             charge.pop("id", None)
             charge["amount"] = line_amount(charge)
             PlanCharge.objects.create(
-                client_id=self.get_client_id(), process_plan=plan, **charge
+                client_id=client_id, process_plan=plan, **charge
             )
         return plan
 

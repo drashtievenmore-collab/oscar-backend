@@ -5977,8 +5977,8 @@ class QCInspectionViewSet(TenantModelViewSet):
             qc_status_val = "Pass"
 
             if disp == "Pass":
-                status_val = "Finished" if lt.item and getattr(lt.item, "fabric_stage", "") == "Finished" else "Available"
-                qc_status_val = "Pass"
+                status_val = "Available"
+                qc_status_val = "Passed"
                 mov_type = "QC_PASS"
                 target_loc = Location.objects.filter(client_id=inspection.client_id, code="WH-MAIN").first() or Location.objects.filter(client_id=inspection.client_id, is_active=True).exclude(code__startswith="SYS-").first()
             elif disp == "Second Quality":

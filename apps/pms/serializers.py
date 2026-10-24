@@ -469,6 +469,7 @@ class ProjectDetailSerializer(ProjectListSerializer):
 
     def get_customerReturns(self, project):
         try:
+            import json
             from django.db.models import Q
             from apps.sales.models import SalesReturn, SalesOrder, SalesInvoice
 
@@ -497,7 +498,7 @@ class ProjectDetailSerializer(ProjectListSerializer):
                         client_id=project.client_id,
                         party_id=project.party_id,
                         deleted_at__isnull=True,
-                    ).select_related("party", "sales_invoice", "location").prefetch_related("line_items", "line_items__lot_taka")
+                    ).select_related("party", "sales_invoice", "sales_invoice__delivery_challan", "location").prefetch_related("line_items", "line_items__lot_taka")
                 else:
                     return []
             else:
@@ -505,13 +506,20 @@ class ProjectDetailSerializer(ProjectListSerializer):
                     SalesReturn.objects.filter(client_id=project.client_id)
                     .filter(q)
                     .filter(deleted_at__isnull=True)
-                    .select_related("party", "sales_invoice", "location")
+                    .select_related("party", "sales_invoice", "sales_invoice__delivery_challan", "location")
                     .prefetch_related("line_items", "line_items__lot_taka")
                     .distinct()
                 )
 
             result = []
             for ret in returns_qs:
+                meta = {}
+                if ret.notes:
+                    try:
+                        meta = json.loads(ret.notes)
+                    except Exception:
+                        meta = {}
+
                 lines = []
                 for line in ret.line_items.all():
                     lines.append({
@@ -524,24 +532,34 @@ class ProjectDetailSerializer(ProjectListSerializer):
                         "unitPrice": float(getattr(line, "unit_price", 0) or 0),
                         "lineTotal": float(getattr(line, "line_total", 0) or 0),
                     })
+                inv = ret.sales_invoice
+                dc = inv.delivery_challan if inv else None
                 result.append({
                     "id": str(ret.id),
                     "returnNumber": ret.return_number or f"RET-{ret.id}",
-                    "creditNoteNumber": ret.credit_note_number or "—",
+                    "creditNoteNumber": ret.credit_note_number or "",
+                    "creditNoteStatus": meta.get("credit_note_status") or ("Issued" if ret.credit_note_number else "Pending"),
                     "docDate": ret.doc_date.isoformat() if ret.doc_date else None,
                     "status": ret.status,
-                    "reason": ret.reason or "—",
-                    "totalAmount": float(ret.total_amount or 0),
-                    "invoiceNumber": ret.sales_invoice.invoice_number if ret.sales_invoice else "—",
+                    "returnStage": meta.get("return_stage") or ("ROUTED" if ret.status == "Posted" else "REQUESTED"),
+                    "reason": ret.reason or meta.get("return_reason") or "Fabric Damaged / Defective",
+                    "totalAmount": float(getattr(ret, "total", None) or getattr(ret, "total_amount", 0) or 0),
+                    "invoiceNumber": inv.invoice_number if inv else "-",
                     "invoiceId": str(ret.sales_invoice_id) if ret.sales_invoice_id else None,
+                    "deliveryChallanNumber": dc.challan_number if dc else "-",
                     "customerName": ret.party.name if ret.party else project.customer_name,
-                    "locationName": ret.location.name if ret.location else "—",
+                    "locationName": ret.location.name if ret.location else "Main Warehouse",
                     "totalReturnedQty": sum(l["returnedQty"] for l in lines),
+                    "requestedQty": float(meta.get("requested_qty") or sum(l["returnedQty"] for l in lines)),
+                    "receivedQty": float(meta.get("received_qty") or (sum(l["returnedQty"] for l in lines) if meta.get("return_stage") in ("RECEIVED_QC_PENDING", "QC_INSPECTED", "ROUTED") else 0.0)),
+                    "qcStatus": meta.get("qc_status") or "Pending Receipt",
+                    "stockDestination": meta.get("stock_destination") or "Pending Receipt",
                     "lines": lines,
                 })
             return result
         except Exception:
             return []
+
 
     def get_pipelineSummary(self, project):
         if self.context.get("pipeline_summary"):

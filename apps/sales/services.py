@@ -1008,7 +1008,7 @@ LOT_TRACKED = ("LOT", "TAKA")
 
 #: Only QC-passed takas may be sold.
 
-SELLABLE_LOT_QC = ("Passed",)
+SELLABLE_LOT_QC = ("Passed", "Pass")
 
 
 
