@@ -665,9 +665,14 @@ class SupplierDeliverySerializer(BaseModelSerializer):
     def get_fabricName(self, obj):
         po = obj.purchase_order
         if po:
-            fl = po.line_items.first()
-            if fl:
+            lines = list(po.line_items.all())
+            if not lines:
+                return None
+            if len(lines) == 1:
+                fl = lines[0]
                 return fl.item_name or (fl.item.name if fl.item else "Grey Fabric")
+            first_name = lines[0].item_name or (lines[0].item.name if lines[0].item else "Fabric")
+            return f"{first_name} (+{len(lines) - 1} more)"
         return None
 
     def get_orderedQty(self, obj):
