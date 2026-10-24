@@ -2679,6 +2679,8 @@ class QCDashboardView(APIView):
         }
 
         # Live inspection records (Purchase GRNs + Job Work Inwards)
+        from . import qc as qc_service
+
         records = []
         for r in receipts_qs.order_by("-receipt_date", "-created_at")[:30]:
             r_lines = list(r.lines.all())
@@ -2686,10 +2688,32 @@ class QCDashboardView(APIView):
             rec_qty = sum(float(l.weighed_qty or l.received_qty or 0) for l in r_lines)
             rej_qty = sum(float(l.rejected_qty or 0) for l in r_lines)
             is_pending = r.qc_status == "Pending"
-            is_good = r.qc_status == "Approved"
+            is_good = r.qc_status in ["Approved", "Partially Approved"]
             is_hold = r.qc_status == "On Hold"
             is_rep = r.qc_status in ["Rework", "Reprocess"]
             is_rej = r.qc_status == "Rejected" or rej_qty >= rec_qty
+
+            # Quantity still at QC Hold; a verdict can only move what is left.
+            awaiting = float(qc_service.pool_quantity(r))
+            can_dispose = awaiting > 0 or not qc_service.receipt_has_stock(r)
+
+            # dispose_receipt keeps the real split in qc_note (cumulative per
+            # category); use it instead of guessing from the status.
+            cumulative = (_qc_meta(r) or {}).get("cumulative")
+            if isinstance(cumulative, dict):
+                good_q = float(cumulative.get("good") or 0)
+                second_q = float(cumulative.get("second") or 0)
+                rep_q = float(cumulative.get("reprocess") or 0)
+                rej_q = float(cumulative.get("reject") or 0)
+                hold_q = awaiting if is_hold else 0.0
+                inspected_q = good_q + second_q + rep_q + rej_q + hold_q
+            else:
+                good_q = (rec_qty - rej_qty) if is_good else 0
+                second_q = 0.0
+                hold_q = (rec_qty - rej_qty) if is_hold else 0
+                rep_q = rec_qty if is_rep else 0
+                rej_q = rej_qty if not is_rej else rec_qty
+                inspected_q = rec_qty if not is_pending else 0
 
             records.append({
                 "id": r.grn_number,
@@ -2701,14 +2725,17 @@ class QCDashboardView(APIView):
                 "itemCode": line0.item.sku if line0 and line0.item else "—",
                 "itemName": line0.item.name if line0 and line0.item else "—",
                 "lotNo": line0.batch_number if line0 and line0.batch_number else None,
-                "takaRoll": len(r_lines) or 1,
+                "takaRoll": sum(int(l.roll_count or 0) for l in r_lines) or len(r_lines) or 1,
                 "received": rec_qty,
-                "inspected": rec_qty if not is_pending else 0,
-                "good": (rec_qty - rej_qty) if is_good else 0,
-                "hold": (rec_qty - rej_qty) if is_hold else 0,
-                "reprocess": rec_qty if is_rep else 0,
-                "rejected": rej_qty if not is_rej else rec_qty,
-                "status": "Completed" if is_good else ("On Hold" if is_hold else r.qc_status),
+                "inspected": inspected_q,
+                "good": good_q,
+                "second": second_q,
+                "hold": hold_q,
+                "reprocess": rep_q,
+                "rejected": rej_q,
+                "awaiting": awaiting,
+                "canDispose": can_dispose,
+                "status": "Completed" if r.qc_status == "Approved" else ("On Hold" if is_hold else r.qc_status),
                 "defectReason": _qc_remarks(r),
                 "inspector": r.qc_by.name if r.qc_by else None,
                 "uom": line0.uom if line0 and line0.uom else None,

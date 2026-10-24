@@ -531,6 +531,7 @@ class ContractSerializer(BaseModelSerializer):
     customerName = serializers.CharField(source="party.name", read_only=True)
     #: ``Expiring Soon`` / ``Expired`` derived from ``end_date`` (api.md §9.5).
     displayStatus = serializers.SerializerMethodField()
+    signedFileUrl = serializers.SerializerMethodField()
 
     class Meta:
         model = Contract
@@ -538,9 +539,18 @@ class ContractSerializer(BaseModelSerializer):
             "id", "contract_number", "title", "customerId", "customerName",
             "deal", "template_key", "contract_type", "value", "start_date",
             "end_date", "status", "displayStatus", "body", "description", "signed_file",
-            "signed_at", "expiring_soon_days", "created_at", "updated_at",
+            "signed_at", "esign_envelope_id", "esign_status", "esign_signer_email",
+            "esign_sent_at", "signedFileUrl", "expiring_soon_days", "created_at", "updated_at",
         ]
-        read_only_fields = ["contract_number", "created_at", "updated_at"]
+        read_only_fields = [
+            "contract_number", "esign_envelope_id", "esign_status",
+            "esign_signer_email", "esign_sent_at", "created_at", "updated_at",
+        ]
+
+    def get_signedFileUrl(self, contract):
+        from apps.core.files import public_url
+
+        return public_url(contract.signed_file, self.context.get("request"))
 
     def get_displayStatus(self, contract):
         from django.utils import timezone
