@@ -10,6 +10,7 @@ The three interlocking pieces db.md §11 calls out:
   - payroll ports ``salaryCalculations.js`` verbatim, and freezes the result on
     the payslip so a later attendance edit cannot silently restate a paid month
 """
+import re
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
@@ -268,6 +269,55 @@ def attendance_summary(client_id, *, month=None, employee_id=None, department_id
 # ---------------------------------------------------------------------------
 # Leave (api.md §11.3)
 # ---------------------------------------------------------------------------
+#: The standard leave types, created on first use for a tenant that has not
+#: configured any yet: ``(name, annual_entitlement, accrual, is_paid)``.
+DEFAULT_LEAVE_TYPES = (
+    ("Casual Leave", "12", "Yearly", True),
+    ("Sick Leave", "8", "Yearly", True),
+    ("Earned Leave", "18", "Monthly", True),
+    ("Loss of Pay", "0", "None", False),
+)
+
+#: Other spellings the screens use for the defaults above.
+LEAVE_TYPE_ALIASES = {
+    "earned / privilege leave": "Earned Leave",
+    "privilege leave": "Earned Leave",
+    "unpaid leave": "Loss of Pay",
+}
+
+
+def resolve_leave_type(client_id, name):
+    """The tenant's leave type called ``name`` (or its code), else ``None``.
+
+    A standard type (see ``DEFAULT_LEAVE_TYPES``) the tenant has not set up
+    yet is created on first use, so self-service leave works before HR has
+    configured the leave master.
+    """
+    from .models import LeaveType
+
+    label = re.sub(r"\s*\(half day\)\s*$", "", str(name or ""), flags=re.I).strip()
+    if not label:
+        return None
+    label = LEAVE_TYPE_ALIASES.get(label.lower(), label)
+
+    live = LeaveType.objects.filter(client_id=client_id, deleted_at__isnull=True)
+    found = live.filter(Q(name__iexact=label) | Q(code__iexact=label)).first()
+    if found:
+        return found
+
+    for default_name, entitlement, accrual, paid in DEFAULT_LEAVE_TYPES:
+        if default_name.lower() == label.lower():
+            return LeaveType.objects.create(
+                client_id=client_id,
+                name=default_name,
+                annual_entitlement=Decimal(entitlement),
+                accrual=accrual,
+                is_paid=paid,
+                carry_forward_cap=Decimal("10") if accrual != "None" else None,
+            )
+    return None
+
+
 def assert_no_overlap(leave_request):
     """db.md §11.3 -- overlapping live requests for the same employee are rejected."""
     clash = LeaveRequest.objects.filter(

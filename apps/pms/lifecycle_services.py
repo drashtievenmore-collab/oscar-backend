@@ -685,6 +685,24 @@ def project_flow_lifecycle(po=None, instruction=None):
     }
 
 
+def project_production_instructions(project):
+    """Every production instruction of a project: raised on the project code, or
+    on one of its Vendor A Production POs (the same reach as
+    ``project_flow_lifecycles``)."""
+    references = [project.code] + [
+        po.po_number for po in project_production_purchase_orders(project) if po.po_number
+    ]
+    return (
+        ProductionInstruction.objects.filter(
+            client_id=project.client_id,
+            order_reference__in=references,
+            deleted_at__isnull=True,
+        )
+        .select_related("employee")
+        .order_by("-created_at")
+    )
+
+
 def project_flow_lifecycles(project):
     """Every production run of a project: each Vendor A Production PO (with its
     instruction), plus any instruction raised directly on the project code."""

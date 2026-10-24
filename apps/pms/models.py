@@ -426,6 +426,37 @@ class ProofShare(TenantModel):
         ordering = ["-created_at"]
 
 
+class ProductionEntryLink(TenantModel):
+    """Backs ``/production-entry/:token`` -- daily production entry outside the
+    app shell, scoped to one project's production instructions.
+
+    Unlike ``ProofShare`` the token is kept, not hashed: it is a standing link
+    the production team re-copies onto the shop floor, so it must be showable
+    again. Regenerating revokes the old row and issues a new token.
+    """
+
+    STATUSES = [("Active", "Active"), ("Revoked", "Revoked")]
+
+    project = models.ForeignKey(
+        Project, on_delete=models.CASCADE, related_name="production_links"
+    )
+    token = models.TextField(unique=True)
+    status = models.TextField(choices=STATUSES, default="Active")
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pms_production_entry_links"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project"],
+                condition=models.Q(status="Active", deleted_at__isnull=True),
+                name="uq_pms_production_link_active",
+            )
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Delays and activity (db.md §10.5)
 # ---------------------------------------------------------------------------

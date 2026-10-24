@@ -1,4 +1,6 @@
 """HRMS serializers (api.md §11)."""
+import re
+
 from rest_framework import serializers
 
 from apps.core.serializers import (
@@ -268,6 +270,27 @@ class RegularizationSerializer(BaseModelSerializer):
         ]
         read_only_fields = ["approver", "decided_at", "created_at"]
 
+    #: ``09:00`` / ``09:00:00`` -- a bare clock time on the request's own date.
+    _TIME_ONLY = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
+
+    def to_internal_value(self, data):
+        """Accept ``requestedCheckIn: "09:00"`` as well as a full datetime.
+
+        The self-service forms collect a clock time for the day being
+        regularized; it is pinned to ``date`` here so it parses as a datetime.
+        """
+        day = data.get("date") if hasattr(data, "get") else None
+        if day:
+            patched = None
+            for key in ("requestedCheckIn", "requestedCheckOut"):
+                value = data.get(key)
+                if isinstance(value, str) and self._TIME_ONLY.match(value.strip()):
+                    patched = patched or (data.copy() if hasattr(data, "copy") else dict(data))
+                    patched[key] = f"{day}T{value.strip()}"
+            if patched is not None:
+                data = patched
+        return super().to_internal_value(data)
+
 
 # ---------------------------------------------------------------------------
 # Leave (api.md §11.3)
@@ -289,7 +312,11 @@ class LeaveRequestSerializer(BaseModelSerializer):
     employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
     type = serializers.CharField(source="leave_type.name", read_only=True)
     leaveTypeId = TenantPrimaryKeyRelatedField(
-        source="leave_type", model="hrms.LeaveType"
+        source="leave_type", model="hrms.LeaveType", required=False, allow_null=True
+    )
+    #: Write-only alternative to ``leaveTypeId``: the leave type's name or code.
+    leaveTypeName = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, allow_null=True
     )
     fromDate = serializers.DateField(source="from_date")
     toDate = serializers.DateField(source="to_date")
@@ -302,8 +329,8 @@ class LeaveRequestSerializer(BaseModelSerializer):
         model = LeaveRequest
         fields = [
             "id", "employeeId", "employeeName", "employeeCode", "type",
-            "leaveTypeId", "fromDate", "toDate", "days", "reason", "delegateId",
-            "delegate_confirmed_at", "status", "approver", "decided_at",
+            "leaveTypeId", "leaveTypeName", "fromDate", "toDate", "days", "reason",
+            "delegateId", "delegate_confirmed_at", "status", "approver", "decided_at",
             "remark", "created_at", "updated_at",
         ]
         read_only_fields = [
@@ -316,6 +343,25 @@ class LeaveRequestSerializer(BaseModelSerializer):
         end = attrs.get("to_date") or getattr(self.instance, "to_date", None)
         if start and end and end < start:
             raise serializers.ValidationError({"toDate": ["Must be on or after the start date."]})
+
+        type_name = attrs.pop("leaveTypeName", None)
+        if self.instance is None:
+            request = self.context.get("request")
+            client_id = getattr(request, "client_id", None) or getattr(
+                getattr(request, "user", None), "client_id", None
+            )
+            if not attrs.get("leave_type"):
+                leave_type = services.resolve_leave_type(client_id, type_name)
+                if leave_type is None:
+                    raise serializers.ValidationError({"leaveTypeId": [
+                        f"No leave type named \"{type_name}\" is set up."
+                        if type_name else "This field is required."
+                    ]})
+                attrs["leave_type"] = leave_type
+            if "days" not in attrs and start and end:
+                attrs["days"] = len(services.working_days_in(client_id, start, end)) or (
+                    (end - start).days + 1
+                )
         return attrs
 
 

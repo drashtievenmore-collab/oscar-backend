@@ -33,6 +33,7 @@ from .models import (
     Delay,
     Department,
     Document,
+    ProductionEntryLink,
     Project,
     ProjectStage,
     ProofShare,
@@ -445,6 +446,8 @@ class ProjectViewSet(TenantModelViewSet):
         "write": ["create_pms_project"],
         "complete": ["complete_project"],
         "apply_stage_template": ["assign_stage"],
+        # Production permissions are checked per method inside the action.
+        "production_link": ["view_pms"],
     }
     #: The UI uses ``code`` in URLs, so both a uuid and a code resolve.
     lookup_value_regex = "[^/]+"
@@ -5475,6 +5478,79 @@ class ProjectViewSet(TenantModelViewSet):
             },
             status=status.HTTP_201_CREATED,
         )
+
+    # -- daily production entry link ----------------------------------------
+    @action(detail=True, methods=["get", "post", "delete"], url_path="production-link")
+    def production_link(self, request, pk=None):
+        """The project's shareable daily-production link.
+
+        ``GET`` returns the active link (or ``null``), ``POST`` issues one --
+        ``{ regenerate: true }`` replaces the current token -- and ``DELETE``
+        revokes it. Anyone holding the link can record production against this
+        project's instructions, so issuing and revoking need ``verify_production``.
+        """
+        from apps.core.permissions import require_permission
+
+        project = self.get_object()
+        active = ProductionEntryLink.objects.filter(
+            client_id=request.client_id, project=project, status="Active",
+            deleted_at__isnull=True,
+        ).first()
+
+        if request.method == "GET":
+            require_permission(request.user, "view_production")
+            return Response({"link": _production_link_payload(active)})
+
+        require_permission(request.user, "verify_production")
+        with transaction.atomic():
+            if active is not None and (
+                request.method == "DELETE" or request.data.get("regenerate")
+            ):
+                active.status = "Revoked"
+                active.revoked_at = timezone.now()
+                active.save(update_fields=["status", "revoked_at", "updated_at"])
+                record_audit(
+                    client=request.client_id, actor=request.user,
+                    action="PRODUCTION_LINK_REVOKED", entity_type="PmsProject",
+                    entity_id=project.id, entity_label=project.code,
+                    description="Daily production entry link revoked",
+                )
+                active = None
+
+            if request.method == "DELETE":
+                return Response({"link": None})
+
+            created = active is None
+            if created:
+                active = ProductionEntryLink.objects.create(
+                    client_id=request.client_id,
+                    project=project,
+                    token=secrets.token_urlsafe(24),
+                    created_by=request.user,
+                )
+                record_audit(
+                    client=request.client_id, actor=request.user,
+                    action="PRODUCTION_LINK_ISSUED", entity_type="PmsProject",
+                    entity_id=project.id, entity_label=project.code,
+                    description="Daily production entry link issued",
+                )
+        return Response(
+            {"link": _production_link_payload(active)},
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+def _production_link_payload(link):
+    if link is None:
+        return None
+    return {
+        "id": str(link.id),
+        "token": link.token,
+        "url": f"/production-entry/{link.token}",
+        "status": link.status,
+        "createdAt": link.created_at,
+        "lastUsedAt": link.last_used_at,
+    }
 
 
 @transaction.atomic
