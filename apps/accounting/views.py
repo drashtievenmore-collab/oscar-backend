@@ -490,7 +490,7 @@ class FinancialReportView(APIView):
         if report_key == "overdue-summary":
             return Response(reports.salesperson_broker_overdue_view(request.client_id, as_of=as_of))
         if report_key == "sub-ledgers":
-            return Response(reports.sub_ledger_summary(request.client_id, ledger_type=params.get("type", "jobwork"), as_of=as_of))
+            return Response(reports.sub_ledger_summary(request.client_id, ledger_type=params.get("ledger_type") or params.get("type") or "jobwork", as_of=as_of))
 
         return Response(
             reports.ageing(

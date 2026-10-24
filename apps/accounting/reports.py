@@ -684,22 +684,22 @@ def sub_ledger_summary(client_id, ledger_type="jobwork", as_of=None):
 
     else:  # jobwork
         from apps.jobwork.models import JobWorkOrder
-        from apps.masters.models import Party
-        processors = Party.objects.filter(client_id=client_id, type__in=["Vendor", "Both"], deleted_at__isnull=True)
-        jwos = JobWorkOrder.objects.filter(client_id=client_id, deleted_at__isnull=True)
+        jwos = JobWorkOrder.objects.filter(
+            client_id=client_id, deleted_at__isnull=True
+        ).exclude(status="Draft").select_related("vendor")
         by_processor = {}
-        for proc in processors:
-            proc_jwos = [j for j in jwos if str(j.processor_id) == str(proc.id)]
-            total_orders = len(proc_jwos)
-            if total_orders == 0:
-                continue
-            total_val = sum((D(j.rate) * D(j.sent_meter) for j in proc_jwos), ZERO)
-            by_processor[str(proc.id)] = {
-                "id": str(proc.id),
-                "name": proc.name,
-                "orderCount": total_orders,
-                "totalValue": float(round2(total_val)),
-                "balance": float(round2(total_val)),
-            }
+        for jwo in jwos:
+            key = str(jwo.vendor_id) if jwo.vendor_id else f"name:{jwo.vendor_name or 'Unassigned'}"
+            group = by_processor.setdefault(key, {
+                "id": key,
+                "name": jwo.vendor.name if jwo.vendor_id else (jwo.vendor_name or "Unassigned"),
+                "orderCount": 0,
+                "totalValue": ZERO,
+            })
+            group["orderCount"] += 1
+            group["totalValue"] += D(jwo.total_amount) or D(jwo.rate) * D(jwo.planned_qty)
+        for group in by_processor.values():
+            group["totalValue"] = float(round2(group["totalValue"]))
+            group["balance"] = group["totalValue"]
         return {"ledgerType": "jobwork", "rows": list(by_processor.values())}
 
