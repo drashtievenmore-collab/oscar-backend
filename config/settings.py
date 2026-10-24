@@ -339,3 +339,18 @@ EINVOICE_CLIENT_ID = env("EINVOICE_CLIENT_ID", "")
 EINVOICE_CLIENT_SECRET = env("EINVOICE_CLIENT_SECRET", "")
 EINVOICE_USERNAME = env("EINVOICE_USERNAME", "")
 EINVOICE_PASSWORD = env("EINVOICE_PASSWORD", "")
+
+
+# --------------------------------------------------------------------------
+# E-signature: DocuSign (CRM contracts, POST /crm/contracts/{id}/send-for-signature/)
+# --------------------------------------------------------------------------
+# JWT Grant auth. Leave DOCUSIGN_INTEGRATION_KEY empty and the endpoint fails
+# with ESIGN_NOT_CONFIGURED instead of pretending to send.
+# Sandbox defaults; production uses account.docusign.com and the account's
+# own base URI (e.g. https://na3.docusign.net/restapi).
+DOCUSIGN_INTEGRATION_KEY = env("DOCUSIGN_INTEGRATION_KEY", "")
+DOCUSIGN_USER_ID = env("DOCUSIGN_USER_ID", "")
+DOCUSIGN_ACCOUNT_ID = env("DOCUSIGN_ACCOUNT_ID", "")
+DOCUSIGN_PRIVATE_KEY_PATH = env("DOCUSIGN_PRIVATE_KEY_PATH", "")
+DOCUSIGN_AUTH_SERVER = env("DOCUSIGN_AUTH_SERVER", "account-d.docusign.com")
+DOCUSIGN_BASE_URL = env("DOCUSIGN_BASE_URL", "https://demo.docusign.net/restapi")

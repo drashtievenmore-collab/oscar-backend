@@ -1426,13 +1426,99 @@ class ContractViewSet(TenantModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="send-for-signature")
     def send_for_signature(self, request, pk=None):
-        from apps.core.printing import PdfNotAvailable
+        """Send the contract to the customer through DocuSign (apps/crm/esign.py).
 
-        self.get_object()
-        raise PdfNotAvailable(
-            "E-signature is not configured on this workspace.",
-            code="ESIGN_NOT_CONFIGURED",
+        Body (all optional): ``signerEmail``, ``signerName``, ``message``.
+        Defaults to the party's email and name.
+        """
+        from apps.core.audit import record_audit
+        from apps.core.printing import company_payload
+
+        from . import esign
+
+        contract = self.get_object()
+        if contract.esign_status in ("sent", "delivered"):
+            raise Conflict(
+                "This contract is already out for signature.", code="ESIGN_ALREADY_SENT"
+            )
+        if contract.esign_status == "completed":
+            raise Conflict(
+                "This contract has already been signed.", code="ESIGN_ALREADY_SIGNED"
+            )
+        party = contract.party
+        signer_email = (request.data.get("signerEmail") or party.email or "").strip()
+        signer_name = (request.data.get("signerName") or party.name or "").strip()
+        if not signer_email:
+            raise ValidationFailed(
+                f"Add an email address to {party.name} before sending for signature.",
+                field_errors={"signerEmail": ["Required."]},
+            )
+        if not esign.is_configured():
+            raise esign.ESignNotConfigured()
+
+        pdf = esign.build_contract_pdf(contract, company_payload(contract.client_id, request))
+        result = esign.create_envelope(
+            pdf_bytes=pdf,
+            file_name=f"{contract.contract_number}.pdf",
+            subject=f"Please sign: {contract.title or contract.contract_number}",
+            signer_email=signer_email,
+            signer_name=signer_name,
+            message=request.data.get("message"),
         )
+        contract.esign_envelope_id = result["envelopeId"]
+        contract.esign_status = result.get("status") or "sent"
+        contract.esign_signer_email = signer_email
+        contract.esign_sent_at = timezone.now()
+        contract.save(update_fields=[
+            "esign_envelope_id", "esign_status", "esign_signer_email", "esign_sent_at", "updated_at",
+        ])
+        record_audit(
+            client=contract.client_id,
+            actor=request.user,
+            action="send",
+            entity_type=self.audit_entity_type,
+            entity_id=contract.id,
+            entity_label=contract.contract_number,
+            description=f"Sent for signature to {signer_email} (DocuSign)",
+            after={"envelopeId": contract.esign_envelope_id, "signerEmail": signer_email},
+        )
+        return Response(self.get_serializer(contract).data)
+
+    @action(detail=True, methods=["get"], url_path="signature-status")
+    def signature_status(self, request, pk=None):
+        """Poll DocuSign; on ``completed`` store the signed PDF as ``signed_file``."""
+        from apps.core import files as file_service
+        from apps.core.models import File
+
+        from . import esign
+
+        contract = self.get_object()
+        if not contract.esign_envelope_id or contract.esign_status in ("completed", "declined", "voided"):
+            return Response(self.get_serializer(contract).data)
+
+        envelope = esign.envelope_status(contract.esign_envelope_id)
+        new_status = envelope.get("status") or contract.esign_status
+        fields = ["esign_status", "updated_at"]
+        if new_status == "completed" and not contract.signed_file_id:
+            pdf = esign.download_signed(contract.esign_envelope_id)
+            file_name = f"{contract.contract_number}-signed.pdf"
+            storage_key = file_service.build_storage_key(contract.client_id, "contract", file_name)
+            file_service.write_bytes(storage_key, pdf)
+            contract.signed_file = File.objects.create(
+                client_id=contract.client_id,
+                scope="contract",
+                storage_key=storage_key,
+                file_name=file_name,
+                content_type="application/pdf",
+                file_size=len(pdf),
+                status="committed",
+                committed_at=timezone.now(),
+            )
+            contract.signed_at = timezone.now()
+            fields += ["signed_file", "signed_at"]
+        contract.esign_status = new_status
+        contract.save(update_fields=fields)
+        return Response(self.get_serializer(contract).data)
 
 
 class CrmProjectViewSet(TenantModelViewSet):

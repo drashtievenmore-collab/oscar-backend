@@ -655,6 +655,12 @@ class Contract(TenantModel, LegacyIdMixin):
         "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     signed_at = models.DateTimeField(null=True, blank=True)
+    #: DocuSign envelope (apps/crm/esign.py). ``esign_status`` mirrors the
+    #: envelope status: sent / delivered / completed / declined / voided.
+    esign_envelope_id = models.TextField(null=True, blank=True)
+    esign_status = models.TextField(null=True, blank=True)
+    esign_signer_email = models.TextField(null=True, blank=True)
+    esign_sent_at = models.DateTimeField(null=True, blank=True)
     expiring_soon_days = models.IntegerField(default=30)
 
     class Meta:
