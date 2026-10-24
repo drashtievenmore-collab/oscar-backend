@@ -52,6 +52,75 @@ DEFAULT_FLEXIBILITY = {
 }
 
 
+#: The Flexibility screen edits these labels ("10 minutes", "09:10",
+#: "09:00 - 18:00 (Flexible)"); the attendance engine reads the numeric keys in
+#: DEFAULT_FLEXIBILITY. ``normalize_flexibility`` keeps the two in step.
+SCREEN_FLEXIBILITY_KEYS = (
+    "gracePeriod", "lateAfter", "halfDayThreshold", "minimumWorkingHours",
+    "flexibleWorkingHours", "overtimeStartsAfter",
+)
+
+
+def _number_in(value, fallback=None):
+    match = re.search(r"\d+(?:\.\d+)?", str(value or ""))
+    return Decimal(match.group(0)) if match else fallback
+
+
+def _clocks_in(value):
+    return re.findall(r"\b(\d{1,2}:\d{2})\b", str(value or ""))
+
+
+def _shift_clock(clock, minutes):
+    parsed = _parse_time(clock, time(9, 30))
+    moved = datetime.combine(date.today(), parsed) + timedelta(minutes=minutes)
+    return moved.strftime("%H:%M")
+
+
+def normalize_flexibility(policy, *, screen_wins=False):
+    """Fill the engine keys from the screen labels (or the reverse).
+
+    ``screen_wins`` is set when the Flexibility page saved, so what HR typed is
+    what the engine uses; otherwise missing labels are derived from the engine
+    keys so the page opens showing the policy actually in force.
+    """
+    policy = dict(policy)
+    if screen_wins:
+        grace = _number_in(policy.get("gracePeriod"))
+        if grace is not None:
+            policy["graceMinutes"] = int(grace)
+        clocks = _clocks_in(policy.get("flexibleWorkingHours"))
+        if clocks:
+            policy["shiftStart"] = clocks[0].zfill(5)
+            if len(clocks) > 1:
+                policy["shiftEnd"] = clocks[1].zfill(5)
+        elif _clocks_in(policy.get("lateAfter")):
+            late_after = _clocks_in(policy.get("lateAfter"))[0]
+            policy["shiftStart"] = _shift_clock(late_after, -int(policy.get("graceMinutes") or 0))
+        half = _number_in(policy.get("halfDayThreshold"))
+        if half is not None:
+            policy["halfDayThresholdHours"] = float(half)
+        full = _number_in(policy.get("minimumWorkingHours"))
+        if full is not None:
+            policy["fullDayHours"] = float(full)
+        overtime = _number_in(policy.get("overtimeStartsAfter"))
+        if overtime is not None:
+            policy["overtimeAfterHours"] = float(overtime)
+
+    grace = int(policy.get("graceMinutes") or 0)
+    policy.setdefault("overtimeAfterHours", policy.get("fullDayHours") or 8)
+    policy["lateAfter"] = _shift_clock(policy.get("shiftStart"), grace)
+    policy.setdefault("gracePeriod", f"{grace} minutes")
+    policy.setdefault("halfDayThreshold", f"{policy.get('halfDayThresholdHours')} hours")
+    policy.setdefault("minimumWorkingHours", f"{policy.get('fullDayHours')} hours")
+    policy.setdefault(
+        "flexibleWorkingHours", f"{policy.get('shiftStart')} - {policy.get('shiftEnd')} (Flexible)"
+    )
+    policy.setdefault("overtimeStartsAfter", f"{policy.get('overtimeAfterHours')} hours")
+    policy.setdefault("earlyClockOutRequiresApproval", True)
+    policy.setdefault("overtimeRequiresApproval", True)
+    return policy
+
+
 def flexibility_policy(client_id):
     from apps.core.models import Setting
 
@@ -59,7 +128,7 @@ def flexibility_policy(client_id):
     policy = dict(DEFAULT_FLEXIBILITY)
     if row and isinstance(row.value, dict):
         policy.update(row.value)
-    return policy
+    return normalize_flexibility(policy)
 
 
 def _parse_time(value, fallback):
@@ -68,6 +137,74 @@ def _parse_time(value, fallback):
         return time(int(hour), int(minute))
     except (ValueError, AttributeError):
         return fallback
+
+
+def parse_clock_on(work_date, value):
+    """``"09:30"`` / ``"9:30 AM"`` / an ISO datetime -> an aware datetime.
+
+    The register screens send wall-clock times beside a date; ``None`` for a
+    blank or placeholder (``—``) value.
+    """
+    if value in (None, "", "—", "-"):
+        return None
+    if isinstance(value, datetime):
+        return value if timezone.is_aware(value) else timezone.make_aware(value)
+    text = str(value).strip()
+    if "T" in text:
+        from django.utils.dateparse import parse_datetime
+
+        parsed = parse_datetime(text.replace("Z", "+00:00"))
+        if parsed is None:
+            return None
+        return parsed if timezone.is_aware(parsed) else timezone.make_aware(parsed)
+    match = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?\s*([AaPp][Mm])?$", text)
+    if not match:
+        raise ValidationFailed(
+            f"'{text}' is not a time.", field_errors={"checkIn": ["Use HH:MM."]}
+        )
+    hour, minute, meridiem = int(match.group(1)), int(match.group(2)), match.group(3)
+    if meridiem:
+        hour = hour % 12 + (12 if meridiem.lower() == "pm" else 0)
+    if isinstance(work_date, str):
+        work_date = date.fromisoformat(work_date[:10])
+    return timezone.make_aware(datetime.combine(work_date, time(hour, minute)))
+
+
+# ---------------------------------------------------------------------------
+# Who counts as staff
+# ---------------------------------------------------------------------------
+#: Logins that run the system rather than work in it. Administration links every
+#: login to an HR record (so the owner can punch in), but these people are not
+#: part of the workforce: they stay out of the Employee, Attendance, Leave and
+#: Payroll lists.
+ADMIN_ROLE_CODES = ("OWNER", "SYS_ADMIN", "AD", "SUPER_ADMIN", "ADMIN")
+ADMIN_ROLE_NAMES = ("admin", "administrator", "system administrator", "super admin",
+                    "owner / management", "owner")
+EXITED_EMPLOYEE_STATUSES = ("Resigned", "Terminated")
+
+
+def admin_employee_ids(client_id):
+    """Employee rows that only exist because an administrator's login is linked."""
+    from apps.accounts.models import User
+
+    admins = User.objects.filter(
+        client_id=client_id, deleted_at__isnull=True, employee_id__isnull=False
+    ).filter(
+        Q(is_superuser=True)
+        | Q(role__code__in=ADMIN_ROLE_CODES)
+        | Q(role__name__iregex=r"^(%s)$" % "|".join(re.escape(n) for n in ADMIN_ROLE_NAMES))
+    )
+    return set(admins.values_list("employee_id", flat=True))
+
+
+def workforce(client_id, queryset=None, *, include_exited=True):
+    """The tenant's employees, without administrator-only records."""
+    if queryset is None:
+        queryset = Employee.objects.filter(client_id=client_id, deleted_at__isnull=True)
+    queryset = queryset.exclude(id__in=admin_employee_ids(client_id))
+    if not include_exited:
+        queryset = queryset.exclude(status__in=EXITED_EMPLOYEE_STATUSES)
+    return queryset
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +221,7 @@ def derive_attendance(client_id, *, check_in, check_out, submitted_status=None):
         return submitted_status, None
 
     if check_in is None:
+        # Marking someone Present without times is a deliberate manual call.
         return submitted_status or "Absent", None
 
     hours = None
@@ -96,8 +234,8 @@ def derive_attendance(client_id, *, check_in, check_out, submitted_status=None):
                 field_errors={"checkOut": ["Must be after check-in."]},
             )
 
-    if submitted_status == "WFH":
-        return "WFH", hours
+    if submitted_status in ("WFH", "Half Day"):
+        return submitted_status, hours
 
     policy = flexibility_policy(client_id)
     shift_start = _parse_time(policy.get("shiftStart"), time(9, 30))
@@ -219,9 +357,235 @@ def working_days_in(client_id, start, end, location_id=None):
     return days
 
 
+def _overtime_hours(hours, policy):
+    if hours is None:
+        return Decimal("0")
+    threshold = Decimal(str(policy.get("overtimeAfterHours") or policy.get("fullDayHours") or 8))
+    return max(Decimal("0"), round(D(hours) - threshold, 2))
+
+
+def _iso(value):
+    return value.isoformat() if value else None
+
+
+def _attendance_row_payload(row, policy):
+    leave_request = row.leave_request if row.leave_request_id else None
+    return {
+        "attendanceId": str(row.id),
+        "status": row.status,
+        "checkIn": _iso(row.check_in),
+        "checkOut": _iso(row.check_out),
+        "hours": float(row.hours) if row.hours is not None else None,
+        "overtimeHours": float(_overtime_hours(row.hours, policy)),
+        "source": row.source,
+        "remark": row.remark or "",
+        "leaveType": leave_request.leave_type.name if leave_request else None,
+        "leavePaid": leave_request.leave_type.is_paid if leave_request else None,
+    }
+
+
+def _employee_payload(employee):
+    return {
+        "employeeId": str(employee.id),
+        "employeeCode": employee.employee_code,
+        "name": employee.name,
+        "email": employee.email or "",
+        "avatar": employee.avatar_url or "",
+        "department": employee.department.name if employee.department_id else "",
+        "designation": employee.designation.name if employee.designation_id else "",
+        "location": employee.location.name if employee.location_id else "",
+        "shift": employee.shift or "General",
+        "employmentType": employee.employment_type or "Full-time",
+        "employeeStatus": employee.status,
+    }
+
+
+def daily_attendance(client_id, work_date, *, department=None):
+    """``GET /hrms/attendance/daily/?date=`` -- every employee on one day.
+
+    The register screens (Overview, Mark, Bulk) start from the workforce, not
+    from whatever rows exist: an employee with no row is "Not Marked" on a
+    working day, "Holiday" / "Week Off" otherwise.
+    """
+    policy = flexibility_policy(client_id)
+    rows = {
+        row.employee_id: row
+        for row in Attendance.objects.filter(
+            client_id=client_id, work_date=work_date, deleted_at__isnull=True
+        ).select_related("leave_request__leave_type")
+    }
+    employees = (
+        workforce(client_id)
+        .filter(Q(joining_date__lte=work_date) | Q(joining_date__isnull=True))
+        .select_related("department", "designation", "location")
+        .order_by("name")
+    )
+    if department:
+        employees = employees.filter(department__name__iexact=department)
+
+    holiday = Holiday.objects.filter(
+        client_id=client_id, date=work_date, deleted_at__isnull=True
+    ).first()
+    is_working = bool(working_days_in(client_id, work_date, work_date))
+    default_status = "Holiday" if holiday else ("Not Marked" if is_working else "Week Off")
+
+    out = []
+    for employee in employees:
+        row = rows.get(employee.id)
+        # Someone who has left only shows on days they actually have a record.
+        if row is None and employee.status in EXITED_EMPLOYEE_STATUSES:
+            continue
+        item = _employee_payload(employee)
+        if row is not None:
+            item.update(_attendance_row_payload(row, policy))
+            item["marked"] = True
+        else:
+            item.update({
+                "attendanceId": None, "status": default_status, "checkIn": None,
+                "checkOut": None, "hours": None, "overtimeHours": 0.0, "source": None,
+                "remark": "", "leaveType": None, "leavePaid": None, "marked": False,
+            })
+        out.append(item)
+
+    count = lambda status: sum(1 for item in out if item["status"] == status)  # noqa: E731
+    present_like = count("Present") + count("Late") + count("WFH") + count("Half Day")
+    summary = {
+        "total": len(out),
+        "present": count("Present"),
+        "late": count("Late"),
+        "absent": count("Absent"),
+        "halfDay": count("Half Day"),
+        "wfh": count("WFH"),
+        "onLeave": count("On Leave"),
+        "notMarked": count("Not Marked"),
+        "attendancePct": round(present_like * 100 / len(out)) if out else 0,
+        "overtimeHours": round(sum(item["overtimeHours"] or 0 for item in out), 2),
+    }
+    return {
+        "date": work_date.isoformat(),
+        "isWorkingDay": is_working and holiday is None,
+        "holiday": holiday.name if holiday else None,
+        "graceMinutes": int(policy.get("graceMinutes") or 0),
+        "shiftStart": policy.get("shiftStart"),
+        "shiftEnd": policy.get("shiftEnd"),
+        "summary": summary,
+        "results": out,
+    }
+
+
+def monthly_attendance(client_id, employee, month):
+    """``GET /hrms/attendance/individual/{id}/?month=YYYY-MM`` -- one calendar month.
+
+    Every day of the month with its verdict, plus the counts payroll will use,
+    so HR sees exactly what the payslip is built from.
+    """
+    policy = flexibility_policy(client_id)
+    first = month.replace(day=1)
+    last = _month_end(first)
+    today = timezone.localdate()
+    rows = {
+        row.work_date: row
+        for row in Attendance.objects.filter(
+            client_id=client_id, employee=employee, deleted_at__isnull=True,
+            work_date__gte=first, work_date__lte=last,
+        ).select_related("leave_request__leave_type")
+    }
+    working = set(working_days_in(client_id, first, last))
+    holidays = {
+        h.date: h.name
+        for h in Holiday.objects.filter(
+            client_id=client_id, deleted_at__isnull=True, date__gte=first, date__lte=last
+        )
+    }
+
+    days = []
+    current = first
+    while current <= last:
+        row = rows.get(current)
+        day = {"date": current.isoformat(), "weekday": current.strftime("%a"),
+               "isWorkingDay": current in working, "holiday": holidays.get(current)}
+        if row is not None:
+            day.update(_attendance_row_payload(row, policy))
+        else:
+            if current in holidays:
+                status_label = "Holiday"
+            elif current not in working:
+                status_label = "Week Off"
+            elif current > today or (employee.joining_date and current < employee.joining_date):
+                status_label = "Upcoming" if current > today else "Not Joined"
+            else:
+                status_label = "Not Marked"
+            day.update({"attendanceId": None, "status": status_label, "checkIn": None,
+                        "checkOut": None, "hours": None, "overtimeHours": 0.0,
+                        "source": None, "remark": "", "leaveType": None, "leavePaid": None})
+        days.append(day)
+        current += timedelta(days=1)
+
+    counts = attendance_counts(client_id, employee, first, last)
+    total_hours = sum((D(r.hours) for r in rows.values() if r.hours is not None), Decimal("0"))
+    overtime = sum((_overtime_hours(r.hours, policy) for r in rows.values()), Decimal("0"))
+    return {
+        "employee": _employee_payload(employee),
+        "month": first.strftime("%Y-%m"),
+        "days": days,
+        "summary": {
+            **{k: float(v) for k, v in counts.items()},
+            "workingDays": len(working),
+            "totalHours": float(round(total_hours, 2)),
+            "overtimeHours": float(round(overtime, 2)),
+            "notMarked": sum(1 for d in days if d["status"] == "Not Marked"),
+        },
+    }
+
+
+def attendance_counts(client_id, employee, start, end):
+    """The day counts payroll is computed from, for one employee and range.
+
+    Late / WFH are attended days, a Half Day is half of one. "On Leave" splits
+    by the leave type: paid leave is not deducted, unpaid (Loss of Pay) is.
+    """
+    rows = Attendance.objects.filter(
+        client_id=client_id, employee=employee, deleted_at__isnull=True,
+        work_date__gte=start, work_date__lte=end,
+    ).select_related("leave_request__leave_type")
+    counts = {"present": 0, "late": 0, "wfh": 0, "halfDay": 0, "absent": 0,
+              "paidLeave": 0, "unpaidLeave": 0, "holiday": 0, "weekOff": 0}
+    for row in rows:
+        if row.status == "Present":
+            counts["present"] += 1
+        elif row.status == "Late":
+            counts["late"] += 1
+        elif row.status == "WFH":
+            counts["wfh"] += 1
+        elif row.status == "Half Day":
+            counts["halfDay"] += 1
+            # The other half of a half-day leave is leave, not absence.
+            if row.leave_request_id:
+                key = "paidLeave" if row.leave_request.leave_type.is_paid else "unpaidLeave"
+                counts[key] += Decimal("0.5")
+        elif row.status == "Absent":
+            counts["absent"] += 1
+        elif row.status == "On Leave":
+            paid = row.leave_request.leave_type.is_paid if row.leave_request_id else True
+            counts["paidLeave" if paid else "unpaidLeave"] += 1
+        elif row.status == "Holiday":
+            counts["holiday"] += 1
+        elif row.status == "Week Off":
+            counts["weekOff"] += 1
+    counts["attendedDays"] = (
+        Decimal(counts["present"] + counts["late"] + counts["wfh"])
+        + Decimal("0.5") * counts["halfDay"]
+    )
+    counts["onLeave"] = counts["paidLeave"] + counts["unpaidLeave"]
+    return counts
+
+
 def attendance_summary(client_id, *, month=None, employee_id=None, department_id=None):
     """``GET /hrms/attendance/summary/`` -- monthly per-employee counts."""
-    queryset = Attendance.objects.filter(client_id=client_id, deleted_at__isnull=True)
+    queryset = Attendance.objects.filter(
+        client_id=client_id, deleted_at__isnull=True,
+        employee_id__in=workforce(client_id).values("id"),
+    )
     if month:
         queryset = queryset.filter(work_date__year=month.year, work_date__month=month.month)
     if employee_id:
@@ -280,6 +644,7 @@ DEFAULT_LEAVE_TYPES = (
 
 #: Other spellings the screens use for the defaults above.
 LEAVE_TYPE_ALIASES = {
+    "annual leave": "Earned Leave",
     "earned / privilege leave": "Earned Leave",
     "privilege leave": "Earned Leave",
     "unpaid leave": "Loss of Pay",
@@ -339,15 +704,58 @@ def assert_no_overlap(leave_request):
 
 
 def leave_balance_for(client_id, employee_id, leave_type_id, year=None):
+    """The year's balance row, opened at the leave type's annual entitlement.
+
+    A row opened at zero would make the first approval of the year fail with
+    "insufficient balance" for every employee HR never seeded by hand.
+    """
+    from .models import LeaveType
+
     year = year or timezone.localdate().year
+    leave_type = LeaveType.objects.filter(pk=leave_type_id).first()
+    entitlement = D(leave_type.annual_entitlement) if leave_type else ZERO
     balance, _ = LeaveBalance.objects.get_or_create(
         client_id=client_id,
         employee_id=employee_id,
         leave_type_id=leave_type_id,
         period_year=year,
-        defaults={"entitlement": ZERO, "carried_forward": ZERO, "used": ZERO},
+        defaults={"entitlement": entitlement, "carried_forward": ZERO, "used": ZERO},
     )
     return balance
+
+
+def leave_balances_for_employee(client_id, employee, year=None):
+    """Every active leave type's balance for one employee (rows opened as needed)."""
+    from .models import LeaveType
+
+    year = year or timezone.localdate().year
+    for name, *_ in DEFAULT_LEAVE_TYPES:
+        resolve_leave_type(client_id, name)
+    out = []
+    for leave_type in LeaveType.objects.filter(client_id=client_id, deleted_at__isnull=True):
+        balance = leave_balance_for(client_id, employee.id, leave_type.id, year)
+        pending = LeaveRequest.objects.filter(
+            client_id=client_id, employee=employee, leave_type=leave_type,
+            status__in=["Pending Review", "Delegate Confirmed"], deleted_at__isnull=True,
+            from_date__year=year,
+        ).aggregate(total=Sum("days"))["total"] or ZERO
+        total = D(balance.entitlement) + D(balance.carried_forward)
+        available = total - D(balance.used) - D(balance.encashed)
+        out.append({
+            "leaveTypeId": str(leave_type.id),
+            "leaveType": leave_type.name,
+            "code": leave_type.code or "",
+            "isPaid": leave_type.is_paid,
+            "year": year,
+            "entitlement": float(balance.entitlement),
+            "carriedForward": float(balance.carried_forward),
+            "total": float(total),
+            "used": float(balance.used),
+            "encashed": float(balance.encashed),
+            "pending": float(pending),
+            "available": float(available),
+        })
+    return out
 
 
 @transaction.atomic
@@ -373,7 +781,8 @@ def approve_leave(leave_request, *, user=None, remark=None):
         leave_request.from_date.year,
     )
     available = D(balance.entitlement) + D(balance.carried_forward) - D(balance.used) - D(balance.encashed)
-    if D(leave_request.days) > available:
+    # Unpaid leave (Loss of Pay) has no quota: it is deducted at payroll instead.
+    if leave_request.leave_type.is_paid and D(leave_request.days) > available:
         raise BusinessRuleViolation(
             f"{leave_request.employee.name} has {available} day(s) of "
             f"{leave_request.leave_type.name} left but requested {leave_request.days}.",
@@ -388,6 +797,8 @@ def approve_leave(leave_request, *, user=None, remark=None):
     leave_request.save()
 
     # Post attendance for every working day in range.
+    # A half-day leave keeps the other half as a worked Half Day.
+    half_day = D(leave_request.days) < 1 and leave_request.from_date == leave_request.to_date
     for day in working_days_in(
         leave_request.client_id, leave_request.from_date, leave_request.to_date
     ):
@@ -395,7 +806,7 @@ def approve_leave(leave_request, *, user=None, remark=None):
             client=leave_request.client,
             employee=leave_request.employee,
             work_date=day,
-            status="On Leave",
+            status="Half Day" if half_day else "On Leave",
             source="leave",
             leave_request=leave_request,
             remark=leave_request.reason,
@@ -421,10 +832,14 @@ def approve_leave(leave_request, *, user=None, remark=None):
         created_by=user if getattr(user, "is_authenticated", False) else None,
     )
 
-    if leave_request.employee.status == "Active" and D(leave_request.days) >= 1:
+    from .user_link import linked_user
+
+    # Notifications go to logins, not HR rows.
+    employee_login = linked_user(leave_request.employee)
+    if employee_login is not None and leave_request.employee.status == "Active":
         notify(
             client=leave_request.client_id,
-            recipients=[leave_request.employee.id],
+            recipients=[employee_login.id],
             type="hrms.leave_approved",
             category="hrms",
             title="Your leave was approved",
@@ -569,8 +984,12 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
             code=Codes.ALREADY_DONE,
         )
 
-    employees = Employee.objects.filter(
-        client=client, deleted_at__isnull=True, status__in=["Active", "On Leave", "Probation"]
+    employees = workforce(
+        client.id,
+        Employee.objects.filter(
+            client=client, deleted_at__isnull=True,
+            status__in=["Active", "On Leave", "Probation"],
+        ),
     ).select_related("salary_structure")
     if employee_ids:
         employees = employees.filter(pk__in=employee_ids)
@@ -581,32 +1000,29 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
 
     payslips = []
     for employee in employees:
-        rows = Attendance.objects.filter(
-            client=client,
-            employee=employee,
-            work_date__gte=period_month,
-            work_date__lte=month_end,
-            deleted_at__isnull=True,
-        ).values("status").annotate(count=Count("id"))
-        counts = {row["status"]: row["count"] for row in rows}
-
-        attended = (
-            Decimal(counts.get("Present", 0))
-            + Decimal(counts.get("Late", 0))
-            + Decimal(counts.get("WFH", 0))
-            + Decimal("0.5") * Decimal(counts.get("Half Day", 0))
-        )
-        paid_leaves = Decimal(counts.get("On Leave", 0))
+        # Attended + paid leave are paid; absences, unmarked working days and
+        # unpaid leave (Loss of Pay) fall out as the attendance deduction.
+        counts = attendance_counts(client.id, employee, period_month, month_end)
+        attended = D(counts["attendedDays"])
+        paid_leaves = D(counts["paidLeave"])
 
         # Fixed salary only (Oscar letter pad §12): salesperson incentive is
         # calculated, posted and paid on its own through PMS
         # IncentiveCalculation, never through the payslip.
         advance = _pending_advance_instalment(employee)
+        # Re-running the month refreshes attendance but keeps HR's adjustments.
+        previous = Payslip.objects.filter(
+            payroll_run=run, employee=employee, deleted_at__isnull=True
+        ).first()
+        additional = D(previous.additional_earnings) if previous else ZERO
+        other_deductions = D(previous.deductions) if previous else ZERO
         result = compute_salary(
             standard_salary=employee.standard_salary,
             total_days=total_days,
             attended_days=attended,
             paid_leaves=paid_leaves,
+            additional_earnings=additional,
+            deductions=other_deductions,
             advance=advance,
         )
         split = split_structure(employee.salary_structure, result["earnedSalary"])
@@ -635,8 +1051,8 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
                 "basic": split["basic"],
                 "hra": split["hra"],
                 "allowances": split["allowances"],
-                "additional_earnings": ZERO,
-                "deductions": ZERO,
+                "additional_earnings": additional,
+                "deductions": other_deductions,
                 "advance_recovery": advance,
                 "net_payable": result["netPayable"],
                 "status": "In Progress",
@@ -1456,10 +1872,12 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, now=No
     first_in = next((p for p in punches if p.punch_type == "IN"), None)
     last_out = next((p for p in reversed(punches) if p.punch_type == "OUT"), None)
 
-    shift_start_time = time(9, 30)
-    shift_end_time = time(18, 30)
-    full_day_hours = Decimal("8.00")
-    half_day_threshold = Decimal("4.00")
+    policy = flexibility_policy(client_id)
+    shift_start_time = _parse_time(policy.get("shiftStart"), time(9, 30))
+    shift_end_time = _parse_time(policy.get("shiftEnd"), time(18, 30))
+    full_day_hours = Decimal(str(policy.get("fullDayHours") or 8))
+    half_day_threshold = Decimal(str(policy.get("halfDayThresholdHours") or 4))
+    grace_minutes = int(policy.get("graceMinutes") or 0)
 
     late_minutes = 0
     if first_in:
@@ -1481,13 +1899,15 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, now=No
 
     is_early_out = bool(last_out and (early_leaving_minutes > 0 or working_hours < full_day_hours))
 
+    # Within the grace window an arrival is still on time.
+    is_late = late_minutes > grace_minutes
     if not punches:
         status = "Absent"
     elif is_punched_in:
-        status = "Late" if late_minutes > 0 else "Present"
+        status = "Late" if is_late else "Present"
     elif working_hours < half_day_threshold:
         status = "Half Day"
-    elif late_minutes > 0:
+    elif is_late:
         status = "Late"
     else:
         status = "Present"
@@ -1505,8 +1925,9 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, now=No
         "late_minutes": late_minutes,
         "early_leaving_minutes": early_leaving_minutes,
         "is_early_out": is_early_out,
-        "shift_start": "09:30",
-        "shift_end": "18:30",
+        "shift_start": shift_start_time.strftime("%H:%M"),
+        "shift_end": shift_end_time.strftime("%H:%M"),
+        "grace_minutes": grace_minutes,
         "full_day_hours": float(full_day_hours),
         "half_day_threshold_hours": float(half_day_threshold),
         "status": status,
@@ -1715,3 +2136,103 @@ def record_punch(
         )
 
     return punch, get_today_punch_status(client_id, employee, work_date=work_date)
+
+
+# ── Asset hand-over (api.md §11.8) ──────────────────────────────────────────
+@transaction.atomic
+def assign_asset(asset, employee, *, user=None, notes=None):
+    """Hand ``asset`` to ``employee``: one open assignment row, status Assigned."""
+    from .models import Asset, AssetAssignment
+
+    asset = Asset.objects.select_for_update().get(pk=asset.pk)
+    if employee.status in EXITED_EMPLOYEE_STATUSES:
+        raise Conflict(f"{employee.name} has left; assets cannot be issued to them.",
+                       code=Codes.BAD_TARGET)
+    if asset.history.filter(returned_at__isnull=True).exists() or asset.status == "Assigned":
+        holder = asset.assigned_employee.name if asset.assigned_employee_id else "someone"
+        raise Conflict(
+            f"{asset.name} is already assigned to {holder}. Record a return first.",
+            code=Codes.IN_USE,
+        )
+    if asset.status not in ("Available",):
+        raise Conflict(
+            f"{asset.name} is {asset.status.lower()} and cannot be issued.",
+            code=Codes.BAD_TARGET,
+        )
+    AssetAssignment.objects.create(
+        client_id=asset.client_id,
+        asset=asset,
+        employee=employee,
+        assigned_by=user if getattr(user, "is_authenticated", False) else None,
+        notes=notes,
+    )
+    asset.assigned_employee = employee
+    asset.status = "Assigned"
+    asset.save(update_fields=["assigned_employee", "status", "updated_at"])
+    return asset
+
+
+@transaction.atomic
+def return_asset(asset, *, condition=None, notes=None):
+    """Close the open assignment; a unit needing repair goes to maintenance."""
+    from .models import Asset
+
+    asset = Asset.objects.select_for_update().get(pk=asset.pk)
+    assignment = asset.history.filter(returned_at__isnull=True).first()
+    if assignment is None and asset.status != "Assigned":
+        raise Conflict("This asset is not currently assigned.", code=Codes.BAD_TARGET)
+    if assignment is not None:
+        assignment.returned_at = timezone.now()
+        assignment.returned_condition = condition
+        assignment.notes = notes or assignment.notes
+        assignment.save()
+    asset.assigned_employee = None
+    asset.condition = condition or asset.condition
+    asset.status = "Under Maintenance" if condition == "Needs Repair" else "Available"
+    asset.save(update_fields=["assigned_employee", "condition", "status", "updated_at"])
+    return asset
+
+
+@transaction.atomic
+def decide_asset_request(request_row, *, approve, user=None, remark=None, asset=None):
+    """Approve or reject an employee's asset request.
+
+    Approving an Inventory request issues the exact unit asked for and closes
+    the request as Fulfilled. Approving an Other request records the decision;
+    passing ``asset`` (now, or later via fulfil) hands a unit over.
+    """
+    from .models import AssetRequest
+
+    request_row = AssetRequest.objects.select_for_update().get(pk=request_row.pk)
+    if request_row.status in ("Fulfilled", "Rejected", "Cancelled"):
+        raise Conflict(f"This request is already {request_row.status.lower()}.",
+                       code=Codes.ALREADY_DONE)
+
+    request_row.approver = user if getattr(user, "is_authenticated", False) else None
+    request_row.decided_at = timezone.now()
+    if remark is not None:
+        request_row.remark = remark
+
+    if not approve:
+        request_row.status = "Rejected"
+        request_row.save()
+        return request_row
+
+    target = asset or (request_row.requested_asset if request_row.request_type == "Inventory" else None)
+    if target is not None:
+        assign_asset(target, request_row.employee, user=user,
+                     notes=f"Issued against asset request ({request_row.employee.name}).")
+        request_row.fulfilled_asset = target
+        request_row.status = "Fulfilled"
+        # Anyone else waiting on the same unit can no longer get it.
+        AssetRequest.objects.filter(
+            client_id=request_row.client_id, requested_asset=target,
+            status="Pending", deleted_at__isnull=True,
+        ).exclude(pk=request_row.pk).update(
+            status="Rejected", decided_at=timezone.now(),
+            remark="Asset was issued to another employee.", updated_at=timezone.now(),
+        )
+    else:
+        request_row.status = "Approved"
+    request_row.save()
+    return request_row

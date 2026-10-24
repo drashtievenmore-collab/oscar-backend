@@ -166,7 +166,11 @@ class OwnEmployeeScopeMixin:
     delegate_read_field = None
 
     def has_team_scope(self):
-        return has_permission(self.request.user, tuple(self.team_scope_permissions))
+        # Any one of the listed permissions grants the team-wide view.
+        return any(
+            has_permission(self.request.user, permission)
+            for permission in self.team_scope_permissions
+        )
 
     def _resolve_employee(self, request, employee_id=None):
         client_id = getattr(request, "client_id", None) or getattr(request.user, "client_id", None)
@@ -265,8 +269,7 @@ class EmployeeViewSet(TenantModelViewSet):
     def colleagues(self, request):
         """GET /hrms/employees/colleagues/ -- names only, for the delegate picker."""
         rows = (
-            Employee.objects.filter(client_id=self.get_client_id(), deleted_at__isnull=True)
-            .exclude(status__in=["Resigned", "Terminated"])
+            services.workforce(self.get_client_id(), include_exited=False)
             .select_related("department", "designation")
             .order_by("name")
         )
@@ -305,7 +308,13 @@ class EmployeeViewSet(TenantModelViewSet):
             sync_all_users_and_employees(self.get_client_id())
         except Exception:
             pass
-        return super().get_queryset()
+        queryset = super().get_queryset()
+        # The directory lists the workforce; administrator logins (which are
+        # linked to an HR row only so they can punch in) stay out of it.
+        include_admins = str(self.request.query_params.get("includeAdmins", "")).lower()
+        if self.action == "list" and include_admins not in ("1", "true", "yes"):
+            queryset = services.workforce(self.get_client_id(), queryset)
+        return queryset
 
     def _ensure_employee_users_linked(self):
         try:
@@ -629,6 +638,14 @@ class AttendanceViewSet(TenantModelViewSet):
         "punch_timeline": [],
     }
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.action == "list":
+            queryset = queryset.filter(
+                employee_id__in=services.workforce(self.get_client_id()).values("id")
+            )
+        return queryset
+
     def get_aggregates(self, queryset):
         return queryset.aggregate(
             total=Count("id"),
@@ -638,6 +655,43 @@ class AttendanceViewSet(TenantModelViewSet):
             onLeave=Count("id", filter=Q(status="On Leave")),
             wfh=Count("id", filter=Q(status="WFH")),
         )
+
+    @staticmethod
+    def _parse_date(value, field="date"):
+        if not value:
+            return timezone.localdate()
+        if hasattr(value, "year"):
+            return value
+        try:
+            return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+        except ValueError:
+            raise ValidationFailed(
+                "Dates must be YYYY-MM-DD.", field_errors={field: ["Expected YYYY-MM-DD."]}
+            )
+
+    @action(detail=False, methods=["get"])
+    def daily(self, request):
+        """``GET /hrms/attendance/daily/?date=`` -- the whole workforce on one day."""
+        work_date = self._parse_date(request.query_params.get("date"))
+        return Response(
+            services.daily_attendance(
+                request.client_id, work_date,
+                department=request.query_params.get("department") or None,
+            )
+        )
+
+    @action(detail=False, methods=["post"])
+    @transaction.atomic
+    def clear(self, request):
+        """``POST /hrms/attendance/clear/ {employeeIds, date}`` -- un-mark a day."""
+        work_date = self._parse_date(request.data.get("date"))
+        ids = request.data.get("employeeIds") or []
+        rows = Attendance.objects.filter(
+            client_id=request.client_id, work_date=work_date, employee_id__in=ids,
+            deleted_at__isnull=True, leave_request__isnull=True,
+        )
+        cleared = rows.update(deleted_at=timezone.now())
+        return Response({"cleared": cleared, "date": work_date})
 
     def perform_create(self, serializer):
         data = serializer.validated_data
@@ -691,6 +745,7 @@ class AttendanceViewSet(TenantModelViewSet):
 
         work_date = data.get("date") or timezone.localdate()
         written = 0
+        skipped = []
         for record in data.get("records", []):
             employee_id = record.get("employeeId") or record.get("employee_id") or record.get("id")
             employee = None
@@ -706,19 +761,37 @@ class AttendanceViewSet(TenantModelViewSet):
                 ).first()
             if employee is None:
                 continue
-            services.mark_attendance(
-                client=request.user.client,
-                employee=employee,
-                work_date=record.get("date") or work_date,
-                check_in=record.get("checkIn"),
-                check_out=record.get("checkOut"),
-                status=record.get("status"),
-                remark=record.get("remark"),
-                source="bulk",
-                user=request.user,
-            )
+            row_date = self._parse_date(record.get("date") or work_date)
+            status_value = record.get("status")
+            # Days with no attendance verdict yet are left alone.
+            if status_value in (None, "", "Not Marked", "Upcoming", "Not Joined"):
+                continue
+            # An approved leave owns its day; the register cannot overwrite it.
+            if Attendance.objects.filter(
+                client_id=request.client_id, employee=employee, work_date=row_date,
+                deleted_at__isnull=True, leave_request__isnull=False,
+            ).exclude(status=status_value).exists():
+                skipped.append({"employeeId": str(employee.id), "name": employee.name,
+                                "reason": "On approved leave"})
+                continue
+            try:
+                services.mark_attendance(
+                    client=request.user.client,
+                    employee=employee,
+                    work_date=row_date,
+                    check_in=services.parse_clock_on(row_date, record.get("checkIn")),
+                    check_out=services.parse_clock_on(row_date, record.get("checkOut")),
+                    status=status_value,
+                    remark=record.get("remark") or record.get("remarks"),
+                    source="bulk",
+                    user=request.user,
+                )
+            except (Conflict, ValidationFailed) as exc:
+                skipped.append({"employeeId": str(employee.id), "name": employee.name,
+                                "reason": str(getattr(exc, "detail", exc))})
+                continue
             written += 1
-        return Response({"written": written, "date": work_date})
+        return Response({"written": written, "skipped": skipped, "date": work_date})
 
     @action(detail=False, methods=["get"])
     def summary(self, request):
@@ -741,6 +814,21 @@ class AttendanceViewSet(TenantModelViewSet):
 
     @action(detail=False, methods=["get"], url_path=r"individual/(?P<employee_id>[^/.]+)")
     def individual(self, request, employee_id=None):
+        month = request.query_params.get("month")
+        if month:
+            # ``?month=YYYY-MM`` -- the full month sheet the Individual screen shows.
+            try:
+                parsed = datetime.strptime(month[:7], "%Y-%m").date()
+            except ValueError:
+                raise ValidationFailed(
+                    "Month must be YYYY-MM.", field_errors={"month": ["Expected YYYY-MM."]}
+                )
+            employee = Employee.objects.filter(
+                pk=employee_id, client_id=request.client_id, deleted_at__isnull=True
+            ).select_related("department", "designation", "location").first()
+            if employee is None:
+                raise NotFound("Employee not found.")
+            return Response(services.monthly_attendance(request.client_id, employee, parsed))
         rows = Attendance.objects.filter(
             client_id=request.client_id, employee_id=employee_id, deleted_at__isnull=True
         ).order_by("work_date")
@@ -1015,6 +1103,12 @@ class FlexibilityPolicyView(APIView):
 
         policy = services.flexibility_policy(request.client_id)
         policy.update(request.data if isinstance(request.data, dict) else {})
+        # The screen saves its labels ("10 minutes", "09:00 - 18:00"); the
+        # engine keys are derived from them so punch-in uses what HR set.
+        policy = services.normalize_flexibility(
+            policy,
+            screen_wins=any(key in request.data for key in services.SCREEN_FLEXIBILITY_KEYS),
+        )
         Setting.objects.update_or_create(
             client_id=request.client_id,
             key="attendance_flexibility",
@@ -1051,6 +1145,14 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     search_fields = ["employee__name", "reason"]
     filter_map = {"employeeId": "employee_id", "type": "leave_type__name", "leaveTypeId": "leave_type_id"}
     permission_map = {"read": [], "create": [], "write": ["approve_leave"], "cancel": [], "confirm_delegate": []}
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.action == "list" and self.has_team_scope():
+            queryset = queryset.filter(
+                employee_id__in=services.workforce(self.get_client_id()).values("id")
+            )
+        return queryset
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -1122,13 +1224,35 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         return Response(self.get_serializer(row).data)
 
 
-class LeaveBalanceViewSet(ReadOnlyTenantViewSet):
+class LeaveBalanceViewSet(OwnEmployeeScopeMixin, ReadOnlyTenantViewSet):
+    team_scope_permissions = ("approve_leave",)
     queryset = LeaveBalance.objects.select_related("employee", "leave_type")
     serializer_class = LeaveBalanceSerializer
     status_field = None
     filter_map = {"employeeId": "employee_id", "leaveTypeId": "leave_type_id", "year": "period_year"}
     ordering = ["employee__name"]
-    permission_map = {"read": ["apply_leave"]}
+    permission_map = {"read": [], "summary": []}
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        """``GET /hrms/leave/balances/summary/?employeeId=&year=`` -- one card per leave type.
+
+        Without ``employeeId`` it answers for the caller's own employee record.
+        """
+        employee = self._resolve_employee(request, request.query_params.get("employeeId"))
+        if employee is None:
+            return Response({"employee": None, "balances": []})
+        self.check_own_employee(employee)
+        year = request.query_params.get("year")
+        try:
+            year = int(year) if year else None
+        except ValueError:
+            raise ValidationFailed("Year must be a number.", field_errors={"year": ["Invalid."]})
+        return Response({
+            "employee": {"id": str(employee.id), "name": employee.name,
+                         "employeeCode": employee.employee_code},
+            "balances": services.leave_balances_for_employee(request.client_id, employee, year),
+        })
 
 
 class CompOffViewSet(TenantModelViewSet):
@@ -1186,10 +1310,27 @@ class PayslipViewSet(TenantModelViewSet):
         ):
             employee_id = getattr(self.request.user, "employee_id", None)
             queryset = queryset.filter(employee_id=employee_id) if employee_id else queryset.none()
+        # ``?month=2026-10`` as well as the first-of-month date the filter_map takes.
+        month = self.request.query_params.get("period")
+        if month:
+            try:
+                parsed = datetime.strptime(month[:7], "%Y-%m").date()
+            except ValueError:
+                raise ValidationFailed(
+                    "Period must be YYYY-MM.", field_errors={"period": ["Expected YYYY-MM."]}
+                )
+            queryset = queryset.filter(period_month=parsed)
         return queryset
 
     def get_aggregates(self, queryset):
-        return services.payroll_summary(self.get_client_id())
+        month = self.request.query_params.get("period")
+        parsed = None
+        if month:
+            try:
+                parsed = datetime.strptime(month[:7], "%Y-%m").date()
+            except ValueError:
+                parsed = None
+        return services.payroll_summary(self.get_client_id(), parsed)
 
     def perform_update(self, serializer):
         """Adjust earnings / deductions before approval (api.md §11.4)."""
@@ -1908,7 +2049,11 @@ class AssetViewSet(TenantModelViewSet):
     search_fields = ["name", "asset_code", "serial_number"]
     ordering = ["name"]
     filter_map = {"categoryId": "category_id", "employeeId": "assigned_employee_id"}
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"], "available": [],
+                      "mine": []}
+
+    def get_queryset(self):
+        return super().get_queryset().prefetch_related("requests")
 
     def perform_create(self, serializer):
         if not serializer.validated_data.get("asset_code"):
@@ -1916,6 +2061,59 @@ class AssetViewSet(TenantModelViewSet):
                 self.request.user.client, "ASSET"
             )
         return super().perform_create(serializer)
+
+    @staticmethod
+    def _catalogue_row(asset):
+        return {
+            "id": str(asset.id),
+            "assetCode": asset.asset_code,
+            "name": asset.name,
+            "category": asset.category.name if asset.category_id else "",
+            "categoryId": str(asset.category_id) if asset.category_id else None,
+            "serialNumber": asset.serial_number or "",
+            "condition": asset.condition or "",
+            "status": asset.status,
+            "location": asset.location.name if asset.location_id else "",
+        }
+
+    @action(detail=False, methods=["get"])
+    def available(self, request):
+        """``GET /hrms/assets/available/`` -- the stock any employee may request.
+
+        Open to every signed-in user: it lists only what is in stock, with no
+        cost or assignment history.
+        """
+        rows = (
+            Asset.objects.filter(
+                client_id=request.client_id, deleted_at__isnull=True, status="Available",
+                assigned_employee__isnull=True,
+            )
+            .select_related("category", "location")
+            .order_by("category__name", "name")
+        )
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            rows = rows.filter(
+                Q(name__icontains=search) | Q(asset_code__icontains=search)
+                | Q(category__name__icontains=search)
+            )
+        return Response(envelope([self._catalogue_row(asset) for asset in rows]))
+
+    @action(detail=False, methods=["get"])
+    def mine(self, request):
+        """``GET /hrms/assets/mine/`` -- what the caller currently holds."""
+        employee = OwnEmployeeScopeMixin._resolve_employee(self, request)
+        if employee is None:
+            return Response(envelope([]))
+        rows = (
+            Asset.objects.filter(
+                client_id=request.client_id, deleted_at__isnull=True,
+                assigned_employee=employee,
+            )
+            .select_related("category", "location")
+            .order_by("name")
+        )
+        return Response(envelope([self._catalogue_row(asset) for asset in rows]))
 
     @action(detail=True, methods=["post"])
     @transaction.atomic
@@ -1929,48 +2127,28 @@ class AssetViewSet(TenantModelViewSet):
             raise ValidationFailed(
                 "Unknown employee.", field_errors={"employeeId": ["Not found."]}
             )
-        if asset.history.filter(returned_at__isnull=True).exists():
-            raise Conflict(
-                "This asset is already assigned. Record a return first.",
-                code=Codes.IN_USE,
-            )
-
-        AssetAssignment.objects.create(
-            client_id=request.client_id,
-            asset=asset,
-            employee=employee,
-            assigned_by=request.user,
-            notes=request.data.get("notes"),
+        asset = services.assign_asset(
+            asset, employee, user=request.user, notes=request.data.get("notes")
         )
-        asset.assigned_employee = employee
-        asset.status = "Assigned"
-        asset.save(update_fields=["assigned_employee", "status", "updated_at"])
+        # A direct hand-over satisfies the same person's pending ask for it.
+        AssetRequest.objects.filter(
+            client_id=request.client_id, requested_asset=asset, employee=employee,
+            status="Pending", deleted_at__isnull=True,
+        ).update(status="Fulfilled", fulfilled_asset=asset, decided_at=timezone.now(),
+                 approver=request.user, updated_at=timezone.now())
         self.write_audit("assign", asset, description=f"Assigned to {employee.name}")
-        return Response(self.get_serializer(asset).data)
+        return Response(self.get_serializer(self.get_queryset().get(pk=asset.pk)).data)
 
     @action(detail=True, methods=["post"], url_path="return")
     @transaction.atomic
     def return_asset(self, request, pk=None):
-        asset = self.get_object()
-        assignment = asset.history.filter(returned_at__isnull=True).first()
-        if assignment is None:
-            raise Conflict("This asset is not currently assigned.", code=Codes.BAD_TARGET)
-
-        assignment.returned_at = timezone.now()
-        assignment.returned_condition = request.data.get("condition")
-        assignment.notes = request.data.get("notes", assignment.notes)
-        assignment.save()
-
-        asset.assigned_employee = None
-        asset.condition = request.data.get("condition") or asset.condition
-        asset.status = (
-            "Under Maintenance"
-            if request.data.get("condition") == "Needs Repair"
-            else "Available"
+        asset = services.return_asset(
+            self.get_object(),
+            condition=request.data.get("condition"),
+            notes=request.data.get("notes"),
         )
-        asset.save(update_fields=["assigned_employee", "condition", "status", "updated_at"])
         self.write_audit("return", asset, description=request.data.get("notes"))
-        return Response(self.get_serializer(asset).data)
+        return Response(self.get_serializer(self.get_queryset().get(pk=asset.pk)).data)
 
 
 class AssetCategoryViewSet(TenantModelViewSet):
@@ -1984,14 +2162,37 @@ class AssetCategoryViewSet(TenantModelViewSet):
 
 
 class AssetRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
+    """Employee asset requests.
+
+    Employees create and cancel their own; HR (``edit_staff``) approves,
+    rejects and fulfils. Status never changes through a plain PATCH.
+    """
+
     team_scope_permissions = ("edit_staff", "view_staff")
-    queryset = AssetRequest.objects.select_related("employee", "category", "fulfilled_asset")
+    queryset = AssetRequest.objects.select_related(
+        "employee", "employee__department", "category", "requested_asset",
+        "fulfilled_asset", "approver",
+    )
     serializer_class = AssetRequestSerializer
     audit_entity_type = "AssetRequest"
     status_field = "status"
     ordering = ["-created_at"]
-    filter_map = {"employeeId": "employee_id"}
-    permission_map = {"read": [], "create": [], "write": ["edit_staff"]}
+    search_fields = ["employee__name", "item_name", "requested_asset__name", "justification"]
+    filter_map = {"employeeId": "employee_id", "requestType": "request_type",
+                  "priority": "priority"}
+    permission_map = {
+        "read": [], "create": [], "cancel": [], "write": ["edit_staff"],
+        "approve": ["edit_staff"], "reject": ["edit_staff"], "fulfill": ["edit_staff"],
+    }
+
+    def get_aggregates(self, queryset):
+        return queryset.aggregate(
+            total=Count("id"),
+            pending=Count("id", filter=Q(status="Pending")),
+            approved=Count("id", filter=Q(status="Approved")),
+            fulfilled=Count("id", filter=Q(status="Fulfilled")),
+            rejected=Count("id", filter=Q(status="Rejected")),
+        )
 
     def perform_create(self, serializer):
         employee = serializer.validated_data.get("employee")
@@ -2000,8 +2201,132 @@ class AssetRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
             if resolved:
                 serializer.validated_data["employee"] = resolved
                 employee = resolved
+        if employee is None:
+            raise ValidationFailed(
+                "Your login is not linked to an employee record. Ask HR to link it.",
+                code="NO_EMPLOYEE",
+            )
         self.check_own_employee(employee)
-        return super().perform_create(serializer)
+        asset = serializer.validated_data.get("requested_asset")
+        if asset is not None and AssetRequest.objects.filter(
+            client_id=self.get_client_id(), employee=employee, requested_asset=asset,
+            status="Pending", deleted_at__isnull=True,
+        ).exists():
+            raise Conflict(
+                f"You already have a pending request for {asset.name}.",
+                code=Codes.ALREADY_DONE,
+            )
+        row = super().perform_create(serializer)
+        self._notify_hr(row)
+        return row
+
+    def _notify_hr(self, row):
+        from apps.accounts.models import User
+
+        hr = User.objects.filter(
+            client_id=row.client_id, deleted_at__isnull=True, is_active=True,
+        ).filter(
+            Q(is_superuser=True)
+            | Q(role__role_permissions__permission_id="edit_staff")
+        ).values_list("id", flat=True).distinct()
+        what = row.requested_asset.name if row.requested_asset_id else (row.item_name or "an asset")
+        try:
+            notify(
+                client=row.client_id,
+                recipients=list(hr),
+                type="hrms.asset_requested",
+                category="hrms",
+                title="New asset request",
+                body=f"{row.employee.name} requested {what}.",
+                entity_type="AssetRequest",
+                entity_id=row.id,
+                actor=self.request.user,
+            )
+        except Exception:
+            pass
+
+    def perform_update(self, serializer):
+        if serializer.instance.status != "Pending":
+            raise Conflict("Only a pending request can be edited.", code=Codes.BAD_TARGET)
+        return super().perform_update(serializer)
+
+    def _respond(self, row):
+        self._notify_requester(row)
+        return Response(self.get_serializer(self.get_queryset().get(pk=row.pk)).data)
+
+    def _notify_requester(self, row):
+        from apps.hrms.user_link import linked_user
+
+        user = linked_user(row.employee)
+        if user is None or user.pk == getattr(self.request.user, "pk", None):
+            return
+        what = row.requested_asset.name if row.requested_asset_id else (row.item_name or "asset")
+        try:
+            notify(
+                client=row.client_id, recipients=[user.id], type="hrms.asset_request_decided",
+                category="hrms", title=f"Asset request {row.status.lower()}",
+                body=f"Your request for {what} is {row.status.lower()}."
+                + (f" {row.remark}" if row.remark else ""),
+                entity_type="AssetRequest", entity_id=row.id, actor=self.request.user,
+            )
+        except Exception:
+            pass
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        """Inventory requests issue the requested unit; Other requests are approved."""
+        asset = None
+        if request.data.get("assetId"):
+            asset = Asset.objects.filter(
+                pk=request.data["assetId"], client_id=request.client_id,
+                deleted_at__isnull=True,
+            ).first()
+            if asset is None:
+                raise ValidationFailed("Unknown asset.", field_errors={"assetId": ["Not found."]})
+        row = services.decide_asset_request(
+            self.get_object(), approve=True, user=request.user,
+            remark=request.data.get("remark"), asset=asset,
+        )
+        self.write_audit("approve", row, description=f"Asset request {row.status.lower()}")
+        return self._respond(row)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        row = services.decide_asset_request(
+            self.get_object(), approve=False, user=request.user,
+            remark=request.data.get("remark") or request.data.get("reason"),
+        )
+        self.write_audit("reject", row, description=row.remark)
+        return self._respond(row)
+
+    @action(detail=True, methods=["post"])
+    def fulfill(self, request, pk=None):
+        """``{assetId}`` -- hand a registered unit over for an approved request."""
+        asset = Asset.objects.filter(
+            pk=request.data.get("assetId"), client_id=request.client_id,
+            deleted_at__isnull=True,
+        ).first()
+        if asset is None:
+            raise ValidationFailed("Pick an asset to issue.", field_errors={"assetId": ["Required."]})
+        row = services.decide_asset_request(
+            self.get_object(), approve=True, user=request.user,
+            remark=request.data.get("remark"), asset=asset,
+        )
+        self.write_audit("fulfill", row, description=f"Issued {asset.asset_code}")
+        return self._respond(row)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        """The requester withdraws a request that is still pending."""
+        row = self.get_object()
+        self.check_own_employee(row.employee)
+        if row.status != "Pending":
+            raise Conflict(f"This request is already {row.status.lower()}.", code=Codes.BAD_TARGET)
+        row.status = "Cancelled"
+        row.decided_at = timezone.now()
+        row.save(update_fields=["status", "decided_at", "updated_at"])
+        self.write_audit("cancel", row, description="Withdrawn by requester")
+        return self._respond(row)
 
 
 class HrDocumentViewSet(TenantModelViewSet):
