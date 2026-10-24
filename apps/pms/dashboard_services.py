@@ -93,8 +93,13 @@ def _date_range(queryset, field, date_from, date_to):
 def _location_ids(client_id, location_id):
     """The chosen location plus its descendants (a warehouse holds its racks)."""
     from apps.masters.models import Location
+    import uuid
 
     if not location_id:
+        return None
+    try:
+        uuid.UUID(str(location_id))
+    except (ValueError, TypeError, AttributeError):
         return None
     ids = {str(location_id)}
     frontier = [location_id]

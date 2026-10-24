@@ -961,7 +961,7 @@ def agency_three_way_match(instruction, invoice_qty, invoice_rate):
     }
 
 
-LOCKED_INSTRUCTION_STATUSES = ("Verified", "PO Pending", "PO Created", "Closed")
+LOCKED_INSTRUCTION_STATUSES = ("Completed", "Verified", "PO Pending", "PO Created", "Closed")
 
 
 def lock_open_instruction(instruction):
@@ -1070,11 +1070,15 @@ def record_daily_entry(
     # Validate against remaining instructed balance for submitted entries
     if status == "Submitted" and instruction.order_meter > ZERO:
         remaining = instruction.order_meter - prev_cum
-        # Over-limit check: reject if meters exceeds remaining balance by more than 25% (allowing standard weaving tolerance)
-        if remaining > ZERO and d_meters > (remaining * Decimal("1.25")):
+        if remaining <= ZERO:
             raise ValidationFailed(
-                f"Today's produced quantity ({d_meters} m) exceeds remaining instructed balance ({remaining} m).",
-                field_errors={"meters": [f"Quantity exceeds remaining instructed balance ({remaining} m)."]},
+                f"Production for this instruction is already completed ({prev_cum} of {instruction.order_meter} m produced). No further entries can be recorded.",
+                field_errors={"meters": ["All ordered quantity has already been produced."]},
+            )
+        if d_meters > remaining:
+            raise ValidationFailed(
+                f"Today's produced quantity ({d_meters} m) exceeds remaining balance ({remaining} m).",
+                field_errors={"meters": [f"Cannot exceed remaining balance of {remaining} m."]},
             )
 
     # Check rapid duplicate submission within 5 seconds
@@ -1125,10 +1129,10 @@ def record_daily_entry(
 
     # Update instruction status only for submitted entries
     if status == "Submitted":
-        if instruction.status in ("Approved", "Not Started"):
-            instruction.status = "Running"
-        elif balance_meter <= ZERO:
+        if balance_meter <= ZERO:
             instruction.status = "Completed"
+        elif instruction.status in ("Approved", "Not Started"):
+            instruction.status = "Running"
         else:
             instruction.status = "Partially Completed"
         instruction.save(update_fields=["status", "updated_at"])

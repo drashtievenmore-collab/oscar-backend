@@ -30,12 +30,14 @@ def calculate_broker_commission(invoice, *, user=None, rate_override=None, commi
             client_id=invoice.client_id, name__iexact=invoice.broker, deleted_at__isnull=True
         ).first()
 
-    # If still not found, check linked sales order / quotation / lead
+    # If still not found, check linked sales order / quotation / lead / party default
     so = invoice.sales_order
     if broker is None and so and so.broker_fk:
         broker = so.broker_fk
     if broker is None and so and so.quotation and so.quotation.broker_fk:
         broker = so.quotation.broker_fk
+    if broker is None and invoice.party and getattr(invoice.party, "default_broker", None):
+        broker = invoice.party.default_broker
 
     if broker is None:
         return None

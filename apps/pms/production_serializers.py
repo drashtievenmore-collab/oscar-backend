@@ -18,6 +18,7 @@ from .models import (
 
 
 class ProductionInstructionSerializer(BaseModelSerializer):
+    agency_name = serializers.CharField(required=False, allow_blank=True, default="")
     employeeId = TenantPrimaryKeyRelatedField(
         source="employee", model="hrms.Employee"
     )
@@ -78,6 +79,15 @@ class ProductionInstructionSerializer(BaseModelSerializer):
 
     def validate(self, attrs):
         from apps.core.money import D, ZERO
+
+        if not attrs.get("agency_name"):
+            agency = attrs.get("agency")
+            if agency:
+                attrs["agency_name"] = agency.name
+            elif attrs.get("employee"):
+                attrs["agency_name"] = attrs["employee"].name
+            else:
+                attrs["agency_name"] = "In-House"
 
         employee = attrs.get("employee", getattr(self.instance, "employee", None))
         supervisor = attrs.get("supervisor", getattr(self.instance, "supervisor", None))

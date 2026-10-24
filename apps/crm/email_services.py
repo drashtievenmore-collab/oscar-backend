@@ -94,7 +94,7 @@ def send_lead_email(lead, *, to_addresses, subject, body, actor=None, client_id=
     is_locmem = getattr(settings, "EMAIL_BACKEND", "").endswith("locmem.EmailBackend")
     is_console = getattr(settings, "EMAIL_BACKEND", "").endswith("console.EmailBackend")
     has_host = bool(getattr(settings, "EMAIL_HOST", ""))
-    if not (is_locmem or is_console or has_host):
+    if not (is_locmem or is_console or has_host or getattr(settings, "DEBUG", False)):
         raise BusinessRuleViolation(
             "Email sending is not configured on the server. Please configure EMAIL_HOST and SMTP credentials in the environment.",
             code="EMAIL_NOT_CONFIGURED",
