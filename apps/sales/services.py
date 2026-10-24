@@ -503,7 +503,7 @@ def _post_invoice_stock(invoice, lines, *, user=None):
 
 LOT_TRACKED = ("LOT", "TAKA")
 #: Only QC-passed takas may be sold.
-SELLABLE_LOT_QC = ("Passed",)
+SELLABLE_LOT_QC = ("Passed", "Pass")
 
 
 def allocate_takas(client_id, line, stock_qty, location_id):

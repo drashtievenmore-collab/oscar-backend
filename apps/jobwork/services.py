@@ -265,6 +265,75 @@ def _touch(header, user):
         header.updated_by = user
         fields.append("updated_by")
     header.save(update_fields=fields)
+    project = getattr(header, "project", None)
+    if project:
+        from apps.pms.pipeline_services import sync_project_pipeline_stages
+        sync_project_pipeline_stages(project)
+
+
+
+
+def validate_outward_stock(order, takas_data=None, qty=None):
+    """Pre-flight validation for Stage 12 Job Work Outward dispatch."""
+    from apps.inventory.models import LotTaka
+
+    if order.status in JobWorkOrder.LOCKED_STATUSES:
+        raise ValidationFailed(f"Job Work Order {order.jwo_no} is locked ({order.status}).")
+
+    total_qty = D(str(qty or 0))
+    dispatched_so_far = _sum([o for o in live(order.outwards) if o.status in ("Sent", "Confirmed")])
+    remaining_planned = max(D(order.planned_qty or 0) - dispatched_so_far, ZERO)
+
+    taka_errors = []
+    validated_takas = []
+    calculated_qty = ZERO
+
+    if takas_data:
+        for item in takas_data:
+            taka_id = item.get("lot_taka_id") or item.get("lotTakaId") or item.get("lot_taka")
+            if isinstance(taka_id, LotTaka):
+                lot_taka = taka_id
+            else:
+                lot_taka = LotTaka.objects.filter(client_id=order.client_id, id=taka_id).first()
+
+            if not lot_taka:
+                taka_errors.append(f"Taka {taka_id} not found.")
+                continue
+
+            if lot_taka.status == "External WIP":
+                taka_errors.append(f"Roll {lot_taka.taka_number or lot_taka.taka_id} is already at external processor WIP.")
+            elif lot_taka.status in ("Dispatched", "QC Hold", "Scrapped", "Consumed"):
+                taka_errors.append(f"Roll {lot_taka.taka_number or lot_taka.taka_id} has status '{lot_taka.status}' and cannot be dispatched.")
+
+            taka_meters = D(str(item.get("meters") or lot_taka.available_quantity or 0))
+            if taka_meters <= ZERO:
+                taka_errors.append(f"Roll {lot_taka.taka_number or lot_taka.taka_id} has 0 available metres.")
+            elif taka_meters > D(str(lot_taka.available_quantity or 0)):
+                taka_errors.append(f"Roll {lot_taka.taka_number or lot_taka.taka_id}: requested {taka_meters}M exceeds available {lot_taka.available_quantity}M.")
+
+            calculated_qty += taka_meters
+            validated_takas.append({
+                "id": str(lot_taka.id),
+                "takaNumber": lot_taka.taka_number,
+                "lotNumber": lot_taka.lot_number,
+                "meters": float(taka_meters),
+                "availableQuantity": float(lot_taka.available_quantity or 0),
+            })
+
+    if total_qty <= ZERO and calculated_qty > ZERO:
+        total_qty = calculated_qty
+
+    if taka_errors:
+        raise ValidationFailed("; ".join(taka_errors), field_errors={"takas": taka_errors})
+
+    return {
+        "valid": True,
+        "totalQty": float(total_qty),
+        "remainingPlanned": float(remaining_planned),
+        "dispatchedSoFar": float(dispatched_so_far),
+        "validatedTakasCount": len(validated_takas),
+        "validatedTakas": validated_takas,
+    }
 
 
 

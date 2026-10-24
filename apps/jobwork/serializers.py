@@ -145,12 +145,25 @@ class JWOOutwardTakaSerializer(BaseModelSerializer):
 class JWOInwardTakaSerializer(BaseModelSerializer):
     sourceTakaId = TenantPrimaryKeyRelatedField(source="source_taka", model="inventory.LotTaka", required=False, allow_null=True)
     receivedTakaId = TenantPrimaryKeyRelatedField(source="received_taka", model="inventory.LotTaka", required=False, allow_null=True)
+    sourceTakaNumber = serializers.ReadOnlyField(source="source_taka.taka_number")
+    sourceLotNumber = serializers.ReadOnlyField(source="source_taka.lot_number")
+    receivedTakaNumber = serializers.ReadOnlyField(source="received_taka.taka_number")
+    receivedLotNumber = serializers.ReadOnlyField(source="received_taka.lot_number")
+    receivedTakaIdStr = serializers.ReadOnlyField(source="received_taka.taka_id")
+    qcStatus = serializers.ReadOnlyField(source="received_taka.qc_status")
 
     class Meta(_RowMeta):
         from .models import JWOInwardTaka
         model = JWOInwardTaka
-        fields = ["id", "sourceTakaId", "receivedTakaId", "taka_number", "meters", "weight_kg", "width", "shade"]
-        read_only_fields = ["id"]
+        fields = [
+            "id", "sourceTakaId", "receivedTakaId", "taka_number", "meters", "weight_kg",
+            "width", "shade", "sourceTakaNumber", "sourceLotNumber", "receivedTakaNumber",
+            "receivedLotNumber", "receivedTakaIdStr", "qcStatus",
+        ]
+        read_only_fields = [
+            "id", "sourceTakaNumber", "sourceLotNumber", "receivedTakaNumber",
+            "receivedLotNumber", "receivedTakaIdStr", "qcStatus",
+        ]
 
 
 class JWOLossEntrySerializer(BaseModelSerializer):
@@ -279,6 +292,7 @@ class JobWorkOrderSerializer(BaseModelSerializer):
     processPlanId = serializers.UUIDField(
         source="process_plan_id", required=False, allow_null=True
     )
+    processPlanNo = serializers.ReadOnlyField(source="process_plan.plan_no")
     vendorId = TenantPrimaryKeyRelatedField(
         source="vendor", model="masters.Party", required=False, allow_null=True
     )
@@ -321,11 +335,11 @@ class JobWorkOrderSerializer(BaseModelSerializer):
         model = JobWorkOrder
         fields = [
             "id", "jwoNo", "projectId", "projectCode", "projectDestination",
-            "processPlanId", "process", "processMasterId", "vendor", "vendorId",
+            "processPlanId", "processPlanNo", "process", "processMasterId", "vendor", "vendorId",
             "assignedEmployeeId", "approverEmployeeId", "rateMasterId", "expectedLossPct",
             "orderDate", "plannedQty", "rate", "totalAmount", "expectedCompletion",
             "status", "remarks", "materials", "outwards", "inwards", "charges",
             "reprocesses", "lossEntries", "documents", "signatures",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["id", "jwoNo", "projectCode", "created_at", "updated_at"]
+        read_only_fields = ["id", "jwoNo", "projectCode", "processPlanNo", "created_at", "updated_at"]

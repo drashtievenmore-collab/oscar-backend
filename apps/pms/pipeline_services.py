@@ -39,14 +39,15 @@ STAGE_2_PROCUREMENT_DEF = {
 }
 
 PURCHASE_PO_STAGES = [
-    {"name": "Create Grey Purchase PO", "department_name": "Purchase", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "FileText"},
-    {"name": "Supplier Delivery", "department_name": "Purchase", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "Truck"},
-    {"name": "GRN / Inward", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "Boxes"},
-    {"name": "Lot & Taka Creation", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "Layers"},
-    {"name": "Grey QC", "department_name": "Quality Control", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "ShieldCheck"},
-    {"name": "Grey Stock Updated", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "Building2"},
-    {"name": "Supplier Bill Matching", "department_name": "Accounts", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "FileSpreadsheet"},
-    {"name": "Payment", "department_name": "Accounts", "branch": "branch_purchase", "default_weight": Decimal("3.75"), "icon": "IndianRupee"},
+    {"name": "Create Grey Purchase PO", "department_name": "Purchase", "branch": "branch_purchase", "default_weight": Decimal("3.33"), "icon": "FileText"},
+    {"name": "Supplier Delivery", "department_name": "Purchase", "branch": "branch_purchase", "default_weight": Decimal("3.33"), "icon": "Truck"},
+    {"name": "GRN / Inward", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("3.33"), "icon": "Boxes"},
+    {"name": "Lot & Taka Creation", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("3.33"), "icon": "Layers"},
+    {"name": "Grey QC", "department_name": "Quality Control", "branch": "branch_purchase", "default_weight": Decimal("3.33"), "icon": "ShieldCheck"},
+    {"name": "Grey Stock Updated", "department_name": "Inventory", "branch": "branch_purchase", "default_weight": Decimal("3.33"), "icon": "Building2"},
+    {"name": "Vendor Bill", "department_name": "Accounts", "branch": "branch_purchase", "default_weight": Decimal("3.34"), "icon": "Receipt"},
+    {"name": "Supplier Bill Matching", "department_name": "Accounts", "branch": "branch_purchase", "default_weight": Decimal("3.34"), "icon": "FileSpreadsheet"},
+    {"name": "Payment", "department_name": "Accounts", "branch": "branch_purchase", "default_weight": Decimal("3.34"), "icon": "IndianRupee"},
 ]
 
 VENDOR_PRODUCTION_STAGES = [
@@ -141,14 +142,14 @@ def lifecycle_stage_status(name, lifecycle):
     return status, pct, remarks, document
 
 DOWNSTREAM_STAGES = [
-    {"name": "Processing Plan & Vendor Assignment", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("10.00"), "icon": "ClipboardList"},
-    {"name": "Job Work Outward (Send to Vendor)", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("10.00"), "icon": "Truck"},
-    {"name": "Processing", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("10.00"), "icon": "Cog"},
-    {"name": "Job Work Inward (Receive)", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("10.00"), "icon": "ArrowDownToLine"},
-    {"name": "Quality Check & Stock Allocation", "department_name": "Quality Control", "branch": "common", "default_weight": Decimal("10.00"), "icon": "ShieldCheck"},
-    {"name": "Customer Dispatch", "department_name": "Dispatch", "branch": "common", "default_weight": Decimal("10.00"), "icon": "Boxes"},
-    {"name": "Invoice & Payment Collection", "department_name": "Accounts", "branch": "common", "default_weight": Decimal("10.00"), "icon": "IndianRupee"},
-    {"name": "Project Closure", "department_name": "Management", "branch": "common", "default_weight": Decimal("10.00"), "icon": "CheckCircle2"},
+    {"name": "Processing Plan & Vendor Assignment", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("7.50"), "icon": "ClipboardList"},
+    {"name": "Job Work Outward (Send to Vendor)", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("7.50"), "icon": "Truck"},
+    {"name": "Processing", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("7.50"), "icon": "Cog"},
+    {"name": "Job Work Inward (Receive)", "department_name": "Job Work", "branch": "common", "default_weight": Decimal("7.50"), "icon": "ArrowDownToLine"},
+    {"name": "Quality Check & Stock Allocation", "department_name": "Quality Control", "branch": "common", "default_weight": Decimal("7.50"), "icon": "ShieldCheck"},
+    {"name": "Customer Dispatch", "department_name": "Dispatch", "branch": "common", "default_weight": Decimal("7.50"), "icon": "Boxes"},
+    {"name": "Invoice & Payment Collection", "department_name": "Accounts", "branch": "common", "default_weight": Decimal("7.50"), "icon": "IndianRupee"},
+    {"name": "Project Closure", "department_name": "Management", "branch": "common", "default_weight": Decimal("7.50"), "icon": "CheckCircle2"},
 ]
 
 def get_project_cfv(project):
@@ -408,32 +409,48 @@ def sync_project_pipeline_stages(project):
     qc_qs = QCInspection.objects.filter(client_id=client_id, deleted_at__isnull=True)
     inward_ids = [i.id for i in all_inwards]
     inward_nos = [i.no for i in all_inwards if getattr(i, "no", None)]
-    if inward_ids or inward_nos:
+    if inward_ids or inward_nos or project.code:
         qc = qc_qs.filter(
             Q(source_document_type__in=["JWO_INWARD", "JobWorkInward"], source_document_id__in=inward_ids)
             | Q(source_document_type__in=["JWO_INWARD", "JobWorkInward"], source_document_number__in=inward_nos)
+            | Q(notes__icontains=project.code)
+            | Q(source_document_number=project.code)
         ).order_by("-inspection_date", "-created_at").first()
 
     dispatched_qty = Decimal("0")
     dc_doc = None
+    challans_qs = DeliveryChallan.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(
+        status__in=["Dispatched", "In Transit", "Delivered", "Partially Delivered"]
+    )
     if order:
-        challans = DeliveryChallan.objects.filter(sales_order=order, status__in=["Dispatched", "Delivered"])
-        for ch in challans:
-            line_items = getattr(ch, "line_items", None)
-            if line_items:
-                line_sum = line_items.aggregate(s=Sum("qty"))["s"] or 0
-                dispatched_qty += Decimal(str(line_sum))
-        dc_doc = challans.first()
+        challans_qs = challans_qs.filter(
+            Q(sales_order=order) | Q(notes__icontains=project.code)
+        )
+    else:
+        challans_qs = challans_qs.filter(notes__icontains=project.code)
+
+    challans = list(challans_qs.order_by("-dispatch_date", "-created_at"))
+    for ch in challans:
+        line_items = getattr(ch, "line_items", None)
+        if line_items:
+            line_sum = line_items.aggregate(s=Sum("qty"))["s"] or 0
+            dispatched_qty += Decimal(str(line_sum))
+    dc_doc = challans[0] if challans else None
 
     invoiced_amount = Decimal("0")
     paid_amount = Decimal("0")
     inv_doc = None
+    invoices_qs = SalesInvoice.objects.filter(client_id=client_id, deleted_at__isnull=True).exclude(status="Cancelled")
     if order:
-        invoices = SalesInvoice.objects.filter(sales_order=order)
-        for inv in invoices:
-            invoiced_amount += Decimal(str(getattr(inv, "total", 0) or 0))
-            paid_amount += Decimal(str(getattr(inv, "amount_paid", 0) or 0))
-        inv_doc = invoices.first()
+        invoices_qs = invoices_qs.filter(Q(sales_order=order) | Q(notes__icontains=project.code))
+    else:
+        invoices_qs = invoices_qs.filter(notes__icontains=project.code)
+
+    invoices = list(invoices_qs.order_by("-doc_date", "-created_at"))
+    for inv in invoices:
+        invoiced_amount += Decimal(str(getattr(inv, "total", 0) or 0))
+        paid_amount += Decimal(str(getattr(inv, "amount_paid", 0) or 0))
+    inv_doc = invoices[0] if invoices else None
 
     production_lifecycle = None
     if any(d.get("branch") == "branch_production" for d in stage_defs):
@@ -530,6 +547,40 @@ def sync_project_pipeline_stages(project):
                 status = "Pending"
                 pct = 0
                 remarks = "PO pending"
+
+        elif name in ("Vendor Bill", "Vendor Bill Entry"):
+            quantities["input"] = float(shortage_qty)
+            from apps.purchase.models import VendorBill
+            vbill = None
+            if po:
+                vbill = VendorBill.objects.filter(client_id=client_id, purchase_order=po, deleted_at__isnull=True).order_by("-created_at").first()
+            if not vbill:
+                vbill = VendorBill.objects.filter(client_id=client_id, deleted_at__isnull=True).filter(
+                    Q(remarks__icontains=project.code) | Q(purchase_order__reference_number=project.code)
+                ).order_by("-created_at").first()
+
+            if vbill:
+                status = "Completed"
+                pct = 100
+                bill_no = getattr(vbill, "vendor_bill_number", None) or str(vbill.id)
+                bill_amt = float(getattr(vbill, "total_amount", 0) or 0)
+                remarks = f"Bill {bill_no} entered (Rs {bill_amt:,.2f})"
+                document = {
+                    "type": "VendorBill",
+                    "number": bill_no,
+                    "url": f"/purchase/bills?id={vbill.id}",
+                    "label": f"Bill: {bill_no}",
+                }
+            else:
+                status = "Pending"
+                pct = 0
+                remarks = "Vendor bill entry pending"
+                document = {
+                    "type": "VendorBill",
+                    "number": "Pending Bill",
+                    "url": f"/purchase/bills?po={po.id if po else ''}",
+                    "label": "Vendor Bill",
+                }
 
         elif name == "Supplier Bill Matching":
             quantities["input"] = float(shortage_qty)
@@ -941,6 +992,13 @@ def sync_project_pipeline_stages(project):
                 remarks = f"Dyeing in process at {vendor}"
             else:
                 remarks = "Processing pending"
+            if jwo:
+                document = {
+                    "type": "JobWorkOrder",
+                    "number": jwo.jwo_no or str(jwo.id),
+                    "url": f"/job-work/orders?id={jwo.id}",
+                    "label": f"JWO: {jwo.jwo_no}",
+                }
 
         elif name == "Job Work Inward (Receive)":
             quantities["input"] = float(jwo_sent or req_qty)
@@ -960,8 +1018,55 @@ def sync_project_pipeline_stages(project):
                 remarks = f"Received {int(jwo_received):,} m"
             else:
                 remarks = "Inward pending"
+            if all_inwards:
+                latest_inw = all_inwards[0]
+                document = {
+                    "type": "JWOInward",
+                    "number": getattr(latest_inw, "no", None) or str(latest_inw.id),
+                    "url": "/job-work/inward",
+                    "label": f"Inward: {getattr(latest_inw, 'no', latest_inw.id)}",
+                }
+            elif jwo:
+                document = {
+                    "type": "JobWorkOrder",
+                    "number": jwo.jwo_no or str(jwo.id),
+                    "url": f"/job-work/orders?id={jwo.id}",
+                    "label": f"JWO: {jwo.jwo_no}",
+                }
 
         elif name == "Quality Check & Stock Allocation":
+            from apps.inventory.models import GreyStockAllocation
+            cust_alloc_qs = GreyStockAllocation.objects.filter(
+                client_id=client_id, project=project, status=GreyStockAllocation.STATUS_ACTIVE, deleted_at__isnull=True
+            )
+            cust_alloc_qty = sum(
+                (a.quantity for a in cust_alloc_qs if getattr(a, "allocation_type", None) == GreyStockAllocation.ALLOCATION_CUSTOMER),
+                Decimal("0")
+            )
+            own_alloc_qty = sum(
+                (a.quantity for a in cust_alloc_qs if getattr(a, "allocation_type", None) == GreyStockAllocation.ALLOCATION_OWN),
+                Decimal("0")
+            )
+            total_alloc_qty = cust_alloc_qty + own_alloc_qty
+
+            project_qcs = list(qc_qs.filter(
+                Q(source_document_type__in=["JWO_INWARD", "JobWorkInward"], source_document_id__in=inward_ids)
+                | Q(source_document_type__in=["JWO_INWARD", "JobWorkInward"], source_document_number__in=inward_nos)
+                | Q(notes__icontains=project.code)
+                | Q(source_document_number=project.code)
+            )) if (inward_ids or inward_nos or project.code) else []
+
+            qc_passed_total = sum((q.passed_qty or Decimal("0") for q in project_qcs if q.status in ("Approved", "Completed", "Passed")), Decimal("0"))
+            qc_inspected_total = sum((q.total_inspected_qty or Decimal("0") for q in project_qcs), Decimal("0"))
+            qc_record = project_qcs[0] if project_qcs else qc
+
+            quantities["received"] = float(jwo_received)
+            quantities["accepted"] = float(qc_passed_total or (qc_record.passed_qty if qc_record else 0) or 0)
+            quantities["allocated"] = float(cust_alloc_qty)
+            quantities["ownAllocated"] = float(own_alloc_qty)
+
+            target_needed = min(req_qty, jwo_received) if (req_qty > Decimal("0") and jwo_received > Decimal("0")) else (req_qty or jwo_received)
+
             if jwo_received <= Decimal("0") and not all_inwards:
                 status = "Pending"
                 pct = 0
@@ -972,27 +1077,36 @@ def sync_project_pipeline_stages(project):
                     "url": "/inventory/qc",
                     "label": "QC: Awaiting Inward",
                 }
-            elif qc and qc.status in ("Approved", "Completed", "Passed"):
+            elif cust_alloc_qty >= target_needed and target_needed > Decimal("0") and qc_passed_total > Decimal("0"):
                 status = "Completed"
                 pct = 100
-                quantities["accepted"] = float(qc.passed_qty or jwo_received or req_qty)
-                remarks = f"QC Passed {int(qc.passed_qty or jwo_received):,} m"
+                remarks = f"QC Passed {int(qc_passed_total):,} m & Allocated {int(cust_alloc_qty):,} m"
                 document = {
                     "type": "QCInspection",
-                    "number": qc.inspection_number,
-                    "url": f"/inventory/qc/register?id={qc.id}",
-                    "label": f"QC: {qc.inspection_number}",
+                    "number": qc_record.inspection_number if qc_record else "QC-DONE",
+                    "url": f"/inventory/qc/register?id={qc_record.id}" if qc_record else "/inventory/qc",
+                    "label": f"QC: {qc_record.inspection_number if qc_record else 'Completed'}",
                 }
-            elif qc:
+            elif qc_passed_total > Decimal("0"):
                 status = "In Progress"
-                pct = 50
-                quantities["accepted"] = float(qc.passed_qty or 0)
+                alloc_ratio = float(cust_alloc_qty / target_needed) if target_needed > Decimal("0") else 0
+                pct = min(95, 60 + int(round(alloc_ratio * 35)))
+                remarks = f"QC Passed {int(qc_passed_total):,} m; Allocated {int(cust_alloc_qty):,} m"
+                document = {
+                    "type": "QCInspection",
+                    "number": qc_record.inspection_number if qc_record else "QC-INSPECTED",
+                    "url": f"/inventory/qc/register?id={qc_record.id}" if qc_record else "/inventory/qc",
+                    "label": f"QC: {qc_record.inspection_number if qc_record else 'Passed'}",
+                }
+            elif qc_record:
+                status = "In Progress"
+                pct = 40
                 remarks = "QC inspection in progress"
                 document = {
                     "type": "QCInspection",
-                    "number": qc.inspection_number,
-                    "url": f"/inventory/qc/register?id={qc.id}",
-                    "label": f"QC: {qc.inspection_number}",
+                    "number": qc_record.inspection_number,
+                    "url": f"/inventory/qc/register?id={qc_record.id}",
+                    "label": f"QC: {qc_record.inspection_number}",
                 }
             elif jwo_received > Decimal("0"):
                 status = "In Progress"
